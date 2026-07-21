@@ -1,0 +1,38 @@
+services:
+  delamain:
+    image: ghcr.io/xjoker/delamain:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: delamain
+    # Single exposed port: the Python gateway (0.0.0.0:8651). The Java
+    # backend inside the container binds 127.0.0.1:8650 only and is never
+    # published — see docker/Dockerfile and docker/entrypoint.sh.
+    ports:
+      - "127.0.0.1:${JADX_GATEWAY_PORT:-8651}:8651"
+    volumes:
+      # JADX sandbox: holds both pre-staged files AND files pushed via the
+      # upload/transfer flow, so it must be writable (uploads land here).
+      - "${JADX_APK_DIR:-/data/apks}:/apks"
+      - jadx-output:/data/output
+      - jadx-indices:/data/indices
+      - "${JADX_CONFIG_DIR:-/data/config}:/data/config:ro"
+    environment:
+      - JADX_FILE_ROOT=/apks
+      # MCP client token whitelist (comma/newline separated) — required, no default.
+      - DELAMAIN_AUTH_TOKENS=${DELAMAIN_AUTH_TOKENS:?DELAMAIN_AUTH_TOKENS must be set (comma/newline separated MCP client token whitelist)}
+      # Internal gateway<->Java token, container-local only. Optional: if unset,
+      # entrypoint.sh generates a random one and shares it between the two
+      # in-container processes; it is never used for MCP client auth.
+      - JADX_INTERNAL_TOKEN=${JADX_INTERNAL_TOKEN:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8651/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  jadx-output:
+  jadx-indices:

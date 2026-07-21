@@ -1,0 +1,22 @@
+[package]
+name = "delamain-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Resumable chunked uploader CLI for delamain transfer endpoints (PUT /transfer/upload, GET /transfer/status)"
+license = "MIT"
+
+[[bin]]
+name = "delamain-cli"
+path = "src/main.rs"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+sha2 = "0.10"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true

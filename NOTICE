@@ -1,0 +1,20 @@
+delamain
+Copyright 2026 the delamain authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+This product bundles and integrates jadx (jadx-all), the Dex to Java
+decompiler, at runtime (packaged into the Docker image and used via its
+headless API).
+
+    jadx
+    https://github.com/skylot/jadx
+    Copyright skylot and the jadx contributors
+    Licensed under the Apache License, Version 2.0
+
+delamain is an independent project and is not affiliated with, sponsored by, or
+endorsed by the jadx authors.

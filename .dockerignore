@@ -1,0 +1,73 @@
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# CI
+.gitea/
+.github/
+
+# Java build artifacts (rebuilt inside multi-stage Dockerfile)
+target/
+*.class
+# Dockerfile.local needs the pre-built fat jar (run `mvn -DskipTests package` first)
+!target/delamain.jar
+
+# Maven local
+.mvn/
+.m2/
+
+# Python
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/.venv/
+**/venv/
+**/.pytest_cache/
+**/dist/
+**/build/
+**/*.egg
+**/uv.lock
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# Logs & runtime
+*.log
+logs/
+data/
+*.idx
+*.db
+
+# Local-only build inputs (large binaries, not committed but present in worktree)
+.docker-build/
+gateway/jadx/
+# Dockerfile.local needs the local jadx-all jar copied out of .docker-build/;
+# glob (not a pinned version) so this never goes stale after scripts/bump-jadx.sh
+!.docker-build/jadx-all-*.jar
+
+# Claude Code agent worktrees and memory (large, not needed in image)
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.local
+
+# Tests (not needed inside image)
+tests/
+
+# Docs (not needed inside image)
+docs/
+*.md
+CONTEXT.md
+
+# Compose / local dev configs (not needed inside image)
+docker-compose.yml
+docker-compose.*.yml

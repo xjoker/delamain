@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Cancel any in-progress run for the same branch/PR when a new commit lands.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Scope: this CI only validates that the two shipped artifacts still build —
+# the fused Docker image and the delamain-cli binary. Language-level unit tests
+# (Java/Python/Rust) are intentionally not run here to keep CI lean; run them
+# locally (see docs/dev-guide.md) or re-add jobs when needed.
+jobs:
+  image:
+    name: Build fused Docker image (amd64, no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          # Build only — no push, no local load. Catches Dockerfile breakage.
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  cli:
+    name: Build delamain-cli (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/delamain-cli
+      - run: cargo build --release --manifest-path tools/delamain-cli/Cargo.toml

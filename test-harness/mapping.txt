@@ -1,0 +1,64 @@
+# compiler: R8
+# compiler_version: 8.6.2-dev
+# min_api: 30
+# compiler_hash: abaab469b5ebd4dd2bb91ba0ed6f45277faae4ca
+# common_typos_disable
+# {"id":"com.android.tools.r8.mapping","version":"2.2"}
+# pg_map_id: e20fc39
+# pg_map_hash: SHA-256 e20fc39d73a6266a476ea1c86ad416d0c08d805e1e58c4278b00f8810818884a
+com.acme.demo.CreditCard -> com.acme.demo.c:
+# {"id":"sourceFile","fileName":"CreditCard.java"}
+    java.lang.String cardNumber -> a
+    int cvv -> b
+    0:2:void <init>(java.lang.String,int):8:8 -> <init>
+    3:4:void <init>(java.lang.String,int):9:9 -> <init>
+    5:7:void <init>(java.lang.String,int):10:10 -> <init>
+com.acme.demo.CreditCard$Metadata -> com.acme.demo.a:
+# {"id":"sourceFile","fileName":"CreditCard.java"}
+    com.acme.demo.CreditCard this$0 -> a
+      # {"id":"com.android.tools.r8.residualsignature","signature":"Lcom/acme/demo/c;"}
+    0:5:void <init>(com.acme.demo.CreditCard):21:21 -> <init>
+      # {"id":"com.android.tools.r8.residualsignature","signature":"(Lcom/acme/demo/c;)V"}
+    0:2:java.lang.String issuer():23:23 -> a
+com.acme.demo.CreditCard$Validator -> com.acme.demo.b:
+# {"id":"sourceFile","fileName":"CreditCard.java"}
+    0:3:void <init>():14:14 -> <init>
+    2:13:boolean luhnValid(java.lang.String):16:16 -> a
+com.acme.demo.CryptoUtils -> com.acme.demo.d:
+# {"id":"sourceFile","fileName":"CryptoUtils.java"}
+    java.lang.String SECRET_MARKER -> a
+    0:3:void <init>():4:4 -> <init>
+    0:3:byte[] deriveKey(byte[]):13:13 -> a
+    4:6:byte[] deriveKey(byte[]):14:14 -> a
+    7:17:byte[] deriveKey(byte[]):15:15 -> a
+    byte[] encryptNative(byte[]) -> b
+com.acme.demo.PaymentProcessor -> com.acme.demo.PaymentProcessor:
+# {"id":"sourceFile","fileName":"PaymentProcessor.java"}
+    com.acme.demo.CryptoUtils crypto -> a
+      # {"id":"com.android.tools.r8.residualsignature","signature":"Lcom/acme/demo/d;"}
+    0:2:void <init>():8:8 -> <init>
+    3:10:void <init>():10:10 -> <init>
+    0:9:java.lang.String processPayment(com.acme.demo.CreditCard,java.lang.String):15:15 -> processPayment
+      # {"id":"com.android.tools.r8.residualsignature","signature":"(Lcom/acme/demo/c;Ljava/lang/String;)Ljava/lang/String;"}
+    10:14:java.lang.String processPayment(com.acme.demo.CreditCard,java.lang.String):16:16 -> processPayment
+    15:18:java.lang.String processPayment(com.acme.demo.CreditCard,java.lang.String):17:17 -> processPayment
+    19:23:java.lang.String processPayment(com.acme.demo.CreditCard,java.lang.String):20:20 -> processPayment
+    24:28:java.lang.String processPayment(com.acme.demo.CreditCard,java.lang.String):28:28 -> processPayment
+    29:34:java.lang.String processPayment(com.acme.demo.CreditCard,java.lang.String):29:29 -> processPayment
+com.acme.demo.PaymentProcessor$1 -> com.acme.demo.e:
+# {"id":"sourceFile","fileName":"PaymentProcessor.java"}
+    boolean val$ok -> a
+    com.acme.demo.PaymentProcessor this$0 -> b
+    0:7:void <init>(com.acme.demo.PaymentProcessor,boolean):20:20 -> <init>
+    0:24:void run():25:25 -> run
+com.acme.demo.SecretKeeper -> com.acme.demo.g:
+# {"id":"sourceFile","fileName":"SecretKeeper.java"}
+    0:3:void <init>():8:8 -> <init>
+    0:4:boolean verify(com.acme.demo.CreditCard,byte[]):11:11 -> a
+      # {"id":"com.android.tools.r8.residualsignature","signature":"(Lcom/acme/demo/c;[B)Z"}
+    5:17:boolean verify(com.acme.demo.CreditCard,byte[]):12:12 -> a
+com.acme.demo.SecretKeeper$VaultEntry -> com.acme.demo.f:
+# {"id":"sourceFile","fileName":"SecretKeeper.java"}
+    0:3:void <init>():16:16 -> <init>
+    0:5:boolean unlockVaultXYZ789(com.acme.demo.CreditCard):0:0 -> a
+      # {"id":"com.android.tools.r8.residualsignature","signature":"(Lcom/acme/demo/c;)Z"}

@@ -1,0 +1,49 @@
+# Java build artifacts
+target/
+*.class
+*.jar
+
+# Maven
+.mvn/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+*.egg
+/uv.lock
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.claude/
+*.swp
+
+# Logs
+*.log
+logs/
+
+# Runtime data
+data/
+*.idx
+*.db
+
+# Docker local build inputs (large binary, not committed)
+.docker-build/
+gateway/jadx/
+
+# Test cache
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+!.env.example

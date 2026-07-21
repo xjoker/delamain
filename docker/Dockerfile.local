@@ -1,0 +1,55 @@
+# Local-build variant: uses pre-built JAR + local Maven cache.
+# Faster than Dockerfile (no Maven compile, no network download).
+# Usage:
+#   mvn -q --batch-mode -DskipTests package
+#   cp ~/.m2/repository/io/github/skylot/jadx-all/1.5.6/jadx-all-1.5.6.jar .docker-build/
+#   docker build -f docker/Dockerfile.local -t delamain:local .
+FROM eclipse-temurin:21-jre-alpine
+
+# Install Python + pip, install gateway deps, clean up in one layer
+RUN apk add --no-cache python3 py3-pip && \
+    pip3 install --no-cache-dir --break-system-packages \
+        fastmcp==3.1.0 httpx==0.28.1 tomli==2.4.0 && \
+    rm -rf /root/.cache /tmp/*
+
+WORKDIR /app
+
+# Pre-built fat JAR (run `mvn -DskipTests package` first)
+COPY target/delamain.jar /app/delamain.jar
+
+# jadx-all from local Maven repo (no network needed)
+COPY .docker-build/jadx-all-1.5.6.jar /app/lib/jadx-all-1.5.6.jar
+
+# Gateway source.
+COPY gateway/pyproject.toml /app/gateway/pyproject.toml
+COPY gateway/main.py /app/gateway/main.py
+COPY gateway/src/ /app/gateway/src/
+
+# Version single source of truth: banner.py resolves /app/VERSION, so /health
+# and the startup banner report the repo-root VERSION instead of the fallback.
+COPY VERSION /app/VERSION
+
+# Same fused entrypoint as docker/Dockerfile: starts Java on 127.0.0.1:8650
+# (internal only), waits for its /health, then runs the gateway in the
+# foreground on 0.0.0.0:8651 — the only port a real deployment ever exposes.
+COPY docker/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# Use a stable, unprivileged UID, matching docker/Dockerfile.
+RUN addgroup -S -g 10001 jadx && \
+    adduser -S -D -H -u 10001 -G jadx jadx && \
+    mkdir -p /data/apks /data/output /data/indices /data/config /home/jadx /apks && \
+    chown -R jadx:jadx /app /data /home/jadx
+
+VOLUME ["/data/output", "/data/indices"]
+
+ENV HOME=/home/jadx \
+    TZ=UTC
+
+# Only the gateway port is reachable — Java's 8650 is bound to 127.0.0.1
+# inside the container by entrypoint.sh and is never EXPOSEd.
+EXPOSE 8651
+
+USER 10001:10001
+
+ENTRYPOINT ["/app/entrypoint.sh"]
