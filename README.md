@@ -61,6 +61,18 @@ resources, Frida hook generation, attack-surface / security scan) is
   bytes never pass through the AI's context window.
 - **One fused container, one exposed port.** Simple and safe to deploy.
 
+## Performance
+
+On a large production APK (~238K classes), delamain sustains **0% 503 errors** across
+concurrency, where a GUI-mode baseline (a JADX-GUI-backed MCP server) sheds `smali`
+requests (28–44% 503) and can't serve class-level `xref` at all under load (100% 503).
+Cached `class_source` P50 is ~5 ms and class-level `xref` ~2.7 ms; a persisted index makes
+hot restart **~40 s — about 26× faster** than a cold warmup, and steady state holds ~10 GB
+heap on 238K classes with **0 OOM**.
+
+Full methodology, tables, and caveats: the
+[**Performance**](https://github.com/xjoker/delamain/wiki/Performance) wiki page.
+
 ## Architecture
 
 ```mermaid

@@ -58,6 +58,17 @@ delamain 直接封装 jadx，因此 jadx 接受的输入它都接受：
   节永远不会经过 AI 的上下文窗口。
 - **单一融合容器，单一暴露端口。** 部署简单又安全。
 
+## 性能
+
+在一个大型生产级 APK（约 23.8 万个类）上，delamain 在并发下保持 **0% 的 503 错误**；
+而一个 GUI 模式基线（基于 JADX-GUI 的 MCP 方案）在压力下会丢弃 `smali` 请求（28–44% 503），
+且并发下完全无法提供类级 `xref`（100% 503）。已缓存的 `class_source` P50 约 5 ms、类级
+`xref` 约 2.7 ms；借助持久化索引，热重启仅约 **40 秒 —— 比冷启动预热快约 26 倍**，
+23.8 万类下稳态堆约 10 GB、**0 次 OOM**。
+
+完整方法学、数据表与注意事项见
+[**Performance**](https://github.com/xjoker/delamain/wiki/Performance) wiki 页面。
+
 ## 架构
 
 ```mermaid
