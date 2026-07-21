@@ -5,6 +5,11 @@
 > Leave the reversing to us.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/xjoker/delamain?display_name=tag&label=release)](https://github.com/xjoker/delamain/releases/latest)
+[![CI](https://github.com/xjoker/delamain/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/xjoker/delamain/actions/workflows/ci.yml)
+[![Release build](https://github.com/xjoker/delamain/actions/workflows/release.yml/badge.svg)](https://github.com/xjoker/delamain/actions/workflows/release.yml)
+[![Container image](https://img.shields.io/badge/ghcr.io-delamain-2496ED?logo=docker&logoColor=white)](https://github.com/xjoker/delamain/pkgs/container/delamain)
+[![CLI downloads](https://img.shields.io/github/downloads/xjoker/delamain/total?label=CLI%20downloads)](https://github.com/xjoker/delamain/releases)
 
 **delamain** is an **MCP server** that exposes the full power of
 [JADX](https://github.com/skylot/jadx) to AI agents — a **headless,

@@ -5,6 +5,11 @@
 > Leave the reversing to us.（把逆向工程交给我们。）
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/xjoker/delamain?display_name=tag&label=release)](https://github.com/xjoker/delamain/releases/latest)
+[![CI](https://github.com/xjoker/delamain/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/xjoker/delamain/actions/workflows/ci.yml)
+[![Release build](https://github.com/xjoker/delamain/actions/workflows/release.yml/badge.svg)](https://github.com/xjoker/delamain/actions/workflows/release.yml)
+[![Container image](https://img.shields.io/badge/ghcr.io-delamain-2496ED?logo=docker&logoColor=white)](https://github.com/xjoker/delamain/pkgs/container/delamain)
+[![CLI downloads](https://img.shields.io/github/downloads/xjoker/delamain/total?label=CLI%20downloads)](https://github.com/xjoker/delamain/releases)
 
 **delamain** 是一个 **MCP server**，把 [JADX](https://github.com/skylot/jadx)
 的全部能力开放给 AI agent —— 一座**无头（headless）、高性能、低内存的桥梁**，
@@ -57,11 +62,11 @@ delamain 直接封装 jadx，因此 jadx 接受的输入它都接受：
 
 ```mermaid
 flowchart TD
-    client["MCP client (AI agent)"]
-    gateway["Python gateway · FastMCP<br/>auth · routing · transfer<br/>0.0.0.0:8651 — the only exposed port"]
-    backend["Java backend · Javalin<br/>wraps the jadx headless API<br/>127.0.0.1:8650 — never exposed"]
-    client -->|"MCP over HTTP + bearer token"| gateway
-    gateway -->|"localhost only"| backend
+    client["MCP 客户端（AI agent）"]
+    gateway["Python 网关 · FastMCP<br/>认证 · 路由 · 文件传输<br/>0.0.0.0:8651 —— 唯一对外暴露的端口"]
+    backend["Java 后端 · Javalin<br/>封装 jadx headless API<br/>127.0.0.1:8650 —— 从不对外暴露"]
+    client -->|"HTTP 上的 MCP + Bearer 令牌"| gateway
+    gateway -->|"仅限本机回环"| backend
 ```
 
 Java 后端（`com.zin.delamain`）封装了 jadx 的无头 `JadxDecompiler`，负责反
