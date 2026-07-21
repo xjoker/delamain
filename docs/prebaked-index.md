@@ -92,7 +92,7 @@ best-effort, doesn't block the main warmup flow). Example content:
 
 ```json
 {
-  "tool_version": "20260721.3",
+  "tool_version": "20260721.4",
   "input_hash": "42e32dbd...",
   "total_classes": 237931,
   "shard_count": 42,

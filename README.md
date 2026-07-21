@@ -97,7 +97,8 @@ image. See [`docs/architecture-reference.md`](docs/architecture-reference.md).
 # 2. Set at least one MCP client token (comma/newline separated whitelist)
 export DELAMAIN_AUTH_TOKENS="$(openssl rand -hex 32)"
 
-docker compose up -d       # builds the fused image, exposes 127.0.0.1:8651
+docker compose pull        # pull the prebuilt image from GHCR (omit to build locally)
+docker compose up -d       # exposes 127.0.0.1:8651
 
 curl -s http://127.0.0.1:8651/health
 # → {"status":"healthy","version":"…","jadx_version":"1.5.6"}
@@ -109,6 +110,64 @@ Then `load_file` an APK from the mounted directory (or push one via the
 
 For building from source and the developer workflow, see
 [`docs/dev-guide.md`](docs/dev-guide.md).
+
+## Install with an AI assistant
+
+Hand this repository (or just this section) to an AI coding agent and say
+*"install delamain and connect me."* The agent should follow this deterministic SOP.
+
+**Goal:** a running delamain container on `127.0.0.1:8651`, with the caller's MCP
+client configured to reach it.
+
+1. **Preconditions** — confirm Docker is running (`docker info`), and pick an
+   absolute host directory holding the APK/DEX/AAB files to analyze (e.g. `~/apks`).
+2. **Generate the MCP token** (the client's bearer secret — keep it):
+   ```bash
+   export DELAMAIN_AUTH_TOKENS="$(openssl rand -hex 32)"
+   ```
+3. **Run the published image** (pin a version tag for reproducibility instead of `latest`):
+   ```bash
+   docker run -d --name delamain \
+     -p 127.0.0.1:8651:8651 \
+     -v /ABS/PATH/TO/apks:/apks \
+     -e JADX_FILE_ROOT=/apks \
+     -e DELAMAIN_AUTH_TOKENS="$DELAMAIN_AUTH_TOKENS" \
+     --log-opt max-size=10m --log-opt max-file=3 \
+     ghcr.io/xjoker/delamain:latest
+   ```
+4. **Verify health** (retry until `status:healthy`):
+   ```bash
+   curl -s http://127.0.0.1:8651/health
+   # → {"status":"healthy","version":"…","jadx_version":"1.5.6"}
+   ```
+5. **Connect the MCP client** — streamable-HTTP endpoint + bearer token:
+   - Endpoint: `http://127.0.0.1:8651/mcp`
+   - Header: `Authorization: Bearer <the DELAMAIN_AUTH_TOKENS value>`
+
+   Illustrative client config (adapt to your MCP client's format):
+   ```json
+   {
+     "mcpServers": {
+       "delamain": {
+         "type": "http",
+         "url": "http://127.0.0.1:8651/mcp",
+         "headers": { "Authorization": "Bearer <token>" }
+       }
+     }
+   }
+   ```
+6. **Confirm tools are live** — an unauthenticated `/mcp` request must return `401`;
+   an authenticated `tools/list` must return the tool set.
+7. **First analysis** — drop an APK in the mounted dir, then over MCP call
+   `load_file_tool(path="app.apk")`, poll `get_decompile_status()` until ready, then
+   use `search_classes_by_keyword`, `get_class_source`, `get_xrefs`, and friends.
+
+**If something fails**
+- `DELAMAIN_AUTH_TOKENS must be set` → step 2 wasn't exported into the `docker run`.
+- Port 8651 already in use → remap (`-p 127.0.0.1:9651:8651`) and update the endpoint.
+- `/health` never healthy → `docker logs delamain`; large APKs warm up in the
+  background, so poll `get_warmup_status` before heavy calls.
+- `401` on every call → the client's bearer doesn't match a `DELAMAIN_AUTH_TOKENS` value.
 
 ## Companion CLI: `delamain-cli`
 

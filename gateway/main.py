@@ -114,7 +114,8 @@ def main():
 
     # STRICT HTTP-only — no stdio fallback. Single uvicorn worker — see module
     # docstring; do not pass workers>1.
-    mcp.run(transport="http", host=args.host, port=args.port, stateless_http=True)
+    mcp.run(transport="http", host=args.host, port=args.port, stateless_http=True,
+            show_banner=False)
 
 
 if __name__ == "__main__":

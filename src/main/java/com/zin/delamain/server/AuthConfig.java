@@ -185,7 +185,7 @@ public class AuthConfig {
         props.setProperty(TOKEN_KEY, authToken);
         props.setProperty(ENABLED_KEY, String.valueOf(authEnabled));
         try (FileOutputStream fos = new FileOutputStream(AUTH_CONFIG_FILE)) {
-            props.store(fos, "JADX MCP Core Authentication Configuration");
+            props.store(fos, "delamain Authentication Configuration");
             logger.info("Authentication token saved to: " + AUTH_CONFIG_FILE);
         } catch (IOException e) {
             logger.error("Failed to save auth config: " + e.getMessage(), e);

@@ -26,6 +26,14 @@ services:
       # in-container processes; it is never used for MCP client auth.
       - JADX_INTERNAL_TOKEN=${JADX_INTERNAL_TOKEN:-}
     restart: unless-stopped
+    # Cap container log growth (both processes log to stdout/stderr only, no log
+    # files) — without this, Docker's default json-file driver grows unbounded
+    # and can fill the host disk. 3 x 10MB rotation is plenty for troubleshooting.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8651/health', timeout=5)"]
       interval: 30s

@@ -67,6 +67,18 @@ def build_mcp_app() -> FastMCP:
         from .banner import SERVER_VERSION
         # Health probes are intentionally unauthenticated. Do not expose global
         # instance topology to callers outside the authenticated MCP transport.
-        return JSONResponse({"status": "healthy", "version": SERVER_VERSION})
+        payload = {"status": "healthy", "version": SERVER_VERSION}
+        # Best-effort: surface the bundled jadx version (from the Java backend's
+        # own /health). Kept non-fatal — the gateway stays healthy even if the
+        # backend is momentarily unreachable.
+        try:
+            from .routing.request_router import get_from_jadx
+            backend = await get_from_jadx("health", timeout=3)
+            jadx_version = backend.get("jadx_version")
+            if jadx_version:
+                payload["jadx_version"] = jadx_version
+        except Exception:
+            pass
+        return JSONResponse(payload)
 
     return mcp

@@ -292,14 +292,9 @@ public class Main {
     private static void printBanner(int port, String bind, List<String> apkPaths,
                                     String outputDir, int workers) {
         System.out.println();
-        System.out.println("  ██╗ █████╗ ██████╗ ██╗  ██╗    ███╗   ███╗ ██████╗██████╗");
-        System.out.println("  ██║██╔══██╗██╔══██╗╚██╗██╔╝    ████╗ ████║██╔════╝██╔══██╗");
-        System.out.println("  ██║███████║██║  ██║ ╚███╔╝     ██╔████╔██║██║     ██████╔╝");
-        System.out.println("  ██║██╔══██║██║  ██║ ██╔██╗     ██║╚██╔╝██║██║     ██╔═══╝");
-        System.out.println("  ██║██║  ██║██████╔╝██╔╝ ██╗    ██║ ╚═╝ ██║╚██████╗██║");
-        System.out.println("  ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝    ╚═╝     ╚═╝ ╚═════╝╚═╝  CORE");
+        System.out.println("  delamain  v" + com.zin.delamain.utils.AppVersion.get());
+        System.out.println("  Headless JADX decompiler for AI agents over MCP");
         System.out.println();
-        System.out.println("  Headless JADX MCP Server  v" + com.zin.delamain.utils.AppVersion.get());
         System.out.println("  Port       : " + port);
         System.out.println("  Bind       : " + bind);
         System.out.println("  APK(s)     : " + (apkPaths.isEmpty() ? "(none)" : String.join(", ", apkPaths)));
