@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Cancel any in-progress run for the same branch/PR when a new commit lands.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  java:
+    name: Java tests (JDK 21)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - run: mvn -B -ntp test
+
+  gateway:
+    name: Gateway tests (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          # Deps live in gateway/pyproject.toml (no root requirements.txt), so
+          # point the pip cache there explicitly or the step fails to find one.
+          cache-dependency-path: gateway/pyproject.toml
+      - name: Install and test
+        # pyproject.toml sets addopts="--ignore=tests/integration", so a bare
+        # `pytest` only runs unit tests; the live-backend integration suite
+        # is intentionally excluded from CI.
+        run: |
+          cd gateway
+          pip install -e ".[dev]"
+          pytest
+
+  rust:
+    name: Rust CLI tests (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/jadx-upload
+      - run: cargo test --manifest-path tools/jadx-upload/Cargo.toml
+
+  docker-build:
+    name: Docker build check (amd64 only, no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          # No push, no local image load — this job only exists to catch
+          # Dockerfile breakage early on PRs, kept fast/single-arch.
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # create GitHub Release / upload assets
+  packages: write   # push image to GHCR
+
+jobs:
+  docker:
+    name: Build & push multi-arch image to GHCR
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from repo-root VERSION file
+        # VERSION is the single source of truth (format YYYYMMDD.N) — reused
+        # verbatim as the image tag so the running container's version always
+        # matches what's committed, regardless of which tag triggered this run.
+        id: version
+        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/xjoker/delamain:${{ steps.version.outputs.version }}
+            ghcr.io/xjoker/delamain:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/xjoker/delamain
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  cli:
+    name: Build CLI (${{ matrix.target }})
+    # Independent of the docker job on purpose: a GHCR push failure must not
+    # block the cross-compiled binary artifacts. Each runner reads VERSION itself.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/jadx-upload
+          key: ${{ matrix.target }}
+
+      - name: Install aarch64 cross linker
+        # Ubuntu runners are x86_64 only; cross-compiling to aarch64-linux
+        # needs the aarch64 GNU linker, pointed at via the CARGO_TARGET_* env var.
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --manifest-path tools/jadx-upload/Cargo.toml
+
+      - name: Package archive
+        id: package
+        shell: bash
+        run: |
+          version="$(cat VERSION)"
+          target="${{ matrix.target }}"
+          bin_dir="tools/jadx-upload/target/${target}/release"
+          name="jadx-upload-${version}-${target}"
+          if [[ "$target" == *windows* ]]; then
+            archive="${name}.zip"
+            (cd "$bin_dir" && 7z a "${GITHUB_WORKSPACE}/${archive}" jadx-upload.exe)
+          else
+            archive="${name}.tar.gz"
+            tar -czf "${archive}" -C "$bin_dir" jadx-upload
+          fi
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release asset
+        # Only tag pushes have a Release to attach assets to; workflow_dispatch
+        # has no tag context, so it falls through to the artifact upload below.
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.archive }}
+
+      - name: Upload workflow artifact (manual runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive }}
+          path: ${{ steps.package.outputs.archive }}

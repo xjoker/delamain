@@ -1,0 +1,78 @@
+# delamain gateway configuration (example)
+#
+# Copy this file (e.g. to config.toml) and pass it with --config config.toml
+# when starting the gateway (see gateway/main.py). Every key here is read by
+# gateway/src/config/config_loader.py's AppConfig.from_dict(); env vars, where
+# they exist, take priority over the equivalent TOML key (see gateway/main.py).
+#
+# Unlisted sections/keys simply fall back to the dataclass defaults in
+# config_loader.py — nothing here is required for the gateway to start.
+
+[server]
+# Bind address for the gateway's own HTTP server (the single port exposed to
+# the outside world; it proxies MCP calls plus the transfer endpoints through
+# to the Java JADX backend on 127.0.0.1:8650).
+host = "0.0.0.0"
+port = 8651
+
+# This gateway's own externally-reachable base URL (e.g.
+# "http://192.168.1.100:8651"). Used to build create_transfer_token's
+# upload_url when the bind address above (e.g. "0.0.0.0") is not itself a
+# reachable hostname/IP for the client that will PUT the uploaded file.
+# Equivalent env var (higher priority): JADX_TRANSFER_PUBLIC_URL.
+# See gateway/src/tools/transfer_tools.py:resolve_upload_base().
+# transfer_public_url = "http://your-host:8651"
+
+# MCP client token whitelist: any token in this list grants full, identical
+# access to every MCP tool (there is no per-token role/identity in this
+# single-user gateway). Equivalent env var DELAMAIN_AUTH_TOKENS accepts a
+# comma- or newline-separated list and is merged with this array (see
+# gateway/main.py:_resolve_allowed_tokens()). At least one token must be
+# configured (via either mechanism) or the gateway refuses to start.
+# Treat each token as a plaintext shared secret: generate >=32 random
+# characters, e.g. `openssl rand -hex 32`.
+allowed_tokens = [
+    # "replace-with-a-random-32-plus-character-secret",
+]
+
+[defaults]
+# Default token used to authenticate this gateway to the JADX plugin/backend
+# itself (distinct from the MCP client tokens above). Equivalent env var
+# (higher priority): DELAMAIN_AUTH_TOKEN. See gateway/main.py.
+# jadx_token = ""
+
+[jadx]
+# The single fixed JADX backend this gateway proxies to. Overridable at
+# startup with --jadx host:port (see gateway/main.py).
+host = "127.0.0.1"
+port = 8650
+# Token this gateway presents to the JADX backend, if different from
+# defaults.jadx_token above.
+# token = ""
+
+# ---------------------------------------------------------------------------
+# The following are NOT read from this TOML file — they are Java-backend
+# environment variables (set on the process/container running delamain
+# itself, not the Python gateway). Listed here for operator convenience since
+# they govern the same file-upload feature this config affects.
+# ---------------------------------------------------------------------------
+#
+# JADX_FILE_ROOT
+#   Directory sandbox root for load_file / file uploads (defaults to /apks
+#   inside the fused Docker image). Unset and no /apks present -> load_file
+#   and the transfer endpoints are disabled entirely.
+#   See src/main/java/com/zin/delamain/utils/FilePathSandbox.java.
+#
+# JADX_TRANSFER_MAX_MB
+#   Max size in MB for a single uploaded file via the transfer endpoints.
+#   Default 1024 (1 GiB). See TransferRoutes.java (ENV_MAX_MB).
+#
+# JADX_TRANSFER_TTL_MIN
+#   Minutes a create_transfer_token token stays valid before it expires.
+#   Default 30. See TransferRoutes.java (ENV_TTL_MIN).
+#
+# JADX_CACHE_MAX_GB
+#   LRU quota, in GB, for the on-disk decompile-index cache. Default 50.
+#   Set to 0 to disable eviction entirely (unbounded cache growth).
+#   See src/main/java/com/zin/delamain/index/IndexCacheManager.java
+#   (ENV_MAX_GB / resolveMaxBytes()).
