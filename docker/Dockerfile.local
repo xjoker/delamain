@@ -9,7 +9,7 @@ FROM eclipse-temurin:21-jre-alpine
 # Install Python + pip, install gateway deps, clean up in one layer
 RUN apk add --no-cache python3 py3-pip && \
     pip3 install --no-cache-dir --break-system-packages \
-        fastmcp==3.1.0 httpx==0.28.1 tomli==2.4.0 && \
+        fastmcp==3.4.4 httpx==0.28.1 tomli==2.4.0 && \
     rm -rf /root/.cache /tmp/*
 
 WORKDIR /app

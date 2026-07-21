@@ -5,7 +5,7 @@
 
     <groupId>com.zin.delamain</groupId>
     <artifactId>delamain</artifactId>
-    <version>20260721.1</version>
+    <version>20260721.2</version>
     <name>delamain</name>
     <description>MCP server that exposes the JADX Android decompiler to AI agents for headless, low-memory reverse engineering.</description>
     <url>https://github.com/xjoker/delamain</url>
@@ -57,7 +57,7 @@
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
-            <version>2.17.2</version>
+            <version>2.18.9</version>
         </dependency>
 
         <!-- SQLite for annotations/bookmarks/tags persistence -->
