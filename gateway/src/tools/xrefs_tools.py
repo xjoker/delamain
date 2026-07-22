@@ -217,6 +217,12 @@ def register_xrefs_tools(mcp):
                 dedup vs per-call-site rows, not a bug. distinct_referrer_class_count is the number of
                 distinct referrer classes across the FULL result regardless of row granularity, so you
                 can confirm the underlying referrer set is unchanged even when the row count differs.
+
+                On a live-decompile path (resolution="live-method-level"), a 25s server-side deadline
+                may cut the scan short: the result then carries partial_results=true and partial_reason
+                explaining the cutoff and what to do (warmup, narrower target, or submit_xref for the
+                deadline-free async path). Don't treat a partial result as "this target has no more
+                referrers" — re-check partial_reason before drawing that conclusion.
         """
         target_type_lower = target_type.lower()
 
@@ -276,6 +282,10 @@ def register_xrefs_tools(mcp):
                 docstring) — always precise/per-call-site granularity, never the class-level dedup
                 get_xrefs(include_snippet=False) uses, so xrefs_count and distinct_referrer_class_count
                 can legitimately differ; both are correct.
+
+                Same 25s live-decompile deadline as get_xrefs: a cut-short scan sets partial_results=true
+                and partial_reason on the response — follow its suggestion (warmup, fewer targets, or
+                submit_xref) rather than assuming the target has no more referrers.
         """
         return await _batch_get_xrefs(targets, instance_id=instance_id)
 

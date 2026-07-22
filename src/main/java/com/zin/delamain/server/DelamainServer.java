@@ -29,6 +29,7 @@ import java.nio.file.Paths;
 import java.util.Set;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Javalin-based HTTP server exposing JADX decompile results as a REST API.
@@ -60,6 +61,13 @@ public class DelamainServer {
     private static final Set<String> TRANSFER_TOKEN_AUTH_PATHS = Set.of(
             "/transfer/upload", "/transfer/status");
     private static final String ANALYSIS_LOCK_ATTRIBUTE = "jadx-analysis-lock";
+    private static final String IN_FLIGHT_TOKEN_ATTRIBUTE = "jadx-in-flight-token";
+
+    // Diagnostics for /health (see 2026-07-22 incident): tracks requests that passed the
+    // load-state gate so a stuck one is visible as "oldest_in_flight_seconds" instead of the
+    // service just going dark behind a held read lock.
+    private final Map<Object, Long> inFlightRequestStartTimes = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicLong inFlightTokenSeq = new java.util.concurrent.atomic.AtomicLong();
 
     private Javalin app;
     private volatile boolean running = false;
@@ -100,6 +108,12 @@ public class DelamainServer {
             // --- Authentication middleware ---
             installAuthMiddleware();
             installLoadStateMiddleware();
+
+            // Warmup Phase-1 doesn't go through the load-state middleware and holds no
+            // analysisLock read lock (see WarmupManager), so a reload's write lock can now win
+            // the race against it — making jadx.close() run underneath a still-running warmup
+            // thread. Quiesce warmup before the reload closes the old decompiler.
+            wrapper.addPreCloseQuiesceHook(this::quiesceWarmupBeforeClose);
 
             // --- Route registration ---
             registerRoutes();
@@ -231,10 +245,17 @@ public class DelamainServer {
                 return;
             }
             ctx.attribute(ANALYSIS_LOCK_ATTRIBUTE, Boolean.TRUE);
+            Long token = inFlightTokenSeq.incrementAndGet();
+            ctx.attribute(IN_FLIGHT_TOKEN_ATTRIBUTE, token);
+            inFlightRequestStartTimes.put(token, System.currentTimeMillis());
         });
         app.after(ctx -> {
             if (Boolean.TRUE.equals(ctx.attribute(ANALYSIS_LOCK_ATTRIBUTE))) {
                 wrapper.releaseAnalysisAccess();
+            }
+            Long token = ctx.attribute(IN_FLIGHT_TOKEN_ATTRIBUTE);
+            if (token != null) {
+                inFlightRequestStartTimes.remove(token);
             }
         });
     }
@@ -292,6 +313,29 @@ public class DelamainServer {
                 resp.put("load_error", wrapper.getLoadError());
             }
             resp.put("oom_detected", isOomDetected());
+
+            resp.put("search_lock", com.zin.delamain.utils.JadxSearchLock.getStatus());
+
+            Map<String, Object> analysisLock = new HashMap<>();
+            analysisLock.put("read_lock_count", wrapper.getAnalysisReadLockCount());
+            analysisLock.put("reload_pending", wrapper.isReloadPending());
+            resp.put("analysis_lock", analysisLock);
+
+            long oldestStart = Long.MAX_VALUE;
+            for (long start : inFlightRequestStartTimes.values()) {
+                if (start < oldestStart) {
+                    oldestStart = start;
+                }
+            }
+            Map<String, Object> requests = new HashMap<>();
+            requests.put("in_flight", inFlightRequestStartTimes.size());
+            requests.put("oldest_in_flight_seconds",
+                    oldestStart == Long.MAX_VALUE ? 0 : (System.currentTimeMillis() - oldestStart) / 1000);
+            resp.put("requests", requests);
+
+            if (wrapper.getLastReloadError() != null) {
+                resp.put("last_reload_error", wrapper.getLastReloadError());
+            }
 
             Runtime rt = Runtime.getRuntime();
             long max = rt.maxMemory();
@@ -362,6 +406,36 @@ public class DelamainServer {
 
             ctx.json(resp);
         });
+    }
+
+    // -------------------------------------------------------------------------
+    // Warmup quiesce
+    // -------------------------------------------------------------------------
+
+    private static final long WARMUP_QUIESCE_TIMEOUT_MILLIS = 15_000;
+    private static final long WARMUP_QUIESCE_POLL_MILLIS = 100;
+
+    /**
+     * Runs under the reload write lock, just before {@code jadx.close()}. Bounded so a warmup
+     * thread that ignores cancellation can never turn into another indefinite reload stall — the
+     * failure mode this whole diagnostics change exists to avoid.
+     */
+    private void quiesceWarmupBeforeClose() {
+        com.zin.delamain.index.WarmupManager.cancel();
+        long deadline = System.currentTimeMillis() + WARMUP_QUIESCE_TIMEOUT_MILLIS;
+        while (Boolean.TRUE.equals(com.zin.delamain.index.WarmupManager.getStatus().get("running"))) {
+            if (System.currentTimeMillis() > deadline) {
+                logger.warn("Warmup did not quiesce within {}ms before reload close; proceeding anyway",
+                        WARMUP_QUIESCE_TIMEOUT_MILLIS);
+                return;
+            }
+            try {
+                Thread.sleep(WARMUP_QUIESCE_POLL_MILLIS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
     }
 
     // -------------------------------------------------------------------------

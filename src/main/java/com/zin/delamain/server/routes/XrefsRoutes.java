@@ -52,6 +52,81 @@ public class XrefsRoutes {
     // threads: xref computation is bounded by JadxSearchLock (one write-lock holder at a time
     // for the live path), so a couple of workers is enough to keep requests moving without
     // piling up unbounded background threads.
+    // ── Live-path deadline ──────────────────────────────────────────────────────
+    // The live xref path decompiles every referrer on the request thread while holding the
+    // analysis read lock. A client-side timeout does NOT stop it (Jetty does not interrupt a
+    // handler when the client disconnects), so on 2026-07-22 one such request kept the read lock
+    // long enough to block a /load-file write lock and 503 the entire service until the container
+    // was restarted. This deadline is therefore not a latency knob — it is the upper bound on how
+    // long one request can hold that lock. Kept well below the gateway's 120s ceiling so the caller
+    // still gets a labelled partial answer plus room to retry, rather than a dead connection.
+    private static final int DEFAULT_LIVE_DEADLINE_SECONDS = 25;
+    private static final long LIVE_DEADLINE_MILLIS = resolveLiveDeadlineMillis();
+
+    private static long resolveLiveDeadlineMillis() {
+        String raw = System.getenv("DELAMAIN_XREF_DEADLINE_SECONDS");
+        if (raw != null && !raw.isBlank()) {
+            try {
+                int seconds = Integer.parseInt(raw.trim());
+                if (seconds > 0) {
+                    return seconds * 1000L;
+                }
+            } catch (NumberFormatException ignored) {
+                // fall through to the default
+            }
+        }
+        return DEFAULT_LIVE_DEADLINE_SECONDS * 1000L;
+    }
+
+    /**
+     * A wall-clock budget for the live xref path, plus a record of whether it actually cut anything
+     * short. Checked at the loop boundaries that iterate referrers — a single class decompile is not
+     * interruptible, so the real upper bound is the deadline plus one class.
+     */
+    static final class Deadline {
+        private final long deadlineNanos;
+        private volatile boolean truncated;
+
+        private Deadline(long deadlineNanos) {
+            this.deadlineNanos = deadlineNanos;
+        }
+
+        static Deadline in(long millis) {
+            return new Deadline(System.nanoTime() + millis * 1_000_000L);
+        }
+
+        /** No budget — used by the async ticket path, which is not on a request thread. */
+        static Deadline none() {
+            return new Deadline(Long.MAX_VALUE);
+        }
+
+        /** True once the budget is spent; records that results from here on are missing. */
+        boolean expired() {
+            if (deadlineNanos != Long.MAX_VALUE && System.nanoTime() - deadlineNanos >= 0) {
+                truncated = true;
+                return true;
+            }
+            return false;
+        }
+
+        boolean truncated() {
+            return truncated;
+        }
+    }
+
+    /** Labels a response whose live path was cut short, so a caller can tell it from a complete one. */
+    static void annotatePartial(Map<String, Object> result, Deadline deadline) {
+        if (deadline == null || !deadline.truncated()) {
+            return;
+        }
+        result.put("partial_results", true);
+        result.put("partial_reason",
+            "Live decompile of the referrer set exceeded the server-side deadline of "
+                + (LIVE_DEADLINE_MILLIS / 1000) + "s; the references below are a prefix of the full "
+                + "set. Run start-warmup (the indexed paths answer this instantly), narrow the "
+                + "target, or use POST /submit-xref for the unbounded async path.");
+    }
+
     private static final TicketRegistry<Map<String, Object>> XREF_TICKETS = new TicketRegistry<>(600);
     private static final int XREF_CACHE_WAIT_TIMEOUT_SECONDS = 60;
     private static final int MAX_BATCH_SIZE = 10;
@@ -227,17 +302,19 @@ public class XrefsRoutes {
         int contextLines = parseIntParam(ctx.queryParam("context_lines"), 3);
 
         if (!tryAcquireDecompileLock(ctx)) return;
+        Deadline deadline = Deadline.in(LIVE_DEADLINE_MILLIS);
         try {
             JavaClass targetJavaClass = findClassByName(ctx, className);
             if (targetJavaClass == null) return;
 
-            XrefComputeResult computed = computeClassXrefs(targetJavaClass, includeSnippet, contextLines);
+            XrefComputeResult computed = computeClassXrefs(targetJavaClass, includeSnippet, contextLines, deadline);
             if (includeSnippet) {
                 // Only the requested page gets snippets — see snippetWindow. Read the same
                 // offset/count the pagination helper is about to apply.
                 attachSnippets(snippetWindow(computed.references,
                     paginationUtils.getIntParam(ctx, "offset", 0),
-                    paginationUtils.getIntParam(ctx, "count", paginationUtils.DEFAULT_PAGE_SIZE)), contextLines);
+                    paginationUtils.getIntParam(ctx, "count", paginationUtils.DEFAULT_PAGE_SIZE)),
+                    contextLines, deadline);
             }
             Map<String, Object> result = paginationUtils.handlePagination(
                 ctx, computed.references, "xrefs", "references", ref -> ref);
@@ -245,6 +322,7 @@ public class XrefsRoutes {
             if (computed.via != null) result.put("via", computed.via);
             if (computed.hint != null) result.put("hint", computed.hint);
             result.put("distinct_referrer_class_count", countDistinctReferrerClasses(computed.references));
+            annotatePartial(result, deadline);
             ctx.json(result);
         } catch (PaginationException e) {
             ctx.status(400).json(Map.of("error", "Pagination error: " + e.getMessage()));
@@ -262,7 +340,8 @@ public class XrefsRoutes {
      * duplicating the fast-path/precise-path/live-path branching. Must be called with the
      * decompile read lock already held (both callers acquire it around this).
      */
-    private XrefComputeResult computeClassXrefs(JavaClass targetJavaClass, boolean includeSnippet, int contextLines) {
+    private XrefComputeResult computeClassXrefs(
+            JavaClass targetJavaClass, boolean includeSnippet, int contextLines, Deadline deadline) {
         // Cheap referrer set (no decompile) — computed up front so both fast paths below can
         // validate their coverage against it before being trusted (same gate as the batch
         // class-xref path in computeBatchXrefs; see coversAllReferrers). It also feeds the live
@@ -314,7 +393,7 @@ public class XrefsRoutes {
         if (includeSnippet && UsePlacesIndex.isReady()) {
             List<Map<String, Object>> persisted = buildPersistedPreciseClassRefs(targetJavaClass);
             if (persisted != null && coversAllReferrers(persisted, classReferences, methodReferences)) {
-                attachSnippets(persisted, contextLines);
+                attachSnippets(persisted, contextLines, deadline);
                 return new XrefComputeResult(persisted, "precise", "use-places-store",
                     "Precise call sites from the persisted use-places index "
                     + "(instant after restart; no caller decompile needed).");
@@ -334,7 +413,7 @@ public class XrefsRoutes {
         }
 
         List<Map<String, Object>> referenceList =
-            collectPreciseReferences(targetJavaClass, classReferences, methodReferences);
+            collectPreciseReferences(targetJavaClass, classReferences, methodReferences, deadline);
 
         // Snippets are deliberately NOT attached here. Each one costs a live decompile of the
         // referrer, and this list is the FULL referrer set — attaching them before pagination
@@ -364,6 +443,7 @@ public class XrefsRoutes {
         int contextLines = parseIntParam(ctx.queryParam("context_lines"), 3);
 
         if (!tryAcquireDecompileLock(ctx)) return;
+        Deadline deadline = Deadline.in(LIVE_DEADLINE_MILLIS);
         try {
             JavaClass containingClass = findClassByName(ctx, className);
             if (containingClass == null) return;
@@ -380,13 +460,20 @@ public class XrefsRoutes {
                 }
             }
 
-            XrefComputeResult computed = computeMethodXrefs(relatedMethods, includeSnippet, contextLines);
+            XrefComputeResult computed = computeMethodXrefs(relatedMethods, includeSnippet, contextLines, deadline);
+            if (includeSnippet) {
+                attachSnippets(snippetWindow(computed.references,
+                    paginationUtils.getIntParam(ctx, "offset", 0),
+                    paginationUtils.getIntParam(ctx, "count", paginationUtils.DEFAULT_PAGE_SIZE)),
+                    contextLines, deadline);
+            }
             Map<String, Object> result = paginationUtils.handlePagination(
                 ctx, computed.references, "xrefs", "references", ref -> ref);
             if (computed.resolution != null) result.put("resolution", computed.resolution);
             if (computed.via != null) result.put("via", computed.via);
             if (computed.hint != null) result.put("hint", computed.hint);
             result.put("distinct_referrer_class_count", countDistinctReferrerClasses(computed.references));
+            annotatePartial(result, deadline);
             ctx.json(result);
         } catch (PaginationException e) {
             ctx.status(400).json(Map.of("error", "Pagination error: " + e.getMessage()));
@@ -402,8 +489,8 @@ public class XrefsRoutes {
      * Core computation behind {@code /xrefs-to-method}, extracted so {@link #computeSingleXref}
      * (the {@code /submit-xref} async path) can share it with the sync handler.
      */
-    private XrefComputeResult computeMethodXrefs(
-            List<JavaMethod> relatedMethods, boolean includeSnippet, int contextLines) {
+    XrefComputeResult computeMethodXrefs(
+            List<JavaMethod> relatedMethods, boolean includeSnippet, int contextLines, Deadline deadline) {
         // Fast path: getUseIn() (the referrer set) is cheap; the >60s cost was the precise
         // line resolution that decompiles every caller. When snippets aren't requested,
         // return referrer class+method names directly without decompiling callers.
@@ -437,10 +524,13 @@ public class XrefsRoutes {
             mergeReferences(
                 referenceList,
                 seenReferences,
-                collectMethodReferences(relatedMethod, extractMethods(relatedMethod.getUseIn()))
+                collectMethodReferences(relatedMethod, extractMethods(relatedMethod.getUseIn()), deadline)
             );
         }
-        attachSnippets(referenceList, contextLines);
+        // Snippets are attached by the caller for only the page it returns (see snippetWindow) —
+        // same reasoning as the class-xref live path above: this is the FULL referrer set, and
+        // attaching snippets here would pay for a decompile of every referrer regardless of
+        // pagination.
         // Live-decompile fallback for method xrefs — tag explicitly like the class-xref live path
         // so row-count differences aren't mistaken for data loss (see distinct_referrer_class_count).
         return new XrefComputeResult(referenceList, "live-method-level", "live-decompile",
@@ -454,6 +544,7 @@ public class XrefsRoutes {
         if (className == null || fieldName == null) return;
 
         if (!tryAcquireDecompileLock(ctx)) return;
+        Deadline deadline = Deadline.in(LIVE_DEADLINE_MILLIS);
         try {
             JavaClass containingClass = findClassByName(ctx, className);
             if (containingClass == null) return;
@@ -461,7 +552,7 @@ public class XrefsRoutes {
             JavaField targetField = findFieldByName(ctx, containingClass, fieldName);
             if (targetField == null) return;
 
-            sendXrefsResponse(ctx, computeFieldXrefs(targetField));
+            sendXrefsResponse(ctx, computeFieldXrefs(targetField, deadline), deadline);
         } catch (PaginationException e) {
             ctx.status(400).json(Map.of("error", "Pagination error: " + e.getMessage()));
         } catch (Exception e) {
@@ -504,7 +595,7 @@ public class XrefsRoutes {
                 return;
             }
 
-            ctx.json(computeBatchXrefs(targets));
+            ctx.json(computeBatchXrefs(targets, Deadline.in(LIVE_DEADLINE_MILLIS)));
         } catch (Exception e) {
             logger.error("Internal error in batch xrefs: {}", e.getMessage(), e);
             ctx.status(500).json(Map.of("error", "Internal error in batch xrefs: " + e.getMessage()));
@@ -518,7 +609,7 @@ public class XrefsRoutes {
      * batch mode (see {@link #handleSubmitXref}) can share it. Assumes {@link ClassCacheManager}
      * is READY and the decompile read lock is already held by the caller.
      */
-    private Map<String, Object> computeBatchXrefs(String[] targets) throws Exception {
+    private Map<String, Object> computeBatchXrefs(String[] targets, Deadline deadline) throws Exception {
         Map<String, JavaClass> classMap = ClassCacheManager.getCache();
         List<Map<String, Object>> results = new ArrayList<>();
 
@@ -592,7 +683,7 @@ public class XrefsRoutes {
                             via = "use-places-store";
                             break;
                         }
-                        xrefs = collectPreciseReferences(targetClass, classRefs, methodRefs);
+                        xrefs = collectPreciseReferences(targetClass, classRefs, methodRefs, deadline);
                         resolution = "live-method-level";
                         via = "live-decompile";
                         break;
@@ -613,7 +704,7 @@ public class XrefsRoutes {
                                 mergeReferences(
                                     xrefs,
                                     seenMethodRefs,
-                                    collectMethodReferences(method, extractMethods(method.getUseIn()))
+                                    collectMethodReferences(method, extractMethods(method.getUseIn()), deadline)
                                 );
                             }
                         }
@@ -642,7 +733,7 @@ public class XrefsRoutes {
                                 mergeReferences(
                                     xrefs,
                                     seenFieldRefs,
-                                    collectMethodReferences(field, extractMethods(field.getUseIn()))
+                                    collectMethodReferences(field, extractMethods(field.getUseIn()), deadline)
                                 );
                             }
                         }
@@ -680,6 +771,7 @@ public class XrefsRoutes {
         Map<String, Object> response = new HashMap<>();
         response.put("results", results);
         response.put("total", targets.length);
+        annotatePartial(response, deadline);
         return response;
     }
 
@@ -770,7 +862,9 @@ public class XrefsRoutes {
                     throw new IllegalStateException("Timed out waiting for the decompile lock");
                 }
                 try {
-                    Map<String, Object> result = computeBatchXrefs(targets);
+                    // No deadline on the async ticket path — see the class-target case in
+                    // computeSingleXref for why.
+                    Map<String, Object> result = computeBatchXrefs(targets, Deadline.none());
                     result.put("kind", "batch");
                     return result;
                 } finally {
@@ -910,10 +1004,23 @@ public class XrefsRoutes {
     private void submitAsync(Context ctx, java.util.concurrent.Callable<Map<String, Object>> work) {
         CompletableFuture<Map<String, Object>> future = new CompletableFuture<>();
         xrefExecutor.submit(() -> {
+            // The HTTP request's own analysisLock read lock is released by the load-state
+            // middleware as soon as this method returns a ticket, but the task body below keeps
+            // touching jadx after that — without its own permit a reload's write lock has nothing
+            // stopping it from closing the decompiler out from under this thread. Acquire/release
+            // must happen on this same executor thread: ReentrantReadWriteLock's read lock cannot
+            // be released by a different thread than the one that acquired it.
+            if (!wrapper.tryAcquireAnalysisAccess()) {
+                future.completeExceptionally(new IllegalStateException(
+                        "APK is reloading or not ready; xref computation was not started"));
+                return;
+            }
             try {
                 future.complete(work.call());
             } catch (Exception e) {
                 future.completeExceptionally(e);
+            } finally {
+                wrapper.releaseAnalysisAccess();
             }
         });
         String ticket = XREF_TICKETS.register(future);
@@ -962,7 +1069,10 @@ public class XrefsRoutes {
 
         switch (type) {
             case "class": {
-                XrefComputeResult computed = computeClassXrefs(targetClass, includeSnippet, contextLines);
+                // No deadline on the async ticket path — it is not on a request thread and holds
+                // no read lock across HTTP responses, so the production-incident constraint the
+                // live-path deadline exists for does not apply here.
+                XrefComputeResult computed = computeClassXrefs(targetClass, includeSnippet, contextLines, Deadline.none());
                 if (includeSnippet) {
                     attachSnippets(snippetWindow(computed.references, 0, ASYNC_SNIPPET_CAP), contextLines);
                 }
@@ -981,7 +1091,10 @@ public class XrefsRoutes {
                         if (!relatedMethods.contains(m)) relatedMethods.add(m);
                     }
                 }
-                XrefComputeResult computed = computeMethodXrefs(relatedMethods, includeSnippet, contextLines);
+                XrefComputeResult computed = computeMethodXrefs(relatedMethods, includeSnippet, contextLines, Deadline.none());
+                if (includeSnippet) {
+                    attachSnippets(snippetWindow(computed.references, 0, ASYNC_SNIPPET_CAP), contextLines);
+                }
                 putComputeResult(payload, computed);
                 break;
             }
@@ -991,7 +1104,7 @@ public class XrefsRoutes {
                     throw new XrefLookupException(
                         "Field " + memberName + " not found in class " + targetClass.getFullName());
                 }
-                payload.put("references", computeFieldXrefs(targetField));
+                payload.put("references", computeFieldXrefs(targetField, Deadline.none()));
                 break;
             }
             default:
@@ -1016,7 +1129,7 @@ public class XrefsRoutes {
 
     /** Result of a single-target xref computation: the reference list plus optional metadata
      * (resolution/via/hint), shared by both the sync handlers and the async ticket path. */
-    private static final class XrefComputeResult {
+    static final class XrefComputeResult {
         final List<Map<String, Object>> references;
         final String resolution;
         final String via;
@@ -1109,8 +1222,8 @@ public class XrefsRoutes {
     }
 
     /** Core computation behind {@code /xrefs-to-field}, shared with the async single-target path. */
-    private List<Map<String, Object>> computeFieldXrefs(JavaField targetField) {
-        return collectMethodReferences(targetField, extractMethods(targetField.getUseIn()));
+    private List<Map<String, Object>> computeFieldXrefs(JavaField targetField, Deadline deadline) {
+        return collectMethodReferences(targetField, extractMethods(targetField.getUseIn()), deadline);
     }
 
     private List<JavaMethod> extractMethods(List<JavaNode> nodes) {
@@ -1131,8 +1244,9 @@ public class XrefsRoutes {
         return classes;
     }
 
-    private List<Map<String, Object>> collectMethodReferences(JavaNode targetNode, List<JavaMethod> methodNodes) {
-        return collectPreciseReferences(targetNode, Collections.emptyList(), methodNodes);
+    private List<Map<String, Object>> collectMethodReferences(
+            JavaNode targetNode, List<JavaMethod> methodNodes, Deadline deadline) {
+        return collectPreciseReferences(targetNode, Collections.emptyList(), methodNodes, deadline);
     }
 
     private void addIfUnique(List<Map<String, Object>> list, Set<String> seen, Map<String, Object> item) {
@@ -1194,18 +1308,21 @@ public class XrefsRoutes {
         return javaClass;
     }
 
-    private List<Map<String, Object>> collectPreciseReferences(
+    List<Map<String, Object>> collectPreciseReferences(
             JavaNode targetNode,
             List<JavaClass> classNodes,
-            List<JavaMethod> methodNodes) {
+            List<JavaMethod> methodNodes,
+            Deadline deadline) {
         LinkedHashMap<String, JavaClass> topUseClasses = new LinkedHashMap<>();
         for (JavaClass classNode : classNodes) {
+            if (deadline.expired()) break;
             JavaClass javaClass = ensureClassDecompiled(classNode);
             if (javaClass != null) {
                 topUseClasses.put(javaClass.getFullName(), javaClass);
             }
         }
         for (JavaMethod methodNode : methodNodes) {
+            if (deadline.expired()) break;
             JavaClass parentClass = methodNode.getDeclaringClass();
             if (parentClass == null) continue;
             JavaClass javaClass = ensureClassDecompiled(parentClass);
@@ -1218,6 +1335,7 @@ public class XrefsRoutes {
         Set<String> seenReferences = new HashSet<>();
 
         for (JavaClass topUseClass : topUseClasses.values()) {
+            if (deadline.expired()) break;
             boolean preciseAdded = collectUsePlacesForClass(targetNode, topUseClass, referenceList, seenReferences);
             if (preciseAdded) continue;
 
@@ -1335,9 +1453,11 @@ public class XrefsRoutes {
         }
     }
 
-    private void sendXrefsResponse(Context ctx, List<Map<String, Object>> referenceList) throws PaginationException {
+    private void sendXrefsResponse(
+            Context ctx, List<Map<String, Object>> referenceList, Deadline deadline) throws PaginationException {
         Map<String, Object> result = paginationUtils.handlePagination(ctx, referenceList, "xrefs", "references", ref -> ref);
         result.put("distinct_referrer_class_count", countDistinctReferrerClasses(referenceList));
+        annotatePartial(result, deadline);
         ctx.json(result);
     }
 
@@ -1397,11 +1517,18 @@ public class XrefsRoutes {
      * whatever the caller is actually working on.</p>
      */
     void attachSnippets(List<Map<String, Object>> referenceList, int contextLines) {
+        attachSnippets(referenceList, contextLines, Deadline.none());
+    }
+
+    void attachSnippets(List<Map<String, Object>> referenceList, int contextLines, Deadline deadline) {
         Map<String, String[]> sourceLineCache = new HashMap<>();
         // Referrers this call had to decompile itself, and therefore owns and must release.
         List<JavaClass> decompiledHere = new ArrayList<>();
 
         for (Map<String, Object> ref : referenceList) {
+            // Snippet rendering live-decompiles referrers too, so it is on the same budget as the
+            // referrer walk — rows past the deadline simply come back without a snippet.
+            if (deadline.expired()) break;
             try {
                 String fromClassName = (String) ref.get("class");
                 if (fromClassName == null || fromClassName.isEmpty()) {

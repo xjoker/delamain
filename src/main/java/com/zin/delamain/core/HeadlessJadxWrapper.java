@@ -13,6 +13,7 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -29,8 +30,46 @@ public class HeadlessJadxWrapper {
     private volatile int threads;
     private volatile LoadState loadState = LoadState.IDLE;
     private volatile String loadError;
+    private volatile String lastReloadError;
     private final Object loadStateLock = new Object();
     private final ReentrantReadWriteLock analysisLock = new ReentrantReadWriteLock(true);
+    /**
+     * Set by {@link #beginReload()} and cleared when the reload ends (successfully or not). This —
+     * not {@link LoadState#LOADING} — is what makes concurrent reloads mutually exclusive. Flipping
+     * the load state at reservation time instead took the currently-loaded APK offline for the
+     * entire time the reload spent waiting for the write lock, which on 2026-07-22 was "forever".
+     */
+    private volatile boolean reloadPending;
+    /** State to restore when a reservation is abandoned without the reload ever starting. */
+    private volatile LoadState stateBeforeReload = LoadState.IDLE;
+    /** How long a reload waits for the analysis write lock before giving up. */
+    private volatile long reloadLockTimeoutMillis = resolveReloadLockTimeoutMillis();
+    /** Quiesce callbacks run under the write lock, immediately before the old decompiler is closed. */
+    private final List<Runnable> preCloseQuiesceHooks = new CopyOnWriteArrayList<>();
+
+    private static final long DEFAULT_RELOAD_LOCK_TIMEOUT_MILLIS = 60_000L;
+
+    private static long resolveReloadLockTimeoutMillis() {
+        String raw = System.getenv("DELAMAIN_RELOAD_LOCK_TIMEOUT_SECONDS");
+        if (raw != null && !raw.isBlank()) {
+            try {
+                long seconds = Long.parseLong(raw.trim());
+                if (seconds > 0) {
+                    return seconds * 1000L;
+                }
+            } catch (NumberFormatException ignored) {
+                // fall through to the default
+            }
+        }
+        return DEFAULT_RELOAD_LOCK_TIMEOUT_MILLIS;
+    }
+
+    /** Thrown when a reload could not acquire the analysis write lock within its timeout. */
+    public static class ReloadLockTimeoutException extends IllegalStateException {
+        public ReloadLockTimeoutException(String message) {
+            super(message);
+        }
+    }
     // Immutable cache of the full class-with-inners list. jadx.getClassesWithInners() is stable
     // after load(); copying it into a fresh ArrayList on every call (there are 230k+ classes, and
     // every search request did this in its preamble) cost ~26ms/request and caused heavy
@@ -183,16 +222,29 @@ public class HeadlessJadxWrapper {
     }
 
     /**
-     * Reserves the wrapper for an asynchronous reload. Once reserved, all analysis requests
-     * receive a clear 503 until {@link #reloadReserved(List, File, int)} completes.
+     * Reserves the wrapper for an asynchronous reload. The reservation is mutual exclusion between
+     * reloads only — it deliberately does NOT take the currently-loaded APK offline. The load state
+     * flips to {@link LoadState#LOADING} inside {@link #reloadReserved} once the write lock is
+     * actually held, i.e. once the reload can really start.
+     *
+     * <p>Reserving used to flip the state immediately, which meant a reload that then waited on the
+     * write lock returned {@code 503 apk_not_ready} for every request in the meantime — and since
+     * that wait had no timeout, a single stuck analysis request took the whole service down until
+     * the container was restarted (production, 2026-07-22).</p>
      */
     public boolean beginReload() {
         synchronized (loadStateLock) {
-            if (loadState == LoadState.LOADING) {
+            if (reloadPending) {
                 return false;
             }
-            loadState = LoadState.LOADING;
-            loadError = null;
+            reloadPending = true;
+            stateBeforeReload = loadState;
+            if (loadState != LoadState.LOADED) {
+                // Nothing is being served anyway (first load, or a previous failure): showing
+                // LOADING right away is the honest status and keeps /decompile-status meaningful.
+                loadState = LoadState.LOADING;
+                loadError = null;
+            }
             return true;
         }
     }
@@ -200,17 +252,20 @@ public class HeadlessJadxWrapper {
     /**
      * Acquires a shared analysis permit. The caller must release it with
      * {@link #releaseAnalysisAccess()} after the request completes.
+     *
+     * <p>Uses the <b>untimed</b> {@code tryLock()} on purpose. {@code analysisLock} is fair, and a
+     * fair lock's <i>timed</i> {@code tryLock} refuses to barge past queued writers — so with a
+     * reload queued for the write lock, every incoming request was rejected even though the loaded
+     * APK could serve it perfectly well. The untimed form barges, which is exactly what keeps the
+     * service available while a reload waits its turn. Writer starvation is bounded by the reload's
+     * own {@link #reloadLockTimeoutMillis}: a reload that cannot get in fails loudly instead of
+     * waiting forever.</p>
      */
     public boolean tryAcquireAnalysisAccess() {
         if (loadState != LoadState.LOADED) {
             return false;
         }
-        try {
-            if (!analysisLock.readLock().tryLock(0, TimeUnit.MILLISECONDS)) {
-                return false;
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        if (!analysisLock.readLock().tryLock()) {
             return false;
         }
         if (loadState != LoadState.LOADED) {
@@ -218,6 +273,41 @@ public class HeadlessJadxWrapper {
             return false;
         }
         return true;
+    }
+
+    /**
+     * Registers a callback to run under the reload write lock, just before the old decompiler is
+     * closed. Used to stop background work that does not go through {@link #tryAcquireAnalysisAccess}
+     * (warmup), which would otherwise touch a closed {@link JadxDecompiler}.
+     */
+    public void addPreCloseQuiesceHook(Runnable hook) {
+        if (hook != null) {
+            preCloseQuiesceHooks.add(hook);
+        }
+    }
+
+    /** Test seam / operational override for how long a reload waits for the write lock. */
+    public void setReloadLockTimeoutMillis(long millis) {
+        this.reloadLockTimeoutMillis = millis;
+    }
+
+    public long getReloadLockTimeoutMillis() {
+        return reloadLockTimeoutMillis;
+    }
+
+    /** Error text of the last reload that failed to start; null once a reload succeeds. */
+    public String getLastReloadError() {
+        return lastReloadError;
+    }
+
+    /** Number of analysis requests currently holding the read lock (diagnostics for /health). */
+    public int getAnalysisReadLockCount() {
+        return analysisLock.getReadLockCount();
+    }
+
+    /** True while a reload is reserved but has not finished (diagnostics for /health). */
+    public boolean isReloadPending() {
+        return reloadPending;
     }
 
     public void releaseAnalysisAccess() {
@@ -275,17 +365,56 @@ public class HeadlessJadxWrapper {
      */
     public void reloadReserved(List<File> newInputFiles, File outputDir, int threads,
                                Runnable postLoadAction) {
-        if (loadState != LoadState.LOADING) {
+        if (!reloadPending) {
             throw new IllegalStateException("Reload was not reserved");
         }
-        analysisLock.writeLock().lock();
+        long timeoutMillis = reloadLockTimeoutMillis;
+        boolean acquired;
         try {
+            acquired = analysisLock.writeLock().tryLock(timeoutMillis, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            abandonReload("reload interrupted while waiting for the analysis write lock");
+            throw new ReloadLockTimeoutException(
+                "Reload interrupted while waiting for the analysis write lock");
+        }
+        if (!acquired) {
+            // Giving up here is the whole point: the previous unconditional lock() parked forever
+            // behind a stuck reader, and every request 503'd until someone restarted the container.
+            String message = "Could not start the reload: an analysis request has held the read lock "
+                + "for longer than " + timeoutMillis + "ms ("
+                + analysisLock.getReadLockCount() + " read lock holder(s), "
+                + analysisLock.getQueueLength() + " thread(s) queued). The currently loaded file "
+                + "stays available; retry, or restart the server if the request never finishes.";
+            abandonReload(message);
+            logger.error("[JADX] {}", message);
+            throw new ReloadLockTimeoutException(message);
+        }
+        try {
+            synchronized (loadStateLock) {
+                // Only now is the old input really going away, so only now do requests become 503.
+                loadState = LoadState.LOADING;
+                loadError = null;
+                lastReloadError = null;
+            }
             doReload(newInputFiles, outputDir, threads, postLoadAction);
         } catch (RuntimeException | Error t) {
             markLoadFailed(t);
             throw t;
         } finally {
+            synchronized (loadStateLock) {
+                reloadPending = false;
+            }
             analysisLock.writeLock().unlock();
+        }
+    }
+
+    /** Releases a reservation whose reload never started, leaving the loaded file serving. */
+    private void abandonReload(String message) {
+        synchronized (loadStateLock) {
+            reloadPending = false;
+            lastReloadError = message;
+            loadState = stateBeforeReload;
         }
     }
 
@@ -293,6 +422,16 @@ public class HeadlessJadxWrapper {
                           Runnable postLoadAction) {
         logger.info("[JADX] Reloading: {} file(s), output={}, threads={}",
                 newInputFiles.size(), outputDir, threads);
+        // Stop background work that does not hold the analysis read lock (warmup) before the
+        // decompiler it is walking gets closed underneath it. Holding the write lock only quiesces
+        // request handlers; this covers the rest.
+        for (Runnable hook : preCloseQuiesceHooks) {
+            try {
+                hook.run();
+            } catch (Exception e) {
+                logger.warn("[JADX] Pre-close quiesce hook failed: {}", e.getMessage());
+            }
+        }
         // Close the existing decompiler before creating a new one
         try {
             jadx.close();
@@ -340,6 +479,9 @@ public class HeadlessJadxWrapper {
             markLoadFailed(t);
             throw t;
         } finally {
+            synchronized (loadStateLock) {
+                reloadPending = false;
+            }
             analysisLock.writeLock().unlock();
         }
     }
