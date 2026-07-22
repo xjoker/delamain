@@ -47,6 +47,20 @@ public final class MemoryConfig {
     /** Estimated transient heap per concurrent decompile worker (MB). */
     private volatile long perWorkerHeapMB;
 
+    /**
+     * Default transient heap budget per concurrent decompile worker.
+     *
+     * <p>Was 1536 MB, derived when Phase-1 grew a heap-resident trigram index as it decompiled —
+     * that growth, not the decompile itself, was what 1.5 GB/worker was paying for. The content
+     * index is now an mmap'd shard on disk and Phase-1 writes each class through to the CodeStore
+     * and unloads it, so what a worker actually holds is one class's decompile working set.
+     * 384 MB keeps a wide margin over that while letting a right-sized container run real
+     * parallelism; {@link com.zin.delamain.index.WarmupManager#isHighMemoryPressure()} is the
+     * reactive net if a pathological class overshoots, and this stays hot-updatable via
+     * POST /memory-config.</p>
+     */
+    static final long DEFAULT_PER_WORKER_HEAP_MB = 384L;
+
     /** Minimum ms between explicit System.gc() calls across all workers. */
     private volatile long gcThrottleMs;
 
@@ -94,7 +108,7 @@ public final class MemoryConfig {
             safetyMargin          = 0.70;
             gcThrottleMs          = 15_000L;
         }
-        perWorkerHeapMB    = 1536L;
+        perWorkerHeapMB    = DEFAULT_PER_WORKER_HEAP_MB;
         pressureSleepBaseMs = 500L;
         phase4Fraction     = 0.25;
         overridden         = false;

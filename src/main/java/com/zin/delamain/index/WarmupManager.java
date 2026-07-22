@@ -107,13 +107,50 @@ public class WarmupManager {
      */
     static int computeWarmupWorkers(int classCount) {
         if (DECOMPILE_WORKERS_OVERRIDE > 0) return DECOMPILE_WORKERS_OVERRIDE;
-        int cores = Runtime.getRuntime().availableProcessors();
-        long maxHeapMB = Runtime.getRuntime().maxMemory() / (1024L * 1024L);
-        long baseMB = 1024L + (long) classCount / 1000L * 80L;       // ~80 MB / 1k classes + 1 GB floor
         MemoryConfig mc = MemoryConfig.get();
-        long usableMB = (long) ((maxHeapMB - baseMB) * mc.getSafetyMargin());
-        int byHeap = (int) Math.max(1L, usableMB / mc.getPerWorkerHeapMB());
-        int byCores = Math.max(1, cores - 2);                        // leave headroom for GC/IO/serving
+        return computeWarmupWorkers(
+            classCount,
+            Runtime.getRuntime().maxMemory() / (1024L * 1024L),
+            Runtime.getRuntime().availableProcessors(),
+            mc.getSafetyMargin(),
+            mc.getPerWorkerHeapMB());
+    }
+
+    /**
+     * Heap held by the structures that persist for the whole warmup, independent of worker count:
+     * the loaded jadx class tree plus the name/graph indices.
+     *
+     * <p>Calibrated against a production measurement rather than a guess: 20260722.2 on the XHS
+     * APK reports a clean post-GC steady state of <b>4 466 MB for 237 931 classes</b>
+     * (GET /memory-diagnostics), i.e. ~19 MB per 1 k classes. The previous constant assumed
+     * 80 MB/1k, which dated from when the trigram index lived in the heap; the content index is
+     * now an mmap'd shard on disk and Phase-1 writes through to the CodeStore before unloading.
+     * 20 MB/1k keeps a small margin over the measurement.</p>
+     */
+    static long estimateBaseHeapMB(int classCount) {
+        return 1024L + (long) classCount / 1000L * 20L;
+    }
+
+    /**
+     * Pure sizing function (package-private for direct testing — {@link WarmupWorkerSizingTest}
+     * pins both the heap and the CPU dimension against real production numbers).
+     *
+     * <p>workers = min( (maxHeap − base(classCount)) × safetyMargin / perWorkerHeap ,
+     * max(2, cores / 4) , 32 ), floored at 1.</p>
+     *
+     * <p>The CPU term is a deliberate throttle, not a headroom fudge: warmup runs while the server
+     * is answering search/xref requests, jadx's own engine parallelises internally on top of these
+     * workers, and the host may be shared with other services. Leaving three quarters of the cores
+     * free is what keeps the box usable during a cold warmup. Set
+     * {@code DELAMAIN_WARMUP_DECOMPILE_WORKERS} to override when the machine is known to be idle.
+     * {@link #isHighMemoryPressure()} remains the reactive safety net above whatever is chosen.</p>
+     */
+    static int computeWarmupWorkers(int classCount, long maxHeapMB, int cores,
+                                    double safetyMargin, long perWorkerHeapMB) {
+        long baseMB = estimateBaseHeapMB(classCount);
+        long usableMB = (long) ((maxHeapMB - baseMB) * safetyMargin);
+        int byHeap = (int) Math.max(1L, usableMB / Math.max(1L, perWorkerHeapMB));
+        int byCores = Math.max(2, cores / 4);
         int workers = Math.max(1, Math.min(Math.min(byHeap, byCores), 32));
         logger.info("[JAI] Auto-sized decompile workers={} (cores={}, maxHeap={}MB, classes={}, base={}MB, byHeap={}, byCores={})",
                 workers, cores, maxHeapMB, classCount, baseMB, byHeap, byCores);
