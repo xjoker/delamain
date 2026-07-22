@@ -330,6 +330,11 @@ public class WarmupManager {
         status.put("skipped_libraries", skip);
         status.put("percentage", percentage);
         status.put("elapsed_seconds", elapsedSec);
+        // How much parallelism Phase-1 actually got, and whether a human chose it. A slow warmup
+        // is otherwise indistinguishable from a stuck one, and an operator setting
+        // DELAMAIN_WARMUP_DECOMPILE_WORKERS has no way to confirm it took effect.
+        status.put("effective_decompile_workers", effectiveDecompileWorkers);
+        status.put("decompile_workers_source", DECOMPILE_WORKERS_OVERRIDE > 0 ? "override" : "auto");
         status.put("trigram_build_running", trigramBuildRunning.get());
         status.put("trigram_count", CodeContentIndex.trigramCount());
         // Precise use-places (E2): readiness + one-time harvest progress (surfaced to MCP

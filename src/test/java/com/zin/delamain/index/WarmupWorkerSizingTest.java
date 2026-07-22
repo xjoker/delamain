@@ -79,6 +79,25 @@ class WarmupWorkerSizingTest {
         assertEquals(2, workers(5000, 8192, 4, 0.55));
     }
 
+    /**
+     * The chosen worker count must be visible to callers. Without it, an AI client watching a slow
+     * warmup cannot tell "this box is small / throttled" from "something is stuck", and an operator
+     * cannot tell whether DELAMAIN_WARMUP_DECOMPILE_WORKERS actually took effect. The gateway's
+     * get_warmup_status docstring documents both of these fields.
+     */
+    @Test
+    void statusExposesTheChosenWorkerCountAndWhereItCameFrom() {
+        java.util.Map<String, Object> status = WarmupManager.getStatus();
+
+        Object workers = status.get("effective_decompile_workers");
+        assertTrue(workers instanceof Number && ((Number) workers).intValue() >= 1,
+            "effective_decompile_workers must be reported: " + status);
+
+        Object source = status.get("decompile_workers_source");
+        assertTrue("auto".equals(source) || "override".equals(source),
+            "decompile_workers_source must say whether the env override applied, got: " + source);
+    }
+
     @Test
     void resultIsAlwaysAtLeastOneAndNeverAbsurd() {
         for (int classes : new int[]{0, 1000, 50000, 500000}) {

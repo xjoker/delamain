@@ -60,8 +60,14 @@ fi
 # Detection failure must never block startup, so fall back to JAVA_OPTS as-is.
 JAVA_OPTS_RESOLVED="$(cd /app/gateway && JAVA_OPTS="${JAVA_OPTS:-}" python3 -m src.heap_config)" \
     || JAVA_OPTS_RESOLVED="${JAVA_OPTS:-}"
+# Pin the SLF4J provider explicitly: jadx-all bundles logback alongside our slf4j-simple, so
+# without this SLF4J prints a four-line "multiple providers" warning at every startup and picks
+# one non-deterministically -- meaning the log format and default level of the backend would
+# depend on classpath scan order. (The api/binding version mismatch that made the backend log
+# NOTHING at all is fixed in pom.xml; see PackagedLoggingBindingTest.)
 # shellcheck disable=SC2086  # intentional word-splitting so multiple flags pass through
-java ${JAVA_OPTS_RESOLVED} -cp "/app/delamain.jar:${JADX_JAR}" \
+java ${JAVA_OPTS_RESOLVED} -Dslf4j.provider=org.slf4j.simple.SimpleServiceProvider \
+    -cp "/app/delamain.jar:${JADX_JAR}" \
     com.zin.delamain.Main \
     --port 8650 \
     --bind 127.0.0.1 \

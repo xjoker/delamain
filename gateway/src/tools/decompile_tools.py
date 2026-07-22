@@ -302,13 +302,19 @@ def register_decompile_tools(mcp):
         skip_libraries: bool = True,
         instance_id: Optional[str] = None,
     ) -> dict:
-        """Warm the full decompile cache in the background so code search works without restrictions.
+        """Manually trigger a full background cache warmup (decompile + trigram + xref graph).
 
-        After calling this, cached_percentage in get_decompile_status() will rise toward 100%.
-        Use get_warmup_status() to poll progress. No busy-check: starts immediately and returns.
+        The server already auto-triggers this warmup right after a file is loaded (unless disabled
+        via DELAMAIN_WARMUP_ON_START=false on the Java side). Call this tool yourself only when: the
+        server was started with warmup-on-load disabled, a previous warmup was cancelled/failed and
+        needs a restart, or you want to redo it with a different skip_libraries setting. Calling it
+        while a warmup is already running is a no-op / returns the current run's state (it does not
+        start a second overlapping pass). No busy-check: starts immediately and returns; poll
+        progress with get_warmup_status().
 
         Args:
-            skip_libraries: Skip known SDK packages (android.*, kotlin.*, etc.). Default True.
+            skip_libraries: Skip known third-party SDK packages (android.*, kotlin.*, etc.) to warm
+                only app-owned classes. Default True.
             instance_id: Target JADX instance name.
         Returns:
             dict: {started, total_classes, skipped_libraries, message}
@@ -317,10 +323,80 @@ def register_decompile_tools(mcp):
 
     @mcp.tool()
     async def get_warmup_status(instance_id: Optional[str] = None) -> dict:
-        """Poll progress of a background cache warmup started by warm_cache().
+        """Poll progress of the background cache warmup (auto-started on file load, or via warm_cache()).
+
+        Use this to decide what you can do RIGHT NOW vs what you must still wait for — check
+        `capabilities` first, then use `eta_seconds`/`eta_basis` if you need to wait.
 
         Returns:
-            dict: {phase, running, total, processed, failed, percentage, elapsed_seconds}
+            dict:
+            - phase: current warmup stage name, one of ENGINE_INIT | PHASE1_DECOMPILE | PHASE2_INDEX |
+              PHASE3_GRAPH | PHASE4_USEPLACES | FAST_RESTORE | DONE | IDLE | CANCELLED | ERROR.
+            - running: whether the Phase-1..4 warmup pipeline is actively running right now.
+            - total / processed / failed: Phase-1 decompile counters (classes queued / done / errored).
+            - skipped_libraries: classes excluded because skip_libraries=True was used to start warmup.
+            - percentage: Phase-1 decompile-only completion, 0-100 (processed/total). NOT the overall
+              warmup progress — use overall_progress_pct for that.
+            - elapsed_seconds: seconds since this warmup run started (or total run time if finished).
+            - trigram_build_running: whether the in-memory trigram index is currently being built.
+            - trigram_count: number of trigram entries built so far (0 if using the mmap shard index
+              instead — see capabilities.code_search for the authoritative readiness signal).
+            - trigram_skip_reason: present only if trigram build was skipped, e.g. "low-heap"; absent
+              (key missing) otherwise.
+            - use_places_ready: whether the precise xref-with-snippet index has finished its one-time
+              harvest.
+            - use_places_harvest_running / use_places_harvest_processed / use_places_harvest_total:
+              background harvest progress for precise cross-reference snippets (runs after core
+              warmup finishes; does not block other capabilities).
+            - use_places_skip_reason: present only if the harvest was skipped, e.g. "low-heap"; absent
+              (key missing) otherwise.
+            - warming_up: single boolean = "is anything still warming" (core pipeline OR the
+              use-places harvest). False means everything below has settled into its final state.
+            - overall_progress_pct: 0-100 blended progress across ALL phases (decompile + trigram +
+              graph + use-places harvest), weighted by each phase's typical cost share. This is the
+              number to show a human/progress bar — percentage above is only Phase-1.
+            - eta_seconds: rough estimate of seconds remaining until warmup fully settles (null while
+              there isn't enough data yet, e.g. right at the start of a phase). Extrapolated from
+              elapsed time and current progress rate, not a hard guarantee.
+            - eta_basis: what eta_seconds was computed from — "overall-progress-rate" (normal
+              extrapolation from Phase-1..3 progress), "fast-restore-estimate" (hot-start path
+              restoring from existing cache), "useplaces-harvest" (core warmup done, only the
+              background snippet harvest remains), "starting" (just began, no rate yet), "idle"
+              (nothing running), or "done".
+            - capabilities: dict mapping capability name -> readiness string. Check this BEFORE
+              calling the corresponding tool:
+                - "ready": safe to use now.
+                - "warming": still being built; the corresponding tool call may be slow, return
+                  partial results, or should be retried later.
+                - "skipped:low-heap": permanently unavailable this run because the host doesn't have
+                  enough heap; do not poll waiting for "ready" — it will never arrive.
+              Keys:
+                - metadata_search: class/method name and structure search. Ready as soon as the APK
+                  is loaded (does not depend on warmup).
+                - class_source: decompiled Java source lookup (get_class_source). Ready
+                  quickly — served from cache once warm, falls back to lazy live-decompile before that.
+                - smali: smali disassembly lookup. Same readiness story as class_source.
+                - live_decompile: on-demand decompilation of an arbitrary class. "warming" until the
+                  one-time JADX engine init completes (a real cost paid once, ~13s on a large APK);
+                  after that, individual live-decompile calls are fast.
+                - code_search: full-text/regex search over decompiled code bodies
+                  (search_in='code' on the search tool). Do NOT issue search_in='code' calls while
+                  this is not "ready" — results will be empty or incomplete, not just slow. If this
+                  is "skipped:low-heap", code-body search is unavailable for the whole session; use
+                  metadata_search (name/structure) instead.
+                - xref_class_level: class-level cross-reference graph (who calls/uses this class).
+                  "warming" until the usage graph index finishes building.
+                - precise_xref_snippets: cross-references with exact call-site source snippets (as
+                  opposed to class-level-only). "warming" while the one-time use-places harvest is
+                  still running; falls back to a slower live lookup path in the meantime, so calls
+                  don't fail, they're just not instant.
+            - effective_decompile_workers: number of parallel decompile worker threads this warmup
+              run is actually using. Higher = warmup finishes faster (more CPU/heap spent now);
+              use this to sanity-check why a run is faster/slower than expected on a given host.
+            - decompile_workers_source: where effective_decompile_workers came from — "auto" (sized
+              automatically from available heap and CPU cores) or "override" (pinned by the
+              DELAMAIN_WARMUP_DECOMPILE_WORKERS environment variable, ignoring auto-sizing). Useful
+              for spotting an operator-imposed speed limit vs. a hardware-limited one.
         """
         return await _get_warmup_status(instance_id=instance_id)
 

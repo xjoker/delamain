@@ -37,6 +37,15 @@
             <artifactId>jadx-all</artifactId>
             <version>${jadx.version}</version>
             <scope>compile</scope>
+            <exclusions>
+                <!-- jadx-all bundles its own slf4j classes and also declares slf4j-api 1.7.30.
+                     Excluding it here makes the resolved api deterministic (the 2.0.13 declared
+                     below) instead of depending on Maven resolution order — see the SLF4J block. -->
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-api</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <!-- JSON serialization -->
@@ -74,7 +83,19 @@
             <version>1.3.0</version>
         </dependency>
 
-        <!-- SLF4J implementation (required by Javalin) -->
+        <!-- SLF4J implementation (required by Javalin).
+             The api MUST be declared explicitly and pinned to the same generation as the binding:
+             jadx-all drags in slf4j-api 1.7.30 transitively, and Maven's nearest-wins would
+             otherwise shade THAT into the fat jar next to this 2.x binding. A 1.7 api looks up
+             org.slf4j.impl.StaticLoggerBinder, which a 2.x provider does not ship, so SLF4J
+             silently falls back to the NOP logger and the whole server logs nothing — the
+             production defect found on 2026-07-22 (see PackagedLoggingBindingTest). Surefire never
+             saw it because tests run against the dependency classpath, not the shaded artifact. -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>2.0.13</version>
+        </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-simple</artifactId>
