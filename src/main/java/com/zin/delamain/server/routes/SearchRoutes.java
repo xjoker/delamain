@@ -101,6 +101,21 @@ public class SearchRoutes {
         System.getenv().getOrDefault("DELAMAIN_UNINDEXED_CONTENT_SCAN_MAX", "20000")
     );
     static int UNINDEXED_CONTENT_SCAN_MAX = DEFAULT_UNINDEXED_CONTENT_SCAN_MAX;
+    // Hard cap on how many classes ANY single content search may actually read. The guards above
+    // bound the query by index state; this one bounds the only thing that actually costs time.
+    // Production (XHS, 237 931 classes) proved the difference: the shard index existed and the
+    // term was narrow — so neither of the other guards fired — yet the shard covered only ~107 k
+    // classes and the ~131 k uncovered residue, which no sound index may prune, was read to the
+    // 60 s deadline. At ~0.27 ms/class this budget is the wall-clock dial: 20 000 ≈ 5-6 s.
+    static final int DEFAULT_CONTENT_SCAN_BUDGET = Integer.parseInt(
+        System.getenv().getOrDefault("DELAMAIN_CONTENT_SCAN_BUDGET", "20000")
+    );
+    static int CONTENT_SCAN_BUDGET = DEFAULT_CONTENT_SCAN_BUDGET;
+    // Corpus size above which the scan runs on the batch pool instead of the calling thread.
+    // Mutable so tests can exercise the parallel branch (the one production takes) on a small
+    // fixture instead of only the serial one.
+    static final int DEFAULT_PARALLEL_SCAN_MIN_CLASSES = 100;
+    static int PARALLEL_SCAN_MIN_CLASSES = DEFAULT_PARALLEL_SCAN_MIN_CLASSES;
     private static final ScheduledExecutorService DECOMPILE_WATCHDOG =
         Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "jadx-decompile-watchdog");
@@ -655,17 +670,27 @@ public class SearchRoutes {
         // construction (executeBroadTermSearch does no metadata matching). A search that mixes a
         // metadata location with CODE therefore used to skip the guard and scan the full candidate
         // set. Keep its metadata phase intact, but cap the content scan at the same bounded sample.
-        final AtomicInteger contentScanBudget =
-            (requiresContentSearch && shardResult != null
-                && shardResult.candidates.getCardinality() > BROAD_CANDIDATE_THRESHOLD)
-                ? new AtomicInteger(BROAD_SAMPLE_SCAN) : null;
+        //
+        // Otherwise every content scan still gets CONTENT_SCAN_BUDGET, because index state is not
+        // a bound on work: a built-but-partial shard leaves an unprunable residue that is only
+        // bounded by the corpus size (production: 131 k classes = the whole 60 s deadline).
+        final boolean broadMixed = requiresContentSearch && shardResult != null
+            && shardResult.candidates.getCardinality() > BROAD_CANDIDATE_THRESHOLD;
+        final AtomicInteger contentScanBudget = requiresContentSearch
+            ? new AtomicInteger(broadMixed ? Math.min(BROAD_SAMPLE_SCAN, CONTENT_SCAN_BUDGET)
+                                           : CONTENT_SCAN_BUDGET)
+            : null;
         final AtomicInteger contentScanned = new AtomicInteger(0);
+        final AtomicInteger contentCandidateTotal = new AtomicInteger(0);
+        // Classes a bulk scan refused to live-decompile (source not materialised). Reported so a
+        // miss is never silently indistinguishable from a genuine absence.
+        final AtomicInteger contentUnreadable = new AtomicInteger(0);
 
         // Parallel-batch any search over a non-trivial corpus.
         // Previously gated on `collectAllResults`, which meant the high-frequency
         // metadata search path (search-classes-by-keyword) ran a sequential
         // 137 k-class scan in the calling Jetty thread, serialising under load.
-        if (filteredClasses.size() > 100) {
+        if (filteredClasses.size() > PARALLEL_SCAN_MIN_CLASSES) {
             // Batch over the full filtered set (outer AND inner classes). This previously built
             // a `topClasses` list that dropped every `cls.isInner()` entry before batching, which
             // silently excluded ALL inner classes from class/method/field matching in this
@@ -722,38 +747,52 @@ public class SearchRoutes {
                 // is now a CodeStore disk read (see classMatchesAnyContentLocation), so the scan
                 // scales near-linearly with cores. matchedClasses/totalMatches/cancelled are all
                 // concurrency-safe; the deadline/cancel checks are re-evaluated per class.
-                List<List<JavaClass>> contentBatches =
-                    splitIntoBatches(new ArrayList<>(contentCandidates), processorCount);
-                List<Future<?>> contentFutures = new ArrayList<>();
-                for (List<JavaClass> batch : contentBatches) {
-                    contentFutures.add(batchExecutor.submit(() -> {
-                        for (JavaClass cls : batch) {
-                            if (cancelled.get() || Thread.currentThread().isInterrupted()) return;
-                            if (System.nanoTime() >= deadlineNanos) { cancelled.set(true); return; }
-                            // H6 soundness guard (shard layer + residual fallback). Only classes a
-                            // sound index authoritatively rejects are skipped; anything uncertain
-                            // falls through to the real content scan (lazily decompiling +
-                            // self-healing) rather than being silently excluded.
-                            if (isDefinitivelyAbsent(cls, shardResult, trigramCandidates,
-                                    trigramDefinitivelyEmpty, shardCoveredPruned)) continue;
-                            if (!claimContentScanSlot(contentScanBudget)) continue;
-                            contentScanned.incrementAndGet();
-                            if (classMatchesAnyContentLocation(cls, term, searchLocations, matchMode, compiledRegex)
-                                    && matchedClasses.add(cls.getFullName())) {
-                                int total = totalMatches.incrementAndGet();
-                                if (!collectAllResults && total >= resultsNeeded) { cancelled.set(true); return; }
-                            }
-                        }
-                    }));
+                // Split the scan set into what the shard says MAY match and the residue no sound
+                // index makes any claim about, and spend the budget on the former first. That
+                // keeps the indexed part of the answer exact and confines sampling to the residue
+                // — which is the half of the corpus the shard never covered.
+                List<JavaClass> shardCandidateFirst = new ArrayList<>();
+                List<JavaClass> residue = new ArrayList<>();
+                for (JavaClass cls : contentCandidates) {
+                    if (isDefinitivelyAbsent(cls, shardResult, trigramCandidates,
+                            trigramDefinitivelyEmpty, shardCoveredPruned)) continue;
+                    if (isShardCandidate(cls, shardResult)) shardCandidateFirst.add(cls);
+                    else residue.add(cls);
                 }
-                for (Future<?> future : contentFutures) {
-                    try {
-                        long remainingNanos = deadlineNanos - System.nanoTime();
-                        if (remainingNanos <= 0) { timedOut = true; cancelled.set(true); future.cancel(true); continue; }
-                        future.get(remainingNanos, TimeUnit.NANOSECONDS);
-                    } catch (TimeoutException e) {
-                        timedOut = true; cancelled.set(true); future.cancel(true);
-                    } catch (Exception ignored) {}
+                contentCandidateTotal.set(shardCandidateFirst.size() + residue.size());
+
+                for (List<JavaClass> scanSet : List.of(shardCandidateFirst, residue)) {
+                    if (scanSet.isEmpty() || timedOut || cancelled.get()
+                            || contentScanBudget.get() <= 0) continue;
+                    List<List<JavaClass>> contentBatches = splitIntoBatches(scanSet, processorCount);
+                    List<Future<?>> contentFutures = new ArrayList<>();
+                    for (List<JavaClass> batch : contentBatches) {
+                        contentFutures.add(batchExecutor.submit(() -> {
+                            for (JavaClass cls : batch) {
+                                if (cancelled.get() || Thread.currentThread().isInterrupted()) return;
+                                if (System.nanoTime() >= deadlineNanos) { cancelled.set(true); return; }
+                                // Budget exhausted: stop reading classes rather than run to the
+                                // deadline. The result is marked partial (content_scan_sampled).
+                                if (!claimContentScanSlot(contentScanBudget)) return;
+                                contentScanned.incrementAndGet();
+                                if (classMatchesAnyContentLocation(cls, term, searchLocations, matchMode,
+                                        compiledRegex, false, contentUnreadable)
+                                        && matchedClasses.add(cls.getFullName())) {
+                                    int total = totalMatches.incrementAndGet();
+                                    if (!collectAllResults && total >= resultsNeeded) { cancelled.set(true); return; }
+                                }
+                            }
+                        }));
+                    }
+                    for (Future<?> future : contentFutures) {
+                        try {
+                            long remainingNanos = deadlineNanos - System.nanoTime();
+                            if (remainingNanos <= 0) { timedOut = true; cancelled.set(true); future.cancel(true); continue; }
+                            future.get(remainingNanos, TimeUnit.NANOSECONDS);
+                        } catch (TimeoutException e) {
+                            timedOut = true; cancelled.set(true); future.cancel(true);
+                        } catch (Exception ignored) {}
+                    }
                 }
             }
         } else {
@@ -770,11 +809,13 @@ public class SearchRoutes {
                     // H6 fix: same soundness guard as the parallel branch above — see comment there.
                     if (isDefinitivelyAbsent(cls, shardResult, trigramCandidates,
                             trigramDefinitivelyEmpty, shardCoveredPruned)) continue;
+                    contentCandidateTotal.incrementAndGet();
                     // Budget exhausted → skip this class's content scan but keep looping: the
                     // metadata phase is interleaved in this branch and must not be cut short.
                     if (!claimContentScanSlot(contentScanBudget)) continue;
                     contentScanned.incrementAndGet();
-                    if (classMatchesAnyContentLocation(cls, term, searchLocations, matchMode, compiledRegex)
+                    if (classMatchesAnyContentLocation(cls, term, searchLocations, matchMode,
+                            compiledRegex, false, contentUnreadable)
                             && matchedClasses.add(cls.getFullName())) {
                         int total = totalMatches.incrementAndGet();
                         if (!collectAllResults && total >= resultsNeeded) cancelled.set(true);
@@ -830,16 +871,41 @@ public class SearchRoutes {
             searchInfo.put("partial_results", true);
             searchInfo.put("hint", contentScanSkippedHint(filteredClasses.size(), searchLocations, matchMode)
                 + " Metadata (class/method/field name) matches in this result are complete.");
-        } else if (contentScanBudget != null) {
+        } else if (contentScanBudget != null && contentScanned.get() < contentCandidateTotal.get()) {
+            // The budget bound before every candidate was read: say so rather than implying the
+            // corpus was exhausted. Everything a sound index could prune is still definitively
+            // excluded and metadata matches are unaffected — only the unindexed residue is sampled.
             searchInfo.put("content_scan_sampled", true);
             searchInfo.put("content_scanned", contentScanned.get());
-            searchInfo.put("candidate_count", shardResult.candidates.getCardinality());
+            searchInfo.put("content_candidates_total", contentCandidateTotal.get());
+            if (shardResult != null) {
+                searchInfo.put("candidate_count", shardResult.candidates.getCardinality());
+            }
             searchInfo.put("partial_results", true);
-            searchInfo.put("hint", "Term '" + searchTerm + "' matches "
-                + shardResult.candidates.getCardinality() + " candidate classes by content (too "
-                + "broad to fully verify); the content scan was capped at " + contentScanned.get()
-                + " classes. Metadata (class/method/field name) matches are complete — narrow the "
-                + "term for complete content matches.");
+            searchInfo.put("hint", "Content scan was capped at " + contentScanned.get() + " of "
+                + contentCandidateTotal.get() + " candidate classes (budget " + CONTENT_SCAN_BUDGET
+                + ", env DELAMAIN_CONTENT_SCAN_BUDGET) so it returns in seconds instead of hitting "
+                + "the " + SEARCH_TIMEOUT_SECONDS + "s limit. Classes the content index covers were "
+                + "scanned FIRST, so those matches are complete; the shard-uncovered remainder is a "
+                + "sample. Narrow the term, pass package= to shrink the corpus, or use "
+                + "search_in=class/method for an exact answer.");
+        } else if (contentScanBudget != null) {
+            searchInfo.put("content_scanned", contentScanned.get());
+            searchInfo.put("content_candidates_total", contentCandidateTotal.get());
+        }
+        if (requiresContentSearch && contentUnreadable.get() > 0) {
+            // Not an error: these classes simply have no decompiled source on disk yet (typically
+            // libraries warmup skipped). Naming the count keeps a miss honest — the term may still
+            // live in one of them — and points at the one action that fixes it.
+            searchInfo.put("content_unreadable_classes", contentUnreadable.get());
+            searchInfo.put("partial_results", true);
+            String prior = (String) searchInfo.get("hint");
+            searchInfo.put("hint", (prior == null ? "" : prior + " ")
+                + contentUnreadable.get() + " class(es) were skipped because their decompiled "
+                + "source is not materialised yet (bulk search never live-decompiles — that is "
+                + "serialised behind a global lock and costs seconds per class). Run warmup "
+                + "(start_warmup) to persist those sources, or use get_class_source on a specific "
+                + "class.");
         }
 
         CodeSearchCoordinator.SearchResult result = new CodeSearchCoordinator.SearchResult(
@@ -856,6 +922,13 @@ public class SearchRoutes {
      * normal, indexed path), so this returns {@code true} without touching anything. Returns
      * {@code false} once the budget is exhausted, and never lets the counter drift below zero.
      */
+    /** True when the shard index positively lists this class as a possible match for the term. */
+    private static boolean isShardCandidate(JavaClass cls, TermLookupResult shardResult) {
+        if (shardResult == null) return false;
+        int id = CodeContentIndex.idOf(cls);
+        return id >= 0 && shardResult.candidates.contains(id);
+    }
+
     private static boolean claimContentScanSlot(AtomicInteger budget) {
         if (budget == null) return true;
         return budget.getAndUpdate(v -> v > 0 ? v - 1 : 0) > 0;
@@ -960,6 +1033,7 @@ public class SearchRoutes {
         Set<String> matchedClasses = new HashSet<>();
         int totalMatches = 0;
         int sampledScanned = 0;
+        AtomicInteger broadUnreadable = new AtomicInteger(0);
 
         for (int id : shardResult.candidates) {
             if (sampledScanned >= BROAD_SAMPLE_SCAN) break;
@@ -967,7 +1041,8 @@ public class SearchRoutes {
             if (cls == null || !filteredSet.contains(cls)) continue;
             sampledScanned++;
             try {
-                if (classMatchesAnyContentLocation(cls, term, searchLocations, matchMode, compiledRegex)
+                if (classMatchesAnyContentLocation(cls, term, searchLocations, matchMode,
+                        compiledRegex, false, broadUnreadable)
                         && matchedClasses.add(cls.getFullName())) {
                     totalMatches++;
                 }
@@ -990,6 +1065,7 @@ public class SearchRoutes {
         searchInfo.put("broad_term", true);
         searchInfo.put("candidate_count", candidateCount);
         searchInfo.put("sampled_scanned", sampledScanned);
+        searchInfo.put("content_unreadable_classes", broadUnreadable.get());
         searchInfo.put("partial_results", true);
         searchInfo.put("hint", "Term '" + searchTerm + "' matches " + candidateCount
             + " candidate classes (too broad to fully verify); showing matches from first "
@@ -1249,6 +1325,22 @@ public class SearchRoutes {
     private boolean classMatchesAnyContentLocation(
         JavaClass cls, String term, Set<SearchLocation> locations, MatchMode matchMode, Pattern compiledRegex
     ) {
+        return classMatchesAnyContentLocation(cls, term, locations, matchMode, compiledRegex, true, null);
+    }
+
+    /**
+     * @param allowLiveDecompile {@code false} for BULK scans. Live decompile is serialised behind
+     *        the global {@link JadxSearchLock} and costs seconds per class, so letting a scan fall
+     *        back to it makes the scan unbounded regardless of any class-count budget — measured on
+     *        production as 3.7 ms/class average (16 053 classes = the full 60 s deadline) while a
+     *        CodeStore read is ~0.27 ms. A bulk scan therefore reads only materialised sources and
+     *        counts what it had to skip; single-class tools still pass {@code true}.
+     * @param unreadable incremented for each class skipped because its source is not materialised.
+     */
+    private boolean classMatchesAnyContentLocation(
+        JavaClass cls, String term, Set<SearchLocation> locations, MatchMode matchMode,
+        Pattern compiledRegex, boolean allowLiveDecompile, AtomicInteger unreadable
+    ) {
         if (!requiresContentSearch(locations)) return false;
         try {
             // Resolve the class source original-case, cheapest source first:
@@ -1266,6 +1358,11 @@ public class SearchRoutes {
             if (originalCode != null) {
                 normalizedCode = originalCode.toLowerCase();
                 CodeContentIndex.index(cls, normalizedCode);
+            } else if (!allowLiveDecompile) {
+                // Bulk scan: the source is not materialised and decompiling it here would serialise
+                // the whole scan behind the global lock. Skip it and let the caller report it.
+                if (unreadable != null) unreadable.incrementAndGet();
+                return false;
             } else {
                 Thread searchThread = Thread.currentThread();
                 ScheduledFuture<?> watchdog = DECOMPILE_WATCHDOG.schedule(

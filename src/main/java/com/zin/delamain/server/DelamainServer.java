@@ -44,8 +44,12 @@ public class DelamainServer {
     private final String bindAddress;
     private final AuthConfig authConfig;
 
-    private static final Set<String> NO_FILE_REQUIRED_PATHS = Set.of(
-            "/health", "/apk-info", "/decompile-status", "/memory-config",
+    // Package-private so the contract is directly assertable (see DelamainServerNoFilePathsTest).
+    // /memory-diagnostics belongs here for the same reason /memory-config does: it reads only the
+    // JVM, /proc and index statics, and its most valuable readings (baseline before a load,
+    // verifying the container-derived heap took effect) are taken with nothing loaded.
+    static final Set<String> NO_FILE_REQUIRED_PATHS = Set.of(
+            "/health", "/apk-info", "/decompile-status", "/memory-config", "/memory-diagnostics",
             "/list-available-files", "/load-file",
             "/create-transfer-token", "/transfer/upload", "/transfer/status");
 

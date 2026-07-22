@@ -112,6 +112,12 @@ class SearchRoutesBroadTermTest {
         }
         buildAndLoadShard(dir, corpus);
 
+        // Materialise the real classes' sources. A bulk scan deliberately never live-decompiles
+        // (that is serialised behind the global JadxSearchLock and costs seconds per class — see
+        // SearchRoutesNoBulkLiveDecompileTest), so without this the sample would have nothing
+        // readable to match and this test would be asserting on the wrong mechanism.
+        for (int i = 0; i < 4 && i < sorted.size(); i++) sorted.get(i).getCode();
+
         // Tiny threshold/sample so the 6-candidate corpus above is "broad" and the scan is capped
         // well under the full 6 candidates.
         SearchRoutes.BROAD_CANDIDATE_THRESHOLD = 2;
