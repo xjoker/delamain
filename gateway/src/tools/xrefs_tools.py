@@ -186,7 +186,11 @@ def register_xrefs_tools(mcp):
             member_name: Method or field name (required for method/field). offset/count: Pagination.
             include_snippet: If True, attach the surrounding source code snippet at each call site.
                 Useful for quickly understanding usage context without opening each referencing class.
-                Each result entry will contain a 'snippet' field (null if retrieval failed).
+                Only the current page (offset..offset+count) is decompiled for snippets — turn the
+                page to get snippets for more rows; missing snippet on a row is not a missing
+                reference. For a high-fan-in target where you just need presence/count, leave this
+                False and paginate with plain rows first. Each row's 'snippet' field is null if
+                retrieval failed.
             context_lines: Lines of context before/after the reference in the snippet (default: 3).
                 Only used when include_snippet=True.
             instance_id: Target JADX instance name.
@@ -309,6 +313,9 @@ def register_xrefs_tools(mcp):
             member_name: Method or field name (required for target_type=method|field).
             targets: Batch mode target list, format "type:class[:member]" (max 10).
             include_snippet: Attach surrounding source at each call site (single-target mode only).
+                Snippets are generated for at most the first 200 references (ASYNC_SNIPPET_CAP);
+                rows beyond that cap have no 'snippet' field even though the reference itself is
+                still present in the result — absence there means "not decompiled", not "not found".
             context_lines: Snippet context lines (default 3, only used with include_snippet=True).
             instance_id: Target JADX instance name.
         Returns:

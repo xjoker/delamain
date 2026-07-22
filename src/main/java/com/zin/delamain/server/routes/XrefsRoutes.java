@@ -232,6 +232,13 @@ public class XrefsRoutes {
             if (targetJavaClass == null) return;
 
             XrefComputeResult computed = computeClassXrefs(targetJavaClass, includeSnippet, contextLines);
+            if (includeSnippet) {
+                // Only the requested page gets snippets — see snippetWindow. Read the same
+                // offset/count the pagination helper is about to apply.
+                attachSnippets(snippetWindow(computed.references,
+                    paginationUtils.getIntParam(ctx, "offset", 0),
+                    paginationUtils.getIntParam(ctx, "count", paginationUtils.DEFAULT_PAGE_SIZE)), contextLines);
+            }
             Map<String, Object> result = paginationUtils.handlePagination(
                 ctx, computed.references, "xrefs", "references", ref -> ref);
             if (computed.resolution != null) result.put("resolution", computed.resolution);
@@ -329,9 +336,11 @@ public class XrefsRoutes {
         List<Map<String, Object>> referenceList =
             collectPreciseReferences(targetJavaClass, classReferences, methodReferences);
 
-        if (includeSnippet) {
-            attachSnippets(referenceList, contextLines);
-        }
+        // Snippets are deliberately NOT attached here. Each one costs a live decompile of the
+        // referrer, and this list is the FULL referrer set — attaching them before pagination
+        // meant a caller asking for one row paid for thousands of decompiles (measured on
+        // production: a high-fan-in target never returned inside the gateway's 120s ceiling).
+        // Callers attach them to the rows they will actually hand back; see snippetWindow.
         // Live fallback (fast indices missing/incomplete): collectPreciseReferences resolves each
         // referrer to its most precise available granularity (exact call-site position when
         // getUsePlacesFor finds one, else the referencing method, else the class itself) by
@@ -954,6 +963,9 @@ public class XrefsRoutes {
         switch (type) {
             case "class": {
                 XrefComputeResult computed = computeClassXrefs(targetClass, includeSnippet, contextLines);
+                if (includeSnippet) {
+                    attachSnippets(snippetWindow(computed.references, 0, ASYNC_SNIPPET_CAP), contextLines);
+                }
                 putComputeResult(payload, computed);
                 break;
             }
@@ -1351,6 +1363,26 @@ public class XrefsRoutes {
             }
         }
         return distinct.size();
+    }
+
+    /**
+     * Upper bound on how many rows the ASYNC xref path renders snippets for. That path has no
+     * request deadline, but a ticket that decompiles tens of thousands of referrers is its own
+     * kind of broken; callers page through the rest without snippets.
+     */
+    static final int ASYNC_SNIPPET_CAP = 200;
+
+    /**
+     * The sub-list of {@code rows} a caller is actually going to receive, so snippet work is paid
+     * only for what is returned. Returns a view backed by the same row objects (so attaching a
+     * snippet is visible in the serialised response), and an empty list for any degenerate window
+     * rather than throwing.
+     */
+    static List<Map<String, Object>> snippetWindow(List<Map<String, Object>> rows, int offset, int count) {
+        if (rows == null || rows.isEmpty() || offset < 0 || count <= 0 || offset >= rows.size()) {
+            return java.util.Collections.emptyList();
+        }
+        return rows.subList(offset, Math.min(rows.size(), offset + count));
     }
 
     /**
