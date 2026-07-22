@@ -51,8 +51,10 @@ async def _gateway_lifespan(server: FastMCP):
 
 
 def build_mcp_app() -> FastMCP:
+    from .banner import SERVER_VERSION
     mcp = FastMCP(
         "Delamain Gateway",
+        version=SERVER_VERSION,
         instructions=MCP_INSTRUCTIONS,
         lifespan=_gateway_lifespan,
     )

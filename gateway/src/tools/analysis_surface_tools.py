@@ -51,8 +51,13 @@ async def export_callgraph(
     return await get_from_jadx("export-callgraph", params, instance_id=instance_id)
 
 
+async def get_native_surface(instance_id: Optional[str] = None) -> dict:
+    return await get_from_jadx("native-surface", instance_id=instance_id)
+
+
 _get_attack_surface = get_attack_surface
 _export_callgraph = export_callgraph
+_get_native_surface = get_native_surface
 
 
 def register_analysis_surface_tools(mcp):
@@ -129,4 +134,25 @@ def register_analysis_surface_tools(mcp):
             instance_id=instance_id,
         )
 
-    logger.info("Analysis surface tools registered: get_attack_surface, export_callgraph")
+    @mcp.tool()
+    @with_busy_check
+    async def get_native_surface(instance_id: Optional[str] = None) -> dict:
+        """Aggregate a native/JNI reverse-engineering handoff worklist: every declared native
+        method (with a JNI mangled-name candidate) plus every System.loadLibrary/System.load
+        target found in the APK. Use this to build the Ghidra/unidbg worklist instead of
+        manually collecting native methods and library names class by class.
+
+        jni_name_candidate is the short-form JNI symbol (Java_<class>_<method>) — an overloaded
+        native may actually be exported under the long-form (signature-suffixed) symbol instead
+        if the short form is ambiguous in the native library's export table.
+
+        Args:
+            instance_id: Target JADX instance name.
+        Returns:
+            dict: {native_methods: [{class_name, raw_class_name, method_name, raw_method_name,
+            param_types_frida, jni_name_candidate}], native_method_count, loaded_libraries:
+            [{name, found_in_class}], loaded_library_count, note}
+        """
+        return await _get_native_surface(instance_id=instance_id)
+
+    logger.info("Analysis surface tools registered: get_attack_surface, export_callgraph, get_native_surface")

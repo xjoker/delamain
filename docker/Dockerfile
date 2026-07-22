@@ -36,6 +36,12 @@ RUN set -eux; \
 COPY pom.xml .
 RUN mvn -DskipTests dependency:resolve -q 2>/dev/null || true
 COPY src/ src/
+# Repo-root VERSION is the single source of truth AppVersion.java reads off the
+# classpath (maven-resources-plugin copies it into the shaded jar as /VERSION).
+# Without this COPY it is absent from the build context, so the jar ships with
+# no /VERSION and the startup banner degrades to "unknown" — /health still shows
+# the right version because the runtime stage copies VERSION to /app separately.
+COPY VERSION .
 RUN mvn -DskipTests clean package -q
 
 # ---------------------------------------------------------------------------

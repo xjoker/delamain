@@ -5,7 +5,7 @@
 
     <groupId>com.zin.delamain</groupId>
     <artifactId>delamain</artifactId>
-    <version>20260721.4</version>
+    <version>20260722.2</version>
     <name>delamain</name>
     <description>MCP server that exposes the JADX Android decompiler to AI agents for headless, low-memory reverse engineering.</description>
     <url>https://github.com/xjoker/delamain</url>
@@ -224,10 +224,15 @@
                          once from this env var in a static initializer, so it must be set
                          before the JVM starts, not per-test. Eviction is disabled so the
                          background heap watcher can't interfere with the eviction test's
-                         deterministic assertions (the test invokes runEvictionSweep directly). -->
+                         deterministic assertions (the test invokes runEvictionSweep directly).
+                         DELAMAIN_TRIGRAM_HEAP=true pins the heap trigram index ON for the test
+                         JVM (production default is OFF, A1): the trigram-behavior tests build
+                         BitSets and assert isIndexed()==true, so they need it on. The dedicated
+                         heap-OFF tests toggle the (non-final) TRIGRAM_HEAP field at runtime. -->
                     <environmentVariables>
                         <DELAMAIN_CODE_INDEX_MAX_TRIGRAMS>5</DELAMAIN_CODE_INDEX_MAX_TRIGRAMS>
                         <DELAMAIN_CODE_INDEX_EVICTION_ENABLED>false</DELAMAIN_CODE_INDEX_EVICTION_ENABLED>
+                        <DELAMAIN_TRIGRAM_HEAP>true</DELAMAIN_TRIGRAM_HEAP>
                     </environmentVariables>
                 </configuration>
             </plugin>

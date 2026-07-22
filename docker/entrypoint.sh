@@ -51,7 +51,17 @@ if [ -z "${JADX_JAR}" ]; then
     echo "ERROR: no /app/lib/jadx-all-*.jar found in image" >&2
     exit 1
 fi
-java -cp "/app/delamain.jar:${JADX_JAR}" \
+# Heap sizing: derived from the CONTAINER's own memory limit (cgroup), never hardcoded and
+# never left to the JVM default -- see gateway/src/heap_config.py for why both of those are
+# wrong here. JAVA_OPTS stays the operator override: an explicit -Xmx / -XX:MaxRAMPercentage
+# in it wins and no heap flag is derived (e.g. -e JAVA_OPTS="-XX:MaxRAMPercentage=75" on a
+# container dedicated to delamain). A low heap degrades gracefully rather than failing --
+# code-content search / precise xref may be skipped, see /warmup-status.
+# Detection failure must never block startup, so fall back to JAVA_OPTS as-is.
+JAVA_OPTS_RESOLVED="$(cd /app/gateway && JAVA_OPTS="${JAVA_OPTS:-}" python3 -m src.heap_config)" \
+    || JAVA_OPTS_RESOLVED="${JAVA_OPTS:-}"
+# shellcheck disable=SC2086  # intentional word-splitting so multiple flags pass through
+java ${JAVA_OPTS_RESOLVED} -cp "/app/delamain.jar:${JADX_JAR}" \
     com.zin.delamain.Main \
     --port 8650 \
     --bind 127.0.0.1 \

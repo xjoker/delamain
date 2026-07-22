@@ -11,6 +11,11 @@
 [![Container image](https://img.shields.io/badge/ghcr.io-delamain-2496ED?logo=docker&logoColor=white)](https://github.com/xjoker/delamain/pkgs/container/delamain)
 [![CLI downloads](https://img.shields.io/github/downloads/xjoker/delamain/total?label=CLI%20downloads)](https://github.com/xjoker/delamain/releases)
 
+> [!WARNING]
+> **开发初期。** delamain 还很年轻、迭代很快。MCP 工具名与签名、响应结构、配置项、
+> 端点、以及内部代码架构都可能在版本之间**大幅变化**——不保证提前通知、不保证向后
+> 兼容。请钉住版本 tag 以保证可复现，并预期在项目稳定前会有破坏性变更。
+
 **delamain** 是一个 **MCP server**，把 [JADX](https://github.com/skylot/jadx)
 的全部能力开放给 AI agent —— 一座**无头（headless）、高性能、低内存的桥梁**，
 用于 AI 驱动的 Android 逆向工程。
@@ -51,9 +56,13 @@ delamain 直接封装 jadx，因此 jadx 接受的输入它都接受：
   淹没模型的上下文窗口。图遍历带有硬性的节点数/深度预算和 `truncated`
   标志。`get_class_source` 会报告 `decompile_quality` 信号，让 agent 知道
   何时该回退到 smali。
-- **无头（headless）且低内存。** 可在没有显示服务器的服务器、CI 或边缘设
-  备上运行。一个基于 mmap 的分片索引，配合持久化的磁盘 CodeStore，让它能在
-  普通内存下加载和搜索非常大的 APK。
+- **无头（headless）且内存有界。** 可在没有显示服务器的服务器、CI 或边缘设
+  备上运行。反编译源码与内容索引都落在磁盘上（基于 mmap 的分片索引 + 持久化
+  CodeStore），所以堆内存只跟随已加载的类树，而不是把整个 APK 全驻内存。内存
+  随规模缩放：一个非常大的（约 23.8 万类）app 稳态约 10 GB、需要 12–16 GB 的
+  主机；典型 app 远低于此。堆上限在启动时**由容器自身的 cgroup 限制推导**（不
+  硬编码 `-Xmx`，容器未设限时也不会按宿主机算），小机器上会优雅降级（低堆时跳
+  过部分能力）；`JAVA_OPTS` 可覆盖该推导值。
 - **带外（out-of-band）文件上传。** 直接把大体积 APK 交给服务器 —— 它的字
   节永远不会经过 AI 的上下文窗口。
 - **单一融合容器，单一暴露端口。** 部署简单又安全。

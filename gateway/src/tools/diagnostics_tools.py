@@ -36,6 +36,19 @@ async def get_decompile_diag(class_name: str, instance_id: Optional[str] = None)
 _get_decompile_diag = get_decompile_diag
 
 
+async def get_memory_diagnostics(gc: bool = True, instance_id: Optional[str] = None) -> dict:
+    logger.debug("get_memory_diagnostics called, gc=%s, instance_id=%s", gc, instance_id)
+    try:
+        return await get_from_jadx(
+            "memory-diagnostics", {"gc": "true" if gc else "false"}, instance_id=instance_id)
+    except Exception as exc:
+        logger.warning("get_memory_diagnostics failed: %s", exc)
+        return {"error": "JADX_ERROR", "message": str(exc)}
+
+
+_get_memory_diagnostics = get_memory_diagnostics
+
+
 def register_diagnostics_tools(mcp):
     """Register diagnostics/index-health tools with the MCP server."""
 
@@ -67,6 +80,13 @@ def register_diagnostics_tools(mcp):
         to JADX) or in classes excluded from the shard index due to size — use search_in=
         'class'/'method' to find the owning class, then get_class_source() on it instead.
 
+        xref_readiness decides how to call xref tools: xref_readiness.class_level == "ready"
+        means class-level xref (who references class X) is instant. xref_readiness.
+        precise_snippets != "ready" means the precise, snippet-level harvest is still building
+        (or was skipped) — do NOT request include_snippet=true against a high-fanin class while
+        it says "building"/"skipped", since that falls through to a live per-caller re-decompile
+        and can be slow; prefer class-level xref first, or wait for precise_snippets == "ready".
+
         Args:
             instance_id: Target JADX instance; omit for default.
         Returns:
@@ -77,6 +97,9 @@ def register_diagnostics_tools(mcp):
                                    max_class_size_bytes, estimated_memory_mb,
                                    saturation_percent},
                    index_prebaked: {complete, reason},
+                   xref_readiness: {class_level: "ready"|"building",
+                                     precise_snippets: "ready"|"building"|"skipped",
+                                     live_fallback_cost: str (present when precise_snippets != "ready")},
                    snapshot_cache: {method_snapshot_classes, field_snapshot_classes},
                    code_cache: {class_index_size, delegates_to_jadx_icodecache}}
         """
@@ -116,4 +139,39 @@ def register_diagnostics_tools(mcp):
         """
         return await _get_decompile_diag(class_name, instance_id=instance_id)
 
-    logger.info("Diagnostics tools registered: get_index_stats, get_decompile_diag")
+    @mcp.tool()
+    @with_busy_check
+    async def get_memory_diagnostics(gc: bool = True, instance_id: Optional[str] = None) -> dict:
+        """Heap/RSS snapshot AFTER forcing a garbage collection — the honest memory figure.
+
+        get_decompile_status().memory reports live heap usage, which includes garbage not yet
+        collected and so overstates what delamain actually needs. Use this instead when the
+        question is "how much memory does this APK really cost" (capacity planning, deciding a
+        container size, or checking whether memory grew after a heavy operation).
+
+        Reading the result:
+          - heap.used_mb (with gc.ran == true) — the clean steady state: live objects only.
+          - heap.freed_mb — how much of the earlier figure was collectable garbage.
+          - heap.committed_mb vs process.rss_mb — what the JVM took from the OS vs what the host
+            sees. The mmap'd shard index counts in RSS but never in the heap, so rss > committed
+            is normal; rss far above committed with a small used_mb means the JVM is sitting on
+            memory it no longer needs.
+          - container.memory_limit_mb — the cgroup limit the startup heap sizing was derived from
+            (null = the container has no limit set, so it can use the whole host).
+
+        Args:
+            gc: Collect before measuring (default true). Pass false for a pure observation —
+                cheaper, but the number then includes uncollected garbage.
+            instance_id: Target JADX instance; omit for default.
+        Returns:
+            dict: {gc: {ran, elapsed_ms},
+                   heap: {max_mb, committed_mb, used_mb, usage_percentage,
+                          used_before_gc_mb, freed_mb},   # last two only when gc ran
+                   process: {rss_mb, virtual_mb},          # null off Linux
+                   container: {memory_limit_mb},           # null when unlimited/unreadable
+                   consumers: {trigram_count, trigram_indexed_classes, shard_index_built}}
+        """
+        return await _get_memory_diagnostics(gc=gc, instance_id=instance_id)
+
+    logger.info(
+        "Diagnostics tools registered: get_index_stats, get_decompile_diag, get_memory_diagnostics")

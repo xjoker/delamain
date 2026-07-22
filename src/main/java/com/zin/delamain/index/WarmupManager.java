@@ -354,8 +354,13 @@ public class WarmupManager {
         caps.put("smali", "ready");
         // live_decompile = the one-time JADX engine init is paid; smali / non-cached source are fast after.
         caps.put("live_decompile", isEngineInitDone() ? "ready" : "warming");
+        // code_search is "ready" once EITHER the heap-resident trigram index has entries OR the
+        // mmap shard layer is built (A1 turned the heap trigram index off by default, so
+        // trigramCount() alone would stay 0 forever and permanently misreport "warming" even
+        // though the shard layer is already serving searches).
         String trigramSkip = trigramSkipReason.get();
-        caps.put("code_search", CodeContentIndex.trigramCount() > 0 ? "ready"
+        boolean codeSearchReady = CodeContentIndex.trigramCount() > 0 || ContentShardIndex.isBuilt();
+        caps.put("code_search", codeSearchReady ? "ready"
             : (trigramSkip != null ? "skipped:low-heap" : "warming"));
         caps.put("xref_class_level", UsageGraphIndex.isReady() ? "ready" : "warming");
         String usePlacesSkip = usePlacesSkipReason.get();
@@ -799,6 +804,8 @@ public class WarmupManager {
      * after a restart without re-running the multi-minute Phase-1 decompile. Idempotent.
      */
     private static void startBackgroundTrigramBuild(HeadlessJadxWrapper wrapper, List<JavaClass> sorted) {
+        // A1: heap trigram index off → search goes through the mmap shard layer; never build BitSets.
+        if (!CodeContentIndex.TRIGRAM_HEAP) return;
         if (!trigramBuildRunning.compareAndSet(false, true)) return;
         // Graceful degradation: skip trigram build if free heap < 2× estimated index cost.
         // BitSet-based trigram index uses ~30 KB per class; on a 237k-class APK that is ~7 GB.
@@ -1106,6 +1113,8 @@ public class WarmupManager {
 
     /** Phase 2: parallel trigram index fill from already-cached code (no lock needed). */
     private static void runPhase2(List<JavaClass> targets) {
+        // A1: heap trigram index off → skip Phase-2 entirely (no BitSet fill). Shard layer serves search.
+        if (!CodeContentIndex.TRIGRAM_HEAP) return;
         int workers = Math.min(INDEX_WORKERS, Math.max(1, targets.size()));
         AtomicInteger indexPos = new AtomicInteger(0);
         AtomicInteger indexed = new AtomicInteger(0);
@@ -1165,6 +1174,9 @@ public class WarmupManager {
      * be skipped; false if a full Phase-2 rebuild is required.
      */
     private static boolean tryRestoreIndex(HeadlessJadxWrapper wrapper, List<JavaClass> sortedTargets) {
+        // A1: heap trigram index off → don't restore BitSets into the heap. Returning false is safe;
+        // the COLD caller then hits runPhase2 (also a no-op when off), the FAST_RESTORE caller ignores it.
+        if (!CodeContentIndex.TRIGRAM_HEAP) return false;
         try {
             if (persistentStore == null) {
                 persistentStore = new PersistentIndexStore(indexCacheDir());
@@ -1190,6 +1202,8 @@ public class WarmupManager {
      * Failures are logged but do not break the warmup result.
      */
     private static void tryPersistIndex(HeadlessJadxWrapper wrapper) {
+        // A1: heap trigram index off → nothing to persist (the in-heap index is empty).
+        if (!CodeContentIndex.TRIGRAM_HEAP) return;
         try {
             if (persistentStore == null) {
                 persistentStore = new PersistentIndexStore(indexCacheDir());

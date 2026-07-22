@@ -159,6 +159,7 @@ public class FileManagementRoutes {
                     wrapper.reloadReserved(newFiles, wrapper.getOutputDir(), wrapper.getThreads(),
                             ClassCacheManager::clearCacheIncludingDecompiled);
                     logger.info("load_file: reload completed ({}) for {}", finalMode, finalCanonical);
+                    triggerAutoWarmup();
                 } catch (Throwable t) {
                     logger.error("load_file: reload failed for {}: {}", finalCanonical, t.getMessage(), t);
                 }
@@ -166,14 +167,7 @@ public class FileManagementRoutes {
             reloadThread.setDaemon(true);
             reloadThread.start();
 
-            Map<String, Object> result = new HashMap<>();
-            result.put("dispatched", true);
-            result.put("mode", mode);
-            result.put("path", canonical.toString());
-            result.put("ready", false);
-            result.put("poll_with", "/decompile-status");
-            result.put("note", "Decompilation continues asynchronously; poll /decompile-status for progress.");
-            ctx.status(202).json(result);
+            ctx.status(202).json(buildLoadDispatchResponse(mode, canonical));
         } catch (SandboxViolation e) {
             logger.warn(e.getMessage());
             ctx.status(400).json(Map.of("error", e.getMessage()));
@@ -181,6 +175,99 @@ public class FileManagementRoutes {
             logger.error("Error: {}", e.getMessage(), e);
             ctx.status(500).json(Map.of("error", "load_file failed: " + e.getMessage()));
         }
+    }
+
+    /**
+     * The 202 body for a dispatched load. Loading and the auto-warmup it triggers both run in the
+     * background, so this is the caller's only chance to learn the shape of the wait: that warmup
+     * starts by itself, where its live phase/eta/capabilities are, and which capability gates code
+     * search. Without that the agent polls {@code /decompile-status} until the class tree is up and
+     * then immediately issues the exact calls (code search, xref) that are slowest while warmup is
+     * still saturating the CPU and the content index does not exist yet.
+     */
+    Map<String, Object> buildLoadDispatchResponse(String mode, Path canonical) {
+        boolean autoWarmup = resolveWarmupOnStart(System.getenv("DELAMAIN_WARMUP_ON_START"));
+
+        Map<String, Object> warmupStatus = com.zin.delamain.index.WarmupManager.getStatus();
+        Map<String, Object> warmup = new HashMap<>();
+        warmup.put("phase", warmupStatus.get("phase"));
+        warmup.put("eta_seconds", warmupStatus.get("eta_seconds"));
+        warmup.put("capabilities", warmupStatus.get("capabilities"));
+
+        Map<String, Object> result = new HashMap<>();
+        result.put("dispatched", true);
+        result.put("mode", mode);
+        result.put("path", canonical.toString());
+        result.put("ready", false);
+        result.put("poll_with", "/decompile-status");
+        result.put("auto_warmup", autoWarmup);
+        result.put("warmup_status_endpoint", "/warmup-status");
+        result.put("warmup", warmup);
+        result.put("note", "Decompilation continues asynchronously; poll /decompile-status for progress."
+            + (autoWarmup ? " Index warmup starts automatically once the load finishes." : ""));
+        result.put("_ai_instruction", autoWarmup
+            ? "Loading is async and index warmup follows it automatically. Poll get_warmup_status "
+              + "(/warmup-status) rather than guessing: it reports phase, eta_seconds and "
+              + "per-capability readiness. Metadata search (search_in=class/method/field), "
+              + "class source and smali are usable as soon as the load completes. Do NOT issue "
+              + "search_in=code or high-fan-in xref calls until capabilities.code_search == "
+              + "\"ready\" — before that the content index does not exist, warmup is using the "
+              + "CPU, and those calls are at their slowest."
+            : "Loading is async. Poll get_warmup_status (/warmup-status) for readiness. Automatic "
+              + "warmup is DISABLED (DELAMAIN_WARMUP_ON_START=false), so capabilities.code_search "
+              + "stays \"warming\" until you call start_warmup explicitly; metadata search, class "
+              + "source and smali work without it.");
+        return result;
+    }
+
+    /**
+     * Mirrors {@code Main}'s auto-warmup-on-start trigger for files loaded after process start via
+     * {@code /load-file}. Container deployments (e.g. the delamain entrypoint) never pass
+     * {@code --apk}, so {@code Main}'s startup-only trigger (main.java, wrapper.isLoaded() check
+     * right after server start) never fires; without this, shard/UsageGraphIndex/UsePlacesIndex
+     * fast indexes are never built for load_file-loaded APKs and xref/code-search silently
+     * degrade to the slow live-decompile path. Only called after a successful reload.
+     *
+     * <p>Dedup is handled by {@link com.zin.delamain.index.WarmupManager#start}, which already
+     * no-ops (returns {@code started=false}) when a warmup is already running — no extra guard
+     * needed here.</p>
+     */
+    private void triggerAutoWarmup() {
+        if (!resolveWarmupOnStart(System.getenv("DELAMAIN_WARMUP_ON_START")) || !wrapper.isLoaded()) {
+            return;
+        }
+        Thread warmupThread = new Thread(() -> {
+            try {
+                boolean skipLibraries = resolveSkipLibraries(System.getenv("DELAMAIN_WARMUP_INDEX_LIBRARIES"));
+                Map<String, Object> result = com.zin.delamain.index.WarmupManager.start(wrapper, skipLibraries);
+                logger.info("load_file: auto warmup trigger result: {}", result);
+            } catch (Exception e) {
+                logger.warn("load_file: auto warmup failed to start: {}", e.getMessage());
+            }
+        }, "jadx-load-file-warmup-trigger");
+        warmupThread.setDaemon(true);
+        warmupThread.start();
+    }
+
+    /**
+     * Resolves whether {@link #triggerAutoWarmup()} should fire, mirroring
+     * {@code Main}'s {@code warmupOnStart} flag (default on; {@code DELAMAIN_WARMUP_ON_START=false}
+     * opts out). Package-private static so it is directly testable, matching the style of
+     * {@code Main#resolveSkipLibraries(String)}.
+     */
+    static boolean resolveWarmupOnStart(String envValue) {
+        return !"false".equalsIgnoreCase(envValue);
+    }
+
+    /**
+     * Local copy of {@code Main#resolveSkipLibraries(String)} (default: skip library classes).
+     * {@code Main}'s version is package-private in {@code com.zin.delamain}, unreachable from this
+     * {@code .server.routes} package; duplicating this two-line env check is the smallest change
+     * that avoids either widening Main's visibility or adding a new shared-helper class for one
+     * flag.
+     */
+    static boolean resolveSkipLibraries(String envValue) {
+        return !"true".equalsIgnoreCase(envValue);
     }
 
     /** Dot-prefixed entries (e.g. {@code .transfer}, the in-flight upload staging dir) are

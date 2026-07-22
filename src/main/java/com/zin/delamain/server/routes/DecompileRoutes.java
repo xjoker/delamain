@@ -109,6 +109,82 @@ public class DecompileRoutes {
         return new DecompileVerdict("ok", null);
     }
 
+    /**
+     * Structured classification of a {@code code != null && code.isEmpty()} decompile result —
+     * the authoritative root cause for why {@code /class-source} came back blank, plus an
+     * actionable next step. Never derived from string length/heuristics.
+     */
+    static final class SourceStatus {
+        final String status;
+        final String nextAction;
+
+        SourceStatus(String status, String nextAction) {
+            this.status = status;
+            this.nextAction = nextAction;
+        }
+    }
+
+    /**
+     * Classifies an empty ({@code code != null && code.isEmpty()}) decompile result using only
+     * existing structured JADX signals, in priority order:
+     *
+     * <ol>
+     *   <li>{@link JavaClass#isInner()} → {@code inner_class_inlined} — the source is not missing,
+     *       it is inlined into the outer/top-level class's decompiled output.</li>
+     *   <li>{@link #computeVerdict} reports {@code failed} (JadxError / incomplete process) →
+     *       {@code decompile_failed}.</li>
+     *   <li>No JadxError, a {@code CodeStore} miss, and no static-DEX backing
+     *       ({@link ClassNode#getInputFileName()} is {@code null}) → {@code not_in_static_dex}
+     *       (dynamically generated / native-bridge stub class; Java decompilation will never
+     *       produce source for it).</li>
+     *   <li>Otherwise → {@code unknown_empty} (no confident root cause — do not guess).</li>
+     * </ol>
+     *
+     * <p>Pure function: no locking, no I/O beyond reading the passed-in nodes/flag. Callers are
+     * responsible for resolving {@code classNode} and {@code codeStoreMiss} under the appropriate
+     * JADX search-lock scope (mirrors the {@link #computeVerdict} contract).</p>
+     */
+    @SuppressWarnings("JadxInternalApiUsage")
+    static SourceStatus classifySourceStatus(JavaClass targetClass, ClassNode classNode, boolean codeStoreMiss) {
+        if (targetClass == null) {
+            return new SourceStatus("unknown_empty", null);
+        }
+
+        try {
+            if (targetClass.isInner()) {
+                JavaClass outer = targetClass.getTopParentClass();
+                String outerName = outer != null ? outer.getFullName() : targetClass.getFullName();
+                return new SourceStatus("inner_class_inlined",
+                    "Source for inner class " + targetClass.getFullName() + " is inlined into its "
+                    + "outer/top-level class's decompiled output (JADX never emits separate source "
+                    + "for an inner class) — call get_class_source(class_name=\"" + outerName
+                    + "\") instead.");
+            }
+        } catch (Exception e) {
+            logger.debug("isInner() check failed for {}: {}", targetClass.getFullName(), e.getMessage());
+        }
+
+        DecompileVerdict verdict = computeVerdict(classNode);
+        if ("failed".equals(verdict.quality)) {
+            return new SourceStatus("decompile_failed",
+                "Java decompilation failed (" + verdict.reason + ") for " + targetClass.getFullName()
+                + " — call get_smali_of_class for the raw bytecode instead.");
+        }
+
+        boolean hasJadxError = classNode != null
+            && classNode.getAll(AType.JADX_ERROR) != null
+            && !classNode.getAll(AType.JADX_ERROR).isEmpty();
+        boolean notInStaticDex = classNode == null || classNode.getInputFileName() == null;
+        if (codeStoreMiss && !hasJadxError && notInStaticDex) {
+            return new SourceStatus("not_in_static_dex",
+                "Class " + targetClass.getFullName() + " is not backed by a static DEX class body "
+                + "(likely dynamically generated at runtime or a native-bridge stub) — Java "
+                + "decompilation will never produce source for it; do not retry get_class_source.");
+        }
+
+        return new SourceStatus("unknown_empty", null);
+    }
+
     /** English, actionable next-step hint for a degraded/failed verdict; {@code null} when {@code ok}. */
     private static String hintFor(String quality, String reason) {
         if (quality == null || "ok".equals(quality)) {
@@ -125,6 +201,7 @@ public class DecompileRoutes {
     public void register(Javalin app, AuthConfig auth) {
         app.get("/class-source", this::handleClassSource);
         app.get("/smali-of-class", this::handleSmaliOfClass);
+        app.get("/smali-of-method", this::handleSmaliOfMethod);
         app.get("/decompile-diag", this::handleDecompileDiag);
         app.get("/code-metadata", this::handleCodeMetadata);
         app.get("/decompile-with-mode", this::handleDecompileWithMode);
@@ -188,6 +265,8 @@ public class DecompileRoutes {
                 }
                 if (chunk == 0) {
                     attachQuality(result, cacheKey);
+                    attachEmptySourceStatus(result, code, targetClass, rawKey);
+                    attachReferrerCount(result, targetClass);
                 }
                 ctx.json(result);
                 return;
@@ -241,6 +320,9 @@ public class DecompileRoutes {
             }
             if (chunk == 0) {
                 attachQuality(result, cacheKey);
+                String resolvedRawKey = targetClass != null ? JadxApiAdapter.getClassRawName(targetClass) : rawKey;
+                attachEmptySourceStatus(result, code, targetClass, resolvedRawKey);
+                attachReferrerCount(result, targetClass);
             }
             ctx.json(result);
         } catch (Exception e) {
@@ -263,6 +345,58 @@ public class DecompileRoutes {
             if (hint != null) {
                 result.put("hint", hint);
             }
+        }
+    }
+
+    /**
+     * Attaches {@code source_status} (and, for the three concrete root causes, a
+     * {@code source_status_hint} next-action) to a {@code /class-source} response when the
+     * decompiled code came back as an empty string. No-op when {@code code} is {@code null} or
+     * non-empty (the normal case). See {@link #classifySourceStatus} for the classification.
+     */
+    private static void attachEmptySourceStatus(Map<String, Object> result, String code, JavaClass targetClass, String rawKey) {
+        if (code == null || !code.isEmpty()) {
+            return;
+        }
+        ClassNode node = null;
+        boolean codeStoreMiss = true;
+        if (targetClass != null) {
+            if (JadxSearchLock.tryAcquireRead()) {
+                try {
+                    @SuppressWarnings("JadxInternalApiUsage")
+                    ClassNode n = targetClass.getClassNode();
+                    node = n;
+                } finally {
+                    JadxSearchLock.releaseRead();
+                }
+            }
+            com.zin.delamain.index.CodeStore cs = com.zin.delamain.index.WarmupManager.codeStore();
+            codeStoreMiss = cs == null || !cs.contains(rawKey);
+        }
+        SourceStatus status = classifySourceStatus(targetClass, node, codeStoreMiss);
+        result.put("source_status", status.status);
+        if (status.nextAction != null) {
+            result.put("source_status_hint", status.nextAction);
+        }
+    }
+
+    /**
+     * Attaches {@code referrer_count} — the number of classes that reference this one, from the
+     * precomputed {@link com.zin.delamain.index.UsageGraphIndex} — to a {@code /class-source}
+     * response. Zero-cost array-length lookup, only attached once the index is ready so a
+     * "building" state is never misreported as "zero referrers".
+     */
+    private static void attachReferrerCount(Map<String, Object> result, JavaClass targetClass) {
+        if (targetClass == null || !com.zin.delamain.index.UsageGraphIndex.isReady()) {
+            return;
+        }
+        try {
+            List<JavaClass> referrers = com.zin.delamain.index.UsageGraphIndex.referrersOf(targetClass);
+            if (referrers != null) {
+                result.put("referrer_count", referrers.size());
+            }
+        } catch (Exception e) {
+            logger.debug("Failed to compute referrer_count for {}: {}", targetClass.getFullName(), e.getMessage());
         }
     }
 
@@ -333,6 +467,222 @@ public class DecompileRoutes {
                 JadxSearchLock.release();
             }
         }
+    }
+
+    // Bounded LRU cache of full-class smali text, keyed by raw class name — /smali-of-method
+    // re-parses the same class's smali for every method requested from it, so cache the
+    // (potentially 100K+ char) generated text once per class instead of recomputing per call.
+    private static final int SMALI_CACHE_MAX_ENTRIES = 100;
+    private static final Map<String, String> smaliCache = java.util.Collections.synchronizedMap(
+        new LinkedHashMap<String, String>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+                return size() > SMALI_CACHE_MAX_ENTRIES;
+            }
+        });
+
+    /**
+     * Handles {@code /smali-of-method}.
+     *
+     * <p>Extracts a single method's {@code .method ... .end method} smali block from its
+     * declaring class — the smali counterpart of {@code /method-source} — so an AI does not have
+     * to binary-search chunked {@code /smali-of-class} output to locate one method inside a
+     * 100K+ char obfuscated class. The full-class smali is generated once and cached (see
+     * {@link #smaliCache}); block extraction itself is a cheap text scan.</p>
+     *
+     * <p>Query params: {@code class_name}, {@code method_name} (required); {@code
+     * method_signature} — optional shortId-style descriptor (e.g.
+     * {@code "onCreate(Landroid/os/Bundle;)V"} or just {@code "(Landroid/os/Bundle;)V"}, matching
+     * the {@code available_descriptors} values other method endpoints in this project return) to
+     * disambiguate overloads. Without it, all overloads matching {@code method_name} are
+     * returned.</p>
+     */
+    public void handleSmaliOfMethod(Context ctx) {
+        String className = checkClassParam(ctx);
+        if (className == null) return;
+
+        String methodName = ctx.queryParam("method_name");
+        if (methodName == null || methodName.isEmpty()) {
+            ctx.status(400).json(Map.of("error", "Missing required parameter 'method_name'"));
+            return;
+        }
+        String methodSignature = ctx.queryParam("method_signature");
+        if (methodSignature != null && methodSignature.isBlank()) {
+            methodSignature = null;
+        }
+
+        try {
+            JavaClass targetClass = findClassByName(className);
+            if (targetClass == null) {
+                ctx.status(404).json(Map.of("error", "Class " + className + " not found"));
+                return;
+            }
+            String rawKey = JadxApiAdapter.getClassRawName(targetClass);
+
+            String smali = getOrComputeClassSmali(targetClass, rawKey, ctx);
+            if (smali == null) {
+                return; // error response already written (busy lock / empty smali)
+            }
+
+            List<MethodBlock> blocks = parseMethodBlocks(smali);
+            List<MethodBlock> matches = new ArrayList<>();
+            List<String> sameNameDescriptors = new ArrayList<>();
+            for (MethodBlock b : blocks) {
+                if (!b.name.equals(methodName)) continue;
+                sameNameDescriptors.add(b.name + b.descriptor);
+                if (methodSignature != null
+                        && !methodSignature.equals(b.name + b.descriptor)
+                        && !methodSignature.equals(b.descriptor)) {
+                    continue;
+                }
+                matches.add(b);
+            }
+
+            if (matches.isEmpty()) {
+                Map<String, Object> err = new LinkedHashMap<>();
+                err.put("error", "Method " + methodName + " not found in class " + className
+                    + (methodSignature != null ? " matching descriptor '" + methodSignature + "'" : ""));
+                if (!sameNameDescriptors.isEmpty()) {
+                    err.put("available_descriptors", sameNameDescriptors);
+                }
+                ctx.status(404).json(err);
+                return;
+            }
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("class_name", targetClass.getFullName());
+            result.put("raw_class_name", targetClass.getRawName());
+            result.put("method_name", methodName);
+            result.put("overload_count", matches.size());
+            if (matches.size() == 1) {
+                result.put("descriptor", matches.get(0).descriptor);
+                result.put("smali", matches.get(0).body);
+            } else {
+                List<Map<String, Object>> multi = new ArrayList<>();
+                for (MethodBlock b : matches) {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("descriptor", b.descriptor);
+                    m.put("smali", b.body);
+                    multi.add(m);
+                }
+                result.put("matches", multi);
+                result.put("hint", "Multiple overloads of " + methodName + " matched; pass "
+                    + "'method_signature' (e.g. '" + matches.get(0).name + matches.get(0).descriptor
+                    + "') to select one.");
+            }
+            ctx.json(result);
+        } catch (Exception e) {
+            logger.error("Error: {}", e.getMessage(), e);
+            ctx.status(500).json(Map.of("error", "Internal error retrieving method smali: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * Returns the cached full-class smali for {@code cls}, generating and caching it (under the
+     * JADX write lock — {@code getSmali()} mutates internal decompiler state just like
+     * {@code getCode()}) on a cache miss. Writes an error response and returns {@code null} on a
+     * busy lock or empty smali generation, mirroring {@link #handleSmaliOfClass}.
+     */
+    private String getOrComputeClassSmali(JavaClass cls, String rawKey, Context ctx) {
+        String cached = smaliCache.get(rawKey);
+        if (cached != null) {
+            return cached;
+        }
+        if (!JadxSearchLock.tryAcquire(5)) {
+            ctx.status(503).json(Map.of(
+                "error", "Decompilation operation in progress",
+                "retry_after", JadxSearchLock.RETRY_AFTER_SECONDS
+            ));
+            return null;
+        }
+        try {
+            cached = smaliCache.get(rawKey); // re-check: another thread may have populated it
+            if (cached != null) {
+                return cached;
+            }
+            String smali = cls.getSmali();
+            if (smali == null || smali.isEmpty()) {
+                ctx.status(404).json(Map.of("error",
+                    "Smali generation returned empty for class " + cls.getFullName() +
+                    ". This may indicate the class was loaded from a non-DEX source."));
+                return null;
+            }
+            smaliCache.put(rawKey, smali);
+            return smali;
+        } finally {
+            JadxSearchLock.release();
+        }
+    }
+
+    /** One {@code .method ... .end method} block extracted from a class's smali text. */
+    static final class MethodBlock {
+        final String name;
+        final String descriptor;
+        final String body;
+
+        MethodBlock(String name, String descriptor, String body) {
+            this.name = name;
+            this.descriptor = descriptor;
+            this.body = body;
+        }
+    }
+
+    /**
+     * Splits a full-class smali text into per-method blocks. Smali {@code .method} blocks never
+     * nest (annotations/param-annotations inside a method body use {@code .end annotation}, not
+     * {@code .end method}), so scanning forward from a {@code .method} line to the next literal
+     * {@code .end method} line is a sound, version-independent block boundary — no smali grammar
+     * parser needed.
+     *
+     * <p>Each {@code .method} declaration line ends with {@code name(paramDescriptors)returnType}
+     * as its final whitespace-separated token (access modifiers precede it), e.g.
+     * {@code ".method protected onCreate(Landroid/os/Bundle;)V"} → name {@code onCreate},
+     * descriptor {@code (Landroid/os/Bundle;)V}. Constructors ({@code <init>}/{@code <clinit>})
+     * parse the same way since angle brackets contain no whitespace.</p>
+     */
+    static List<MethodBlock> parseMethodBlocks(String smali) {
+        List<MethodBlock> result = new ArrayList<>();
+        if (smali == null || smali.isEmpty()) {
+            return result;
+        }
+        String[] lines = smali.split("\n", -1);
+        int i = 0;
+        while (i < lines.length) {
+            String trimmed = lines[i].trim();
+            if (trimmed.startsWith(".method")
+                    && (trimmed.length() == ".method".length() || Character.isWhitespace(trimmed.charAt(".method".length())))) {
+                int start = i;
+                int end = -1;
+                for (int j = i + 1; j < lines.length; j++) {
+                    if (lines[j].trim().equals(".end method")) {
+                        end = j;
+                        break;
+                    }
+                }
+                if (end == -1) {
+                    // Malformed/truncated block (should not happen for real jadx output) — skip.
+                    i++;
+                    continue;
+                }
+                StringBuilder body = new StringBuilder();
+                for (int k = start; k <= end; k++) {
+                    body.append(lines[k]);
+                    if (k < end) body.append('\n');
+                }
+                String[] tokens = trimmed.split("\\s+");
+                String last = tokens[tokens.length - 1];
+                int parenIdx = last.indexOf('(');
+                if (parenIdx > 0) {
+                    String name = last.substring(0, parenIdx);
+                    String descriptor = last.substring(parenIdx);
+                    result.add(new MethodBlock(name, descriptor, body.toString()));
+                }
+                i = end + 1;
+            } else {
+                i++;
+            }
+        }
+        return result;
     }
 
     /**

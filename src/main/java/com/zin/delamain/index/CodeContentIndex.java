@@ -28,7 +28,18 @@ public final class CodeContentIndex {
 
     private static final Logger logger = LoggerFactory.getLogger(CodeContentIndex.class);
 
-    static final boolean ENABLED;
+    // The single ENABLED gate was split in two (A1): the id machinery must stay available even when
+    // the heap trigram index is off, because the mmap shard layer's coverage judgment in
+    // SearchRoutes maps live JavaClasses to shard ids through idOf/resolveClass.
+    /** Id-assignment machinery (preAssignIds/idOf/resolveClass/assignId). ALWAYS on — no env gate. */
+    static final boolean ID_ENABLED = true;
+    /** Heap trigram BitSet index (index/candidatesForTerm/isIndexed/tryIndexFromCache/bulkRestore/
+     *  eviction). Default OFF: code search goes through the mmap shard layer instead, freeing the
+     *  ~6-7GB the ConcurrentHashMap&lt;String,BitSet&gt; consumed on a large APK. Enable with
+     *  DELAMAIN_TRIGRAM_HEAP=true. Non-final so tests can toggle it without a JVM restart (mirrors
+     *  SearchRoutes.BROAD_CANDIDATE_THRESHOLD); production always reads this mutable field. */
+    static final boolean DEFAULT_TRIGRAM_HEAP;
+    static boolean TRIGRAM_HEAP;
     static final int MAX_TRIGRAMS;
     static final int MAX_CLASS_SIZE_BYTES;
     static final boolean EVICTION_ENABLED;
@@ -37,8 +48,9 @@ public final class CodeContentIndex {
     static final int HEAP_WATCHER_INTERVAL_SECONDS;
 
     static {
-        String enabledEnv = System.getenv("DELAMAIN_CODE_INDEX_ENABLED");
-        ENABLED = enabledEnv == null || !enabledEnv.equalsIgnoreCase("false");
+        String trigramHeapEnv = System.getenv("DELAMAIN_TRIGRAM_HEAP");
+        DEFAULT_TRIGRAM_HEAP = trigramHeapEnv != null && trigramHeapEnv.equalsIgnoreCase("true");
+        TRIGRAM_HEAP = DEFAULT_TRIGRAM_HEAP;
 
         String maxTrigramsEnv = System.getenv("DELAMAIN_CODE_INDEX_MAX_TRIGRAMS");
         int maxTrigrams = 500_000;
@@ -84,7 +96,7 @@ public final class CodeContentIndex {
     private static final ScheduledExecutorService heapWatcher;
 
     static {
-        if (ENABLED && EVICTION_ENABLED) {
+        if (TRIGRAM_HEAP && EVICTION_ENABLED) {
             ScheduledExecutorService svc = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "jadx-heap-watcher");
                 t.setDaemon(true);
@@ -102,7 +114,7 @@ public final class CodeContentIndex {
     }
 
     public static void index(JavaClass cls, String code) {
-        if (!ENABLED || cls == null || code == null) {
+        if (!TRIGRAM_HEAP || cls == null || code == null) {
             return;
         }
         State s = state;
@@ -171,7 +183,7 @@ public final class CodeContentIndex {
      * - null: cannot narrow (disabled, term &lt; 3 chars, or a trigram is absent from index)
      */
     public static BitSet candidatesForTerm(String term) {
-        if (!ENABLED || term == null || term.length() < 3) {
+        if (!TRIGRAM_HEAP || term == null || term.length() < 3) {
             return null;
         }
         State s = state;
@@ -210,7 +222,7 @@ public final class CodeContentIndex {
      * space (shard classId == CodeContentIndex id, guaranteed by {@link #preAssignIds}).
      */
     public static int idOf(JavaClass cls) {
-        if (!ENABLED || cls == null) {
+        if (!ID_ENABLED || cls == null) {
             return -1;
         }
         Integer id = state.classToId.get(cls);
@@ -227,7 +239,7 @@ public final class CodeContentIndex {
     }
 
     public static void invalidate(JavaClass cls) {
-        if (!ENABLED || cls == null) {
+        if (!ID_ENABLED || cls == null) {
             return;
         }
         State s = state;
@@ -245,7 +257,7 @@ public final class CodeContentIndex {
     }
 
     public static void clear() {
-        if (!ENABLED) {
+        if (!ID_ENABLED) {
             return;
         }
         state = new State();
@@ -253,7 +265,7 @@ public final class CodeContentIndex {
     }
 
     public static boolean tryIndexFromCache(JavaClass cls, String codeStr) {
-        if (!ENABLED || cls == null || codeStr == null || codeStr.isEmpty()) {
+        if (!TRIGRAM_HEAP || cls == null || codeStr == null || codeStr.isEmpty()) {
             return false;
         }
         State s = state;
@@ -277,7 +289,7 @@ public final class CodeContentIndex {
     }
 
     public static boolean isIndexed(JavaClass cls) {
-        if (!ENABLED || cls == null) {
+        if (!TRIGRAM_HEAP || cls == null) {
             return false;
         }
         return state.trigramBuilt.contains(cls);
@@ -289,7 +301,7 @@ public final class CodeContentIndex {
 
     public static java.util.Map<String, Object> getStats() {
         java.util.Map<String, Object> stats = new java.util.LinkedHashMap<>();
-        stats.put("enabled", ENABLED);
+        stats.put("enabled", TRIGRAM_HEAP);
         int indexedClasses = indexedClassCount();
         int trigramCnt = trigramCount();
         stats.put("indexed_classes", indexedClasses);
@@ -341,7 +353,7 @@ public final class CodeContentIndex {
      * the same classes.
      */
     public static void preAssignIds(List<JavaClass> sortedClasses) {
-        if (!ENABLED) return;
+        if (!ID_ENABLED) return;
         State s = state;
         for (JavaClass cls : sortedClasses) {
             s.assignId(cls);
@@ -354,7 +366,7 @@ public final class CodeContentIndex {
      * BitSets correctly refer to the current session's class-ID assignments.
      */
     public static void bulkRestore(Map<String, BitSet> loadedData) {
-        if (!ENABLED || loadedData == null || loadedData.isEmpty()) return;
+        if (!TRIGRAM_HEAP || loadedData == null || loadedData.isEmpty()) return;
         State s = state;
         s.trigramIndex.putAll(loadedData);
         if (loadedData.size() >= MAX_TRIGRAMS) {

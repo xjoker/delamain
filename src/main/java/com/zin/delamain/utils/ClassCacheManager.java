@@ -9,12 +9,9 @@ import com.zin.delamain.index.shard.ContentShardIndex;
 import jadx.api.ICodeCache;
 import jadx.api.ICodeInfo;
 import jadx.api.JavaClass;
-import jadx.api.impl.DelegateCodeCache;
-import jadx.gui.cache.code.FixedCodeCache;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -107,6 +104,15 @@ public class ClassCacheManager {
                         String simpleName = cls.getName();
                         if (simpleName != null && !simpleName.isEmpty()) {
                             clsNameIdx.computeIfAbsent(simpleName.toLowerCase(), k -> new ArrayList<>()).add(cls);
+                        }
+                        // Bug 1 fix: also bucket the raw (pre-deobfuscation) simple class name, so
+                        // an EXACT/SUBSTRING/PREFIX class-name search for the raw DEX identifier
+                        // (e.g. "a" when the deobfuscated display name is "C0000a") hits the fast
+                        // path too, not just the display name. No-op when raw == display.
+                        String rawSimpleName = JadxApiAdapter.getClassRawSimpleName(cls);
+                        if (rawSimpleName != null && !rawSimpleName.isEmpty()
+                                && !rawSimpleName.equalsIgnoreCase(simpleName)) {
+                            clsNameIdx.computeIfAbsent(rawSimpleName.toLowerCase(), k -> new ArrayList<>()).add(cls);
                         }
                         for (JadxApiAdapter.MethodInfoSnapshot m : JadxApiAdapter.getDeclaredMethodInfos(cls)) {
                             String mName = m.getName();
@@ -291,6 +297,11 @@ public class ClassCacheManager {
         String simpleName = cls.getName();
         if (simpleName != null && !simpleName.isEmpty()) {
             addToIndex(clsIdx, simpleName.toLowerCase(), cls);
+        }
+        String rawSimpleName = JadxApiAdapter.getClassRawSimpleName(cls);
+        if (rawSimpleName != null && !rawSimpleName.isEmpty()
+                && !rawSimpleName.equalsIgnoreCase(simpleName)) {
+            addToIndex(clsIdx, rawSimpleName.toLowerCase(), cls);
         }
         for (JadxApiAdapter.MethodInfoSnapshot m : JadxApiAdapter.getDeclaredMethodInfos(cls)) {
             String mName = m.getName();
@@ -745,7 +756,7 @@ public class ClassCacheManager {
             }
             return;
         }
-        ICodeCache codeCache = unwrapFixedCodeCache(upstreamCodeCacheRef.get());
+        ICodeCache codeCache = upstreamCodeCacheRef.get();
         if (codeCache != null && className != null && !className.isEmpty()) {
             codeCache.remove(className);
         }
@@ -780,23 +791,6 @@ public class ClassCacheManager {
 
     private static ICodeCache resolveMutableCodeCache(JavaClass cls) {
         registerUpstreamCodeCache(cls);
-        return unwrapFixedCodeCache(upstreamCodeCacheRef.get());
-    }
-
-    private static ICodeCache unwrapFixedCodeCache(ICodeCache codeCache) {
-        if (!(codeCache instanceof FixedCodeCache)) {
-            return codeCache;
-        }
-        try {
-            Field backCacheField = DelegateCodeCache.class.getDeclaredField("backCache");
-            backCacheField.setAccessible(true);
-            Object backCache = backCacheField.get(codeCache);
-            if (backCache instanceof ICodeCache) {
-                return (ICodeCache) backCache;
-            }
-        } catch (ReflectiveOperationException e) {
-            logger.debug("[JAI] Failed to unwrap FixedCodeCache: {}", e.getMessage());
-        }
-        return codeCache;
+        return upstreamCodeCacheRef.get();
     }
 }

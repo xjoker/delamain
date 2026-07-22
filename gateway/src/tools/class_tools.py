@@ -14,11 +14,39 @@ from ..pagination_utils import PaginationUtils
 logger = get_logger("class_tools")
 
 
+def _attach_empty_source_hint(result: dict) -> None:
+    """Surfaces Java's `/class-source` source_status_hint (attached when the decompiled code
+    came back empty and Java could classify why — inner class inlined, decompile failed, or not
+    backed by static DEX) as an `_ai_instruction`, mirroring the batch-endpoint convention in
+    this module. `source_status == "unknown_empty"` carries no hint and is left alone."""
+    hint = result.get("source_status_hint")
+    if hint:
+        result["_ai_instruction"] = hint
+
+
+def _attach_referrer_hint(result: dict) -> None:
+    """Nudges toward find_callers_chain/export_callgraph once a class has enough referrers that
+    manually walking get_class_source per referrer is a bad use of the AI's turn budget."""
+    count = result.get("referrer_count")
+    if not isinstance(count, int) or count <= 5:
+        return
+    note = (
+        f"This class has {count} referrers. For call-graph analysis prefer find_callers_chain "
+        "or export_callgraph instead of manually walking get_class_source per referrer."
+    )
+    existing = result.get("_ai_instruction")
+    result["_ai_instruction"] = f"{existing} {note}" if existing else note
+
+
 async def get_class_source(class_name: str, chunk: int = 0, instance_id: Optional[str] = None) -> dict:
     params = {"class_name": class_name}
     if chunk > 0:
         params["chunk"] = str(chunk)
-    return await get_from_jadx("class-source", params, instance_id=instance_id)
+    result = await get_from_jadx("class-source", params, instance_id=instance_id)
+    if chunk == 0 and "error" not in result:
+        _attach_empty_source_hint(result)
+        _attach_referrer_hint(result)
+    return result
 
 
 def _estimate_batch_size(class_names: list[str]) -> int:
@@ -222,12 +250,23 @@ def register_class_tools(mcp):
         get_decompile_diag for the full structured diagnostic, or retry via decompile_with_mode.
         decompile_quality/hint are only attached on chunk=0, not on continuation chunks.
 
+        If response is an empty string, chunk=0 also carries source_status explaining why:
+        "inner_class_inlined" (source is merged into the outer class — call get_class_source on
+        that instead), "decompile_failed" (see decompile_quality/hint), "not_in_static_dex"
+        (dynamically generated/native-bridge class — Java source will never exist), or
+        "unknown_empty" (no confident cause). An _ai_instruction field carries the matching
+        next-action for the first three.
+
+        Once referrer_count exceeds 5, an _ai_instruction suggests find_callers_chain or
+        export_callgraph instead of manually walking get_class_source per referrer.
+
         Args:
             class_name: Fully qualified class name. chunk: 0=first, N=continue chunked response.
             instance_id: Target JADX instance name.
         Returns:
-            dict: {response: str, _chunking: {...}, decompile_quality?: str, hint?: str} — call
-            again with chunk=N if has_more=true.
+            dict: {response: str, _chunking: {...}, decompile_quality?: str, hint?: str,
+            source_status?: str, referrer_count?: int, _ai_instruction?: str} — call again with
+            chunk=N if has_more=true.
         """
         return await _get_class_source(class_name, chunk=chunk, instance_id=instance_id)
 

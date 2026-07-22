@@ -43,6 +43,9 @@ _JADX_VERBOSE_GUIDE = """\
    - shard_index not built yet → metadata-only search (class/method/field names)
    - broad_term=true in a code-search result → narrow the term or use search_in='class'/'method'
      instead of retrying (see search_info.candidate_count/hint)
+   - content_scan_skipped=true → the content phase was refused because no index could prefilter it
+     (index still warming, or a regex/comment query); metadata matches are still complete. Retry
+     only after capabilities.code_search=ready, or use a metadata search now
    - trigram_index is now a residual/self-heal layer, not the coverage signal
 
 ## Search Decision Tree

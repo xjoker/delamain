@@ -11,6 +11,13 @@
 [![Container image](https://img.shields.io/badge/ghcr.io-delamain-2496ED?logo=docker&logoColor=white)](https://github.com/xjoker/delamain/pkgs/container/delamain)
 [![CLI downloads](https://img.shields.io/github/downloads/xjoker/delamain/total?label=CLI%20downloads)](https://github.com/xjoker/delamain/releases)
 
+> [!WARNING]
+> **Early development.** delamain is young and moving fast. MCP tool names and
+> signatures, response shapes, config keys, endpoints, and internal architecture
+> may change **significantly** between releases — without notice or
+> backward-compatibility shims. Pin a version tag for reproducibility and expect
+> breaking changes until the project stabilizes.
+
 **delamain** is an **MCP server** that exposes the full power of
 [JADX](https://github.com/skylot/jadx) to AI agents — a **headless,
 high-performance, low-memory bridge for AI-driven Android reverse
@@ -54,9 +61,15 @@ resources, Frida hook generation, attack-surface / security scan) is
   output so it never floods the model's context window. Graph traversals carry
   hard node/depth budgets and a `truncated` flag. `get_class_source` reports a
   `decompile_quality` signal so the agent knows when to fall back to smali.
-- **Headless & low-memory.** Runs on servers, CI, or edge boxes with no display
-  server. An mmap-backed sharded index plus a persistent on-disk CodeStore let
-  it load and search very large APKs on modest RAM.
+- **Headless & memory-bounded.** Runs on servers, CI, or edge boxes with no
+  display server. Decompiled source and the content index live on disk (an
+  mmap-backed sharded index plus a persistent CodeStore), so heap tracks the
+  loaded class tree instead of re-holding everything. Memory scales with corpus
+  size: a very large (~238K-class) app holds a steady ~10 GB and wants a
+  12–16 GB host; typical apps need far less. The heap ceiling is **derived from
+  the container's own cgroup limit at startup** (no hardcoded `-Xmx`, and no
+  sizing against the host when the container is unbounded), with graceful
+  low-heap degradation on smaller machines; `JAVA_OPTS` overrides it.
 - **Out-of-band file upload.** Hand a large APK to the server directly — its
   bytes never pass through the AI's context window.
 - **One fused container, one exposed port.** Simple and safe to deploy.

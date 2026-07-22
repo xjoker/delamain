@@ -26,6 +26,7 @@ import java.util.BitSet;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -90,6 +91,16 @@ public class SearchRoutes {
     );
     static int BROAD_CANDIDATE_THRESHOLD = DEFAULT_BROAD_CANDIDATE_THRESHOLD;
     static int BROAD_SAMPLE_SCAN = DEFAULT_BROAD_SAMPLE_SCAN;
+    // Content-scan admission control: the largest corpus we are willing to scan for content with
+    // NO index able to prune it (shard not built yet, heap trigram off, or a query no index can
+    // prefilter — REGEX / COMMENT). Above this, the scan cannot finish inside
+    // SEARCH_TIMEOUT_SECONDS (measured: 222 779 classes x ~0.27ms ≈ the full 60s deadline), so we
+    // refuse the content phase outright and say so instead of burning a minute on a partial
+    // answer. Mutable for the same reason as the broad-term knobs above: tests override it.
+    static final int DEFAULT_UNINDEXED_CONTENT_SCAN_MAX = Integer.parseInt(
+        System.getenv().getOrDefault("DELAMAIN_UNINDEXED_CONTENT_SCAN_MAX", "20000")
+    );
+    static int UNINDEXED_CONTENT_SCAN_MAX = DEFAULT_UNINDEXED_CONTENT_SCAN_MAX;
     private static final ScheduledExecutorService DECOMPILE_WATCHDOG =
         Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "jadx-decompile-watchdog");
@@ -437,7 +448,7 @@ public class SearchRoutes {
         }
     }
 
-    private CodeSearchCoordinator.SearchResult tryNameIndexFastPath(
+    CodeSearchCoordinator.SearchResult tryNameIndexFastPath(
         String searchTerm,
         Set<SearchLocation> searchLocations,
         String packageFilter,
@@ -450,33 +461,57 @@ public class SearchRoutes {
                 || searchTerm.contains(" ") || searchTerm.contains(".")) {
             return null;
         }
-        if (searchLocations.size() != 1) return null;
-        SearchLocation loc = searchLocations.iterator().next();
-        String kind;
-        switch (loc) {
-            case CLASS_NAME:  kind = "class";  break;
-            case METHOD_NAME: kind = "method"; break;
-            case FIELD_NAME:  kind = "field";  break;
-            default: return null;
+        // Every requested location must be name-indexable. A multi-location metadata search
+        // matches a class if ANY of its locations matches, which is exactly the union of the
+        // per-kind index lookups — so serve all of them from the indices instead of bailing to
+        // the O(N) scan. This is the DEFAULT search shape (search_in='class,method,field'), which
+        // used to miss the fast path entirely on the `size() != 1` check (814ms on a 222k-class
+        // APK for a query the hash buckets answer directly).
+        if (searchLocations == null || searchLocations.isEmpty()) return null;
+        List<String> kinds = new ArrayList<>();
+        for (SearchLocation loc : searchLocations) {
+            switch (loc) {
+                case CLASS_NAME:  kinds.add("class");  break;
+                case METHOD_NAME: kinds.add("method"); break;
+                case FIELD_NAME:  kinds.add("field");  break;
+                default: return null; // CODE / COMMENT have no name index
+            }
         }
 
-        List<JavaClass> candidates;
-        switch (matchMode) {
-            case EXACT:
-                candidates = ClassCacheManager.findByExactName(kind, searchTerm);
-                break;
-            case SUBSTRING:
-                candidates = ClassCacheManager.findBySubstringName(kind, searchTerm);
-                break;
-            case PREFIX:
-                candidates = ClassCacheManager.findByPrefixName(kind, searchTerm);
-                break;
-            default:
-                return null;
+        // Union in kind order, deduped: "class" first so class-name hits keep their matched_on
+        // attribution even when the same class also matches on a method/field name.
+        Set<JavaClass> classKindHits = new HashSet<>();
+        Set<JavaClass> candidateSet = new LinkedHashSet<>();
+        for (String kind : kinds) {
+            List<JavaClass> perKind;
+            switch (matchMode) {
+                case EXACT:
+                    perKind = ClassCacheManager.findByExactName(kind, searchTerm);
+                    break;
+                case SUBSTRING:
+                    perKind = ClassCacheManager.findBySubstringName(kind, searchTerm);
+                    break;
+                case PREFIX:
+                    perKind = ClassCacheManager.findByPrefixName(kind, searchTerm);
+                    break;
+                default:
+                    return null;
+            }
+            // A missing index for ANY requested kind means that location cannot be answered from
+            // the indices; falling through keeps the search sound rather than silently partial.
+            if (perKind == null) return null;
+            candidateSet.addAll(perKind);
+            if ("class".equals(kind)) classKindHits.addAll(perKind);
         }
-        if (candidates == null) return null;
+        List<JavaClass> candidates = new ArrayList<>(candidateSet);
 
         List<String> matchedNames = new ArrayList<>();
+        // Bug 1 fix: index-hit candidates can come from either the display-name or the raw
+        // (pre-deobfuscation) bucket (see ClassCacheManager's raw-simple-name indexing) — record
+        // which one actually matched this query so the response can be honest about it via
+        // search_info.matched_on, instead of silently always implying a display-name hit.
+        Map<String, String> matchSource = kinds.contains("class") ? new HashMap<>() : null;
+        String lowerTerm = searchTerm.toLowerCase();
         boolean applyPackage = packageFilter != null && !packageFilter.isEmpty();
         Set<JavaClass> allClassesSet = applyPackage ? new HashSet<>(allClasses) : null;
         for (JavaClass cls : candidates) {
@@ -490,6 +525,13 @@ public class SearchRoutes {
                 if (excluded) continue;
             }
             matchedNames.add(cls.getFullName());
+            // Only a class-KIND hit is a class-name match; a class pulled in purely by a
+            // method/field-name hit must not claim one (matched_on describes the class name form
+            // that matched — display vs raw — and would be a lie for those).
+            if (matchSource != null && classKindHits.contains(cls)) {
+                String src = classNameMatchSource(cls, lowerTerm, matchMode, null);
+                matchSource.put(cls.getFullName(), src != null ? src : "display");
+            }
         }
 
         Map<String, Object> searchInfo = new HashMap<>();
@@ -501,6 +543,9 @@ public class SearchRoutes {
         searchInfo.put("parallel_batches", 0);
         searchInfo.put("search_locations", searchLocations.toString());
         searchInfo.put("index_hit", true);
+        if (matchSource != null && !matchSource.isEmpty()) {
+            searchInfo.put("matched_on", matchSource);
+        }
 
         return new CodeSearchCoordinator.SearchResult(matchedNames, searchInfo, matchMode.name().toLowerCase());
     }
@@ -531,12 +576,16 @@ public class SearchRoutes {
         final Set<String> matchedClasses = ConcurrentHashMap.newKeySet();
         final AtomicInteger totalMatches = new AtomicInteger(0);
         final AtomicBoolean cancelled = new AtomicBoolean(false);
+        // Bug 1 fix: same raw/display match-source tracking as executeSearchWithMatchMode, for the
+        // metadata (CLASS_NAME) matches found on this path (submit-code-search's leader task).
+        final Map<String, String> classNameMatchSource = searchLocations.contains(SearchLocation.CLASS_NAME)
+            ? new ConcurrentHashMap<>() : null;
 
         long startTimeMs = System.currentTimeMillis();
         long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(SEARCH_TIMEOUT_SECONDS);
         boolean timedOut = false;
         int batchCount = 0;
-        boolean requiresContentSearch = requiresContentSearch(searchLocations);
+        final boolean contentRequested = requiresContentSearch(searchLocations);
 
         final Set<JavaClass> trigramCandidates;
         final boolean trigramDefinitivelyEmpty;
@@ -551,7 +600,7 @@ public class SearchRoutes {
         // The trigram index is built from literal code substrings, so it cannot pre-filter a
         // REGEX search term (e.g. "public\s+class" never appears verbatim in decompiled code).
         // Skip the trigram shortcut for REGEX and fall through to a full per-class scan instead.
-        if (requiresContentSearch && searchLocations.contains(SearchLocation.CODE)
+        if (contentRequested && searchLocations.contains(SearchLocation.CODE)
                 && matchMode != MatchMode.REGEX) {
             shardResult = ContentShardIndex.isBuilt() ? ContentShardIndex.candidatesForTerm(term) : null;
             BitSet candidateBits = CodeContentIndex.candidatesForTerm(term);
@@ -579,11 +628,38 @@ public class SearchRoutes {
         // Broad-word guard: shard already told us the candidate cardinality is huge — don't run
         // the full parallel/serial content scan at all, return a bounded sample immediately.
         // Narrow terms (candidates <= threshold) and no-shard-built cases fall through unchanged.
-        if (requiresContentSearch && isContentOnly(searchLocations) && shardResult != null
+        if (contentRequested && isContentOnly(searchLocations) && shardResult != null
                 && shardResult.candidates.getCardinality() > BROAD_CANDIDATE_THRESHOLD) {
             return executeBroadTermSearch(allClasses, filteredClasses, searchTerm, term,
                 searchLocations, matchMode, compiledRegex, shardResult, startTimeMs);
         }
+
+        // Admission control (P0 leak a): the guard above needs the shard index to know a term's
+        // cardinality. When NO index can prune at all — shard not built yet (it is built in the
+        // background after warmup), heap trigram off (A1 default), or a query shape no index can
+        // prefilter (REGEX / COMMENT-only) — the content scan degenerates into reading every class
+        // in the corpus, which on a large APK is exactly the 60s SEARCH_TIMEOUT_SECONDS burn this
+        // fixes. Refuse the content phase instead of attempting it; metadata locations are
+        // index-free and still run in full, so a mixed search keeps all of its name matches.
+        final boolean contentIndexUsable =
+            shardResult != null || trigramCandidates != null || trigramDefinitivelyEmpty;
+        final boolean contentScanSkipped = contentRequested && !contentIndexUsable
+            && filteredClasses.size() > UNINDEXED_CONTENT_SCAN_MAX;
+        if (contentScanSkipped && isContentOnly(searchLocations)) {
+            return contentIndexUnavailableResult(allClasses, filteredClasses, searchTerm,
+                searchLocations, matchMode, startTimeMs);
+        }
+        final boolean requiresContentSearch = contentRequested && !contentScanSkipped;
+
+        // Admission control (P0 leak b): the broad-word short-circuit above is content-only by
+        // construction (executeBroadTermSearch does no metadata matching). A search that mixes a
+        // metadata location with CODE therefore used to skip the guard and scan the full candidate
+        // set. Keep its metadata phase intact, but cap the content scan at the same bounded sample.
+        final AtomicInteger contentScanBudget =
+            (requiresContentSearch && shardResult != null
+                && shardResult.candidates.getCardinality() > BROAD_CANDIDATE_THRESHOLD)
+                ? new AtomicInteger(BROAD_SAMPLE_SCAN) : null;
+        final AtomicInteger contentScanned = new AtomicInteger(0);
 
         // Parallel-batch any search over a non-trivial corpus.
         // Previously gated on `collectAllResults`, which meant the high-frequency
@@ -609,7 +685,7 @@ public class SearchRoutes {
                         if (cancelled.get() || Thread.currentThread().isInterrupted()) return;
                         if (System.nanoTime() >= deadlineNanos) { cancelled.set(true); return; }
                         try {
-                            if (classMatchesAnyMetadataLocation(cls, term, searchLocations)) {
+                            if (classMatchesAnyMetadataLocation(cls, term, searchLocations, classNameMatchSource)) {
                                 if (matchedClasses.add(cls.getFullName())) {
                                     int total = totalMatches.incrementAndGet();
                                     if (!collectAllResults && total >= resultsNeeded) {
@@ -660,6 +736,8 @@ public class SearchRoutes {
                             // self-healing) rather than being silently excluded.
                             if (isDefinitivelyAbsent(cls, shardResult, trigramCandidates,
                                     trigramDefinitivelyEmpty, shardCoveredPruned)) continue;
+                            if (!claimContentScanSlot(contentScanBudget)) continue;
+                            contentScanned.incrementAndGet();
                             if (classMatchesAnyContentLocation(cls, term, searchLocations, matchMode, compiledRegex)
                                     && matchedClasses.add(cls.getFullName())) {
                                 int total = totalMatches.incrementAndGet();
@@ -682,7 +760,7 @@ public class SearchRoutes {
             for (JavaClass cls : filteredClasses) {
                 if (cancelled.get()) break;
                 if (System.nanoTime() >= deadlineNanos) { timedOut = true; break; }
-                boolean metadataMatched = classMatchesAnyMetadataLocation(cls, term, searchLocations);
+                boolean metadataMatched = classMatchesAnyMetadataLocation(cls, term, searchLocations, classNameMatchSource);
                 if (metadataMatched) {
                     if (matchedClasses.add(cls.getFullName())) {
                         int total = totalMatches.incrementAndGet();
@@ -692,6 +770,10 @@ public class SearchRoutes {
                     // H6 fix: same soundness guard as the parallel branch above — see comment there.
                     if (isDefinitivelyAbsent(cls, shardResult, trigramCandidates,
                             trigramDefinitivelyEmpty, shardCoveredPruned)) continue;
+                    // Budget exhausted → skip this class's content scan but keep looping: the
+                    // metadata phase is interleaved in this branch and must not be cut short.
+                    if (!claimContentScanSlot(contentScanBudget)) continue;
+                    contentScanned.incrementAndGet();
                     if (classMatchesAnyContentLocation(cls, term, searchLocations, matchMode, compiledRegex)
                             && matchedClasses.add(cls.getFullName())) {
                         int total = totalMatches.incrementAndGet();
@@ -729,6 +811,9 @@ public class SearchRoutes {
         }
         searchInfo.put("trigram_index_size", CodeContentIndex.trigramCount());
         searchInfo.put("trigram_indexed_classes", CodeContentIndex.indexedClassCount());
+        if (classNameMatchSource != null && !classNameMatchSource.isEmpty()) {
+            searchInfo.put("matched_on", classNameMatchSource);
+        }
         if (timedOut) {
             // Surface a partial result rather than nothing: the matches gathered before the
             // deadline are valid, just incomplete. This happens when the term's trigrams are all
@@ -738,6 +823,24 @@ public class SearchRoutes {
                 + "s time limit; results are PARTIAL. The term's trigrams are too common to narrow "
                 + "the candidate set — use a longer or rarer substring for complete results.");
         }
+        if (contentScanSkipped) {
+            // Mixed search whose content phase was refused (the content-only case returned
+            // earlier via contentIndexUnavailableResult). Metadata matches above are complete.
+            searchInfo.put("content_scan_skipped", true);
+            searchInfo.put("partial_results", true);
+            searchInfo.put("hint", contentScanSkippedHint(filteredClasses.size(), searchLocations, matchMode)
+                + " Metadata (class/method/field name) matches in this result are complete.");
+        } else if (contentScanBudget != null) {
+            searchInfo.put("content_scan_sampled", true);
+            searchInfo.put("content_scanned", contentScanned.get());
+            searchInfo.put("candidate_count", shardResult.candidates.getCardinality());
+            searchInfo.put("partial_results", true);
+            searchInfo.put("hint", "Term '" + searchTerm + "' matches "
+                + shardResult.candidates.getCardinality() + " candidate classes by content (too "
+                + "broad to fully verify); the content scan was capped at " + contentScanned.get()
+                + " classes. Metadata (class/method/field name) matches are complete — narrow the "
+                + "term for complete content matches.");
+        }
 
         CodeSearchCoordinator.SearchResult result = new CodeSearchCoordinator.SearchResult(
             buildOrderedMatchList(filteredClasses, matchedClasses), searchInfo, matchMode.name().toLowerCase());
@@ -746,6 +849,92 @@ public class SearchRoutes {
             searchTerm, TimeUnit.MILLISECONDS.toSeconds(elapsedMs), totalMatches.get(), batchCount, timedOut);
 
         return new SearchExecution(result, elapsedMs, timedOut);
+    }
+
+    /**
+     * Takes one slot from a bounded content-scan budget. {@code null} budget = unbounded (the
+     * normal, indexed path), so this returns {@code true} without touching anything. Returns
+     * {@code false} once the budget is exhausted, and never lets the counter drift below zero.
+     */
+    private static boolean claimContentScanSlot(AtomicInteger budget) {
+        if (budget == null) return true;
+        return budget.getAndUpdate(v -> v > 0 ? v - 1 : 0) > 0;
+    }
+
+    /**
+     * Explains, in terms the calling AI can act on, why the content phase of this search was
+     * refused: either the index is still warming (retry later) or nothing can prefilter this query
+     * shape (change the query). Kept caller-agnostic so both the content-only refusal and the
+     * mixed-search partial result use identical wording.
+     */
+    private static String contentScanSkippedHint(int corpusSize, Set<SearchLocation> locations,
+                                                 MatchMode matchMode) {
+        Map<String, Object> status = WarmupManager.getStatus();
+        String phase = String.valueOf(status.get("phase"));
+        Object eta = status.get("eta_seconds");
+        boolean warming = !"DONE".equals(phase) && !"IDLE".equals(phase);
+
+        String why;
+        if (matchMode == MatchMode.REGEX) {
+            why = "A REGEX content search cannot use the content index (the index stores literal "
+                + "substrings), so it would have to read all " + corpusSize + " classes.";
+        } else if (!locations.contains(SearchLocation.CODE)) {
+            why = "A COMMENT-only search cannot use the content index, so it would have to read "
+                + "all " + corpusSize + " classes.";
+        } else if (warming) {
+            why = "The code-content index is still building (warmup phase " + phase
+                + (eta != null ? ", eta ~" + eta + "s" : "") + "), so this search would have to "
+                + "read all " + corpusSize + " classes.";
+        } else {
+            why = "No code-content index is available (shard index not built), so this search "
+                + "would have to read all " + corpusSize + " classes.";
+        }
+        String action = warming
+            ? " Retry once get_index_stats / warmup status reports capabilities.code_search=ready."
+            : " Use search_in=class, search_in=method or search_in=field (index-free and fast), or "
+              + "use a plain substring term once the index is built.";
+        return why + " That exceeds the " + SEARCH_TIMEOUT_SECONDS
+            + "s search limit, so the content scan was skipped instead of timing out." + action;
+    }
+
+    /**
+     * Content-only search whose content phase cannot run (see {@link #contentScanSkippedHint}).
+     * There is no metadata phase to fall back on, so return immediately with an empty, explicitly
+     * partial result. This replaces the old behaviour of scanning the whole corpus and handing back
+     * a partial answer 60s later.
+     */
+    private SearchExecution contentIndexUnavailableResult(
+            List<JavaClass> allClasses,
+            List<JavaClass> filteredClasses,
+            String searchTerm,
+            Set<SearchLocation> searchLocations,
+            MatchMode matchMode,
+            long startTimeMs) {
+        long elapsedMs = Math.max(0L, System.currentTimeMillis() - startTimeMs);
+        Map<String, Object> searchInfo = new HashMap<>();
+        searchInfo.put("total_found", 0);
+        searchInfo.put("total_classes", allClasses.size());
+        searchInfo.put("filtered_classes", filteredClasses.size());
+        searchInfo.put("elapsed_seconds", TimeUnit.MILLISECONDS.toSeconds(elapsedMs));
+        searchInfo.put("timed_out", false);
+        searchInfo.put("parallel_batches", 0);
+        searchInfo.put("search_locations", searchLocations.toString());
+        searchInfo.put("trigram_index_size", CodeContentIndex.trigramCount());
+        searchInfo.put("trigram_indexed_classes", CodeContentIndex.indexedClassCount());
+        searchInfo.put("shard_index_built", ContentShardIndex.isBuilt());
+        searchInfo.put("shard_covered_pruned", 0);
+        searchInfo.put("content_scan_skipped", true);
+        searchInfo.put("partial_results", true);
+        searchInfo.put("hint", contentScanSkippedHint(filteredClasses.size(), searchLocations, matchMode));
+
+        CodeSearchCoordinator.SearchResult result = new CodeSearchCoordinator.SearchResult(
+            new ArrayList<>(), searchInfo, matchMode.name().toLowerCase());
+
+        logger.info("delamain: Search '{}' content scan skipped - no usable content index over {} "
+                + "classes (shard_built={})",
+            searchTerm, filteredClasses.size(), ContentShardIndex.isBuilt());
+
+        return new SearchExecution(result, elapsedMs, false);
     }
 
     /**
@@ -896,12 +1085,15 @@ public class SearchRoutes {
         long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(SEARCH_TIMEOUT_SECONDS);
         boolean timedOut = false;
 
+        Map<String, String> classNameMatchSource = searchLocations.contains(SearchLocation.CLASS_NAME)
+            ? new ConcurrentHashMap<>() : null;
+
         for (JavaClass cls : filteredClasses) {
             if (cancelled.get()) break;
             if (System.nanoTime() >= deadlineNanos) { timedOut = true; break; }
             try {
                 boolean matched = classMatchesInLocationWithMode(cls, searchTerm, term,
-                    searchLocations, matchMode, compiledRegex);
+                    searchLocations, matchMode, compiledRegex, classNameMatchSource);
                 if (matched && matchedClasses.add(cls.getFullName())) {
                     int total = totalMatches.incrementAndGet();
                     if (!collectAllResults && total >= resultsNeeded) cancelled.set(true);
@@ -918,6 +1110,9 @@ public class SearchRoutes {
         searchInfo.put("timed_out", timedOut);
         searchInfo.put("parallel_batches", 0);
         searchInfo.put("search_locations", searchLocations.toString());
+        if (classNameMatchSource != null && !classNameMatchSource.isEmpty()) {
+            searchInfo.put("matched_on", classNameMatchSource);
+        }
 
         CodeSearchCoordinator.SearchResult result = new CodeSearchCoordinator.SearchResult(
             buildOrderedMatchList(filteredClasses, matchedClasses), searchInfo, matchMode.name().toLowerCase());
@@ -926,13 +1121,23 @@ public class SearchRoutes {
 
     private boolean classMatchesInLocationWithMode(
         JavaClass cls, String searchTerm, String termLower,
-        Set<SearchLocation> searchLocations, MatchMode matchMode, Pattern compiledRegex
+        Set<SearchLocation> searchLocations, MatchMode matchMode, Pattern compiledRegex,
+        Map<String, String> classNameMatchSource
     ) {
         for (SearchLocation location : searchLocations) {
             if (location == SearchLocation.CODE || location == SearchLocation.COMMENT) continue;
             switch (location) {
                 case CLASS_NAME:
-                    if (nameMatches(cls.getName(), searchTerm, matchMode, compiledRegex)) return true;
+                    // Bug 1 fix: compare against the raw (pre-deobfuscation) DEX name too, not just
+                    // the display (deobfuscated) name — a caller who obtained the raw fully-qualified
+                    // name from get_class_source/get_smali_of_class must be able to find it here.
+                    String src = classNameMatchSource(cls, termLower, matchMode, compiledRegex);
+                    if (src != null) {
+                        if (classNameMatchSource != null) {
+                            classNameMatchSource.putIfAbsent(cls.getFullName(), src);
+                        }
+                        return true;
+                    }
                     break;
                 case METHOD_NAME:
                     for (JadxApiAdapter.MethodInfoSnapshot ms : JadxApiAdapter.getDeclaredMethodInfos(cls)) {
@@ -961,6 +1166,31 @@ public class SearchRoutes {
         }
     }
 
+    /**
+     * Bug 1 fix: decides whether {@code cls}'s CLASS_NAME location matches {@code lowerTerm} under
+     * {@code matchMode}, checking both the display (deobfuscated) name and the raw (pre-deobfuscation
+     * DEX) name — a fully-qualified raw class name like {@code com.xingin.xhs.index.v2.Foo} that
+     * {@code get_class_source} resolves instantly must also be findable via
+     * {@code search_classes_by_keyword(search_in="class")}, not just the deobfuscated display name.
+     *
+     * @return {@code "display"} if only the display simple/full name matched, {@code "raw"} if only
+     *         the raw simple/full name matched (display checked first, so a class whose display name
+     *         happens to equal its raw name is reported as {@code "display"}), or {@code null} if
+     *         neither matched.
+     */
+    private String classNameMatchSource(JavaClass cls, String lowerTerm, MatchMode matchMode, Pattern compiledRegex) {
+        if (nameMatches(cls.getName(), lowerTerm, matchMode, compiledRegex)) return "display";
+        if (nameMatches(cls.getFullName(), lowerTerm, matchMode, compiledRegex)) return "display";
+        String rawFull = JadxApiAdapter.getClassRawName(cls);
+        if (rawFull != null && !rawFull.isEmpty()) {
+            if (nameMatches(rawFull, lowerTerm, matchMode, compiledRegex)) return "raw";
+            int dot = rawFull.lastIndexOf('.');
+            String rawSimple = dot >= 0 ? rawFull.substring(dot + 1) : rawFull;
+            if (nameMatches(rawSimple, lowerTerm, matchMode, compiledRegex)) return "raw";
+        }
+        return null;
+    }
+
     List<JavaClass> filterSearchClasses(
         List<JavaClass> allClasses, String packageFilter, List<String> excludePrefixes
     ) {
@@ -982,12 +1212,22 @@ public class SearchRoutes {
         return filteredClasses;
     }
 
-    private boolean classMatchesAnyMetadataLocation(JavaClass cls, String term, Set<SearchLocation> locations) {
+    private boolean classMatchesAnyMetadataLocation(
+        JavaClass cls, String term, Set<SearchLocation> locations, Map<String, String> classNameMatchSource
+    ) {
         for (SearchLocation location : locations) {
             if (location == SearchLocation.CODE || location == SearchLocation.COMMENT) continue;
             switch (location) {
                 case CLASS_NAME:
-                    if (cls.getName().toLowerCase().contains(term)) return true;
+                    // Bug 1 fix: substring match now also covers the raw (pre-deobfuscation) DEX
+                    // name, not just the deobfuscated display name — see classNameMatchSource().
+                    String src = classNameMatchSource(cls, term, MatchMode.SUBSTRING, null);
+                    if (src != null) {
+                        if (classNameMatchSource != null) {
+                            classNameMatchSource.putIfAbsent(cls.getFullName(), src);
+                        }
+                        return true;
+                    }
                     break;
                 case METHOD_NAME:
                     for (JadxApiAdapter.MethodInfoSnapshot ms : JadxApiAdapter.getDeclaredMethodInfos(cls)) {

@@ -68,13 +68,25 @@ def register_file_management_tools(mcp):
         mode: str = "replace",
         instance_id: Optional[str] = None,
     ) -> dict:
-        """Load an APK/JAR/AAR/DEX into JADX without touching the GUI. Poll get_decompile_status after loading.
+        """Load an APK/JAR/AAR/DEX into JADX without touching the GUI. Returns immediately (202).
+
+        Loading is async, and index warmup starts automatically after it. The response carries a
+        warmup snapshot (phase, eta_seconds, capabilities) plus _ai_instruction — read them instead
+        of guessing when to start work:
+          - poll get_decompile_status until the class tree is loaded;
+          - metadata search (search_in='class'/'method'/'field'), get_class_source and smali are
+            usable from that moment;
+          - poll get_warmup_status and wait for capabilities.code_search == "ready" before any
+            search_in='code' or high-fan-in xref call. Issuing those during warmup is the slowest
+            possible timing: the content index does not exist yet and warmup owns the CPU.
 
         Args:
             path: Sandbox-relative path (e.g. "target.apk"). mode: replace|append.
             instance_id: Target JADX instance.
         Returns:
-            dict: {dispatched: bool, mode, path, ready: false, poll_with: "get_decompile_status"}
+            dict: {dispatched: bool, mode, path, ready: false, poll_with: "get_decompile_status",
+                   auto_warmup: bool, warmup_status_endpoint,
+                   warmup: {phase, eta_seconds, capabilities}, _ai_instruction}
         """
         return await load_file(path=path, mode=mode, instance_id=instance_id)
 

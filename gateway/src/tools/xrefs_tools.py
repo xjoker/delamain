@@ -13,6 +13,35 @@ from ..pagination_utils import PaginationUtils
 from ..busy_tracker import with_busy_check
 
 
+def _augment_xref_timeout(result: dict, async_hint: dict) -> dict:
+    """Turn a dead-end xref TIMEOUT into actionable guidance.
+
+    A sync xref on a high-fan-in class with the usage-graph index still cold falls
+    back to live-decompiling every referrer, which blows past the gateway's 120s
+    HTTP ceiling (TIMEOUT_CODE_READ) and returns a bare {"error":"TIMEOUT"}. The
+    same answer is reachable without blocking — the async ticket path
+    (submit_xref → get_xref_result) returns immediately, and a warm usage graph
+    makes xref near-instant — but the caller can't know that from the raw error.
+    Point them at both. Only fires on TIMEOUT, so successful results are untouched.
+    """
+    if not isinstance(result, dict):
+        return result
+    if result.get("error") == "TIMEOUT" or result.get("error_code") == "TIMEOUT":
+        result["suggestion"] = (
+            "This xref timed out at the 120s ceiling: the usage-graph index isn't warm "
+            "yet, so it fell back to live-decompiling every referrer. Get the same result "
+            "without blocking: (1) call submit_xref(...) with the same target — the async "
+            "ticket path returns immediately, then poll get_xref_result; or (2) run warmup "
+            "(check get_warmup_status) so the precomputed index makes xref near-instant."
+        )
+        result["next_action"] = {
+            "tool": "submit_xref",
+            "args": async_hint,
+            "why": "the async ticket path never hits the 120s HTTP timeout",
+        }
+    return result
+
+
 async def get_xrefs_to_class(
     class_name: str,
     offset: int = 0,
@@ -26,7 +55,7 @@ async def get_xrefs_to_class(
         additional_params["include_snippet"] = "true"
         additional_params["context_lines"] = str(context_lines)
 
-    return await PaginationUtils.get_paginated_data(
+    result = await PaginationUtils.get_paginated_data(
         endpoint="xrefs-to-class",
         offset=offset,
         count=count,
@@ -34,6 +63,7 @@ async def get_xrefs_to_class(
         data_extractor=lambda parsed: parsed.get("references", []),
         fetch_function=lambda ep, params={}: get_from_jadx(ep, params, instance_id=instance_id),
     )
+    return _augment_xref_timeout(result, {"target_type": "class", "class_name": class_name})
 
 
 async def get_xrefs_to_method(
@@ -50,13 +80,17 @@ async def get_xrefs_to_method(
         additional_params["include_snippet"] = "true"
         additional_params["context_lines"] = str(context_lines)
 
-    return await PaginationUtils.get_paginated_data(
+    result = await PaginationUtils.get_paginated_data(
         endpoint="xrefs-to-method",
         offset=offset,
         count=count,
         additional_params=additional_params,
         data_extractor=lambda parsed: parsed.get("references", []),
         fetch_function=lambda ep, params={}: get_from_jadx(ep, params, instance_id=instance_id),
+    )
+    return _augment_xref_timeout(
+        result,
+        {"target_type": "method", "class_name": class_name, "member_name": method_name},
     )
 
 
@@ -67,7 +101,7 @@ async def get_xrefs_to_field(
     count: int = 20,
     instance_id: Optional[str] = None,
 ) -> dict:
-    return await PaginationUtils.get_paginated_data(
+    result = await PaginationUtils.get_paginated_data(
         endpoint="xrefs-to-field",
         offset=offset,
         count=count,
@@ -75,11 +109,16 @@ async def get_xrefs_to_field(
         data_extractor=lambda parsed: parsed.get("references", []),
         fetch_function=lambda ep, params={}: get_from_jadx(ep, params, instance_id=instance_id),
     )
+    return _augment_xref_timeout(
+        result,
+        {"target_type": "field", "class_name": class_name, "member_name": field_name},
+    )
 
 
 async def batch_get_xrefs(targets: list[str], instance_id: Optional[str] = None) -> dict:
     targets_str = ",".join(targets)
-    return await get_from_jadx("batch-xrefs", {"targets": targets_str}, instance_id=instance_id)
+    result = await get_from_jadx("batch-xrefs", {"targets": targets_str}, instance_id=instance_id)
+    return _augment_xref_timeout(result, {"targets": targets})
 
 
 async def submit_xref(

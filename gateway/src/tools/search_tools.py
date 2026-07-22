@@ -52,6 +52,25 @@ async def get_method_source(
     return result
 
 
+async def get_smali_of_method(
+    class_name: str,
+    method_name: str,
+    method_signature: Optional[str] = None,
+    instance_id: Optional[str] = None,
+) -> dict:
+    logger.info(
+        f"get_smali_of_method: class={class_name}, method={method_name}, "
+        f"method_signature={method_signature}, instance={instance_id}"
+    )
+    params: dict = {"class_name": class_name, "method_name": method_name}
+    if method_signature:
+        params["method_signature"] = method_signature
+    result = await get_from_jadx("smali-of-method", params, instance_id=instance_id)
+    if "error" in result:
+        logger.warning(f"get_smali_of_method failed: {result.get('error')}")
+    return result
+
+
 async def _execute_batch_method_request(
     methods: list[str],
     chunk: int,
@@ -277,6 +296,35 @@ def register_search_tools(mcp):
             class_name, method_name, method_signature=method_signature, instance_id=instance_id,
         )
 
+    @mcp.tool(name="get_smali_of_method")
+    @with_busy_check
+    async def get_smali_of_method_tool(
+        class_name: str,
+        method_name: str,
+        method_signature: Optional[str] = None,
+        instance_id: Optional[str] = None,
+    ) -> dict:
+        """Extract one method's Dalvik smali block from its class — the smali counterpart of
+        get_method_source. Avoids binary-searching chunked get_smali_of_class output (100K+
+        chars / ~19 chunks for an obfuscated class) to locate one method's bytecode by hand.
+
+        Args:
+            class_name: Fully qualified class name.
+            method_name: Method name (deobfuscated or raw). Use '<init>'/'<clinit>' for
+                constructors/static initializers.
+            method_signature: Descriptor to disambiguate overloads — either the shortId form
+                'onCreate(Landroid/os/Bundle;)V' (same values as available_descriptors from
+                other method endpoints) or just the '(args)ret' portion (optional).
+            instance_id: Target JADX instance name.
+        Returns:
+            dict: single match: {class_name, raw_class_name, method_name, descriptor, smali,
+            overload_count: 1}. Multiple overloads without method_signature: {overload_count,
+            matches: [{descriptor, smali}], hint}. No match: 404 with available_descriptors.
+        """
+        return await get_smali_of_method(
+            class_name, method_name, method_signature=method_signature, instance_id=instance_id,
+        )
+
     @mcp.tool(name="batch_get_method_by_name")
     @with_busy_check
     async def batch_get_method_by_name_tool(
@@ -317,6 +365,15 @@ def register_search_tools(mcp):
           shard_index.built/covered_classes for availability. Broad/common terms return
           partial_results (search_info.broad_term=true + candidate_count/hint) instead of an
           exhaustive scan — narrow the term or use search_in='class'/'method' instead of retrying.
+
+        Content-scan admission control (a code/comment search NEVER runs unbounded):
+        - search_info.content_scan_skipped=true → no content index could prefilter this query
+          (index still warming, or a regex/comment query no index can prefilter), so the content
+          phase was skipped in milliseconds instead of timing out at 60s. Metadata matches in the
+          same result are complete. Follow search_info.hint: retry once get_index_stats reports
+          capabilities.code_search=ready, or switch to search_in='class'/'method'/'field'.
+        - search_info.content_scan_sampled=true → the term was too broad, so only
+          search_info.content_scanned classes were content-scanned; metadata matches are complete.
 
         Hard limits (hex/UUID/base64/long paths → never indexed): see get_index_stats docstring.
 
@@ -410,6 +467,9 @@ def register_search_tools(mcp):
         Hard limits (hex/UUID/base64/long paths → never indexed): see get_index_stats docstring.
         Broad/common terms return partial_results (search_info.broad_term=true) instead of an
         exhaustive scan — narrow the term or use search_in='class'/'method' rather than retrying.
+        search_info.content_scan_skipped=true means no content index could prefilter the query yet
+        (see search_info.hint): retry once get_index_stats reports capabilities.code_search=ready,
+        or use a metadata search now — do not re-submit the same code search in a tight loop.
 
         Args:
             search_term: Short human-readable token (≤20 chars ideal). package: Package filter.
