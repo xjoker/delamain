@@ -1353,8 +1353,21 @@ public class XrefsRoutes {
         return distinct.size();
     }
 
-    private void attachSnippets(List<Map<String, Object>> referenceList, int contextLines) {
+    /**
+     * Attaches a source snippet to each reference row.
+     *
+     * <p>Referrers whose source this method had to live-decompile are released again when it
+     * returns. Without that, one {@code include_snippet=true} xref against a high-fan-in class
+     * pins every referrer's decompiled ClassNode in the heap for the rest of the process's life:
+     * measured on production as heap 4 461 MB → 8 466 MB (86 % of a 9 832 MB cap) with only 538 MB
+     * reclaimable by a forced GC, and the request still unfinished after 4 minutes. Classes that
+     * were already resident before the call are left as they were — evicting those would slow down
+     * whatever the caller is actually working on.</p>
+     */
+    void attachSnippets(List<Map<String, Object>> referenceList, int contextLines) {
         Map<String, String[]> sourceLineCache = new HashMap<>();
+        // Referrers this call had to decompile itself, and therefore owns and must release.
+        List<JavaClass> decompiledHere = new ArrayList<>();
 
         for (Map<String, Object> ref : referenceList) {
             try {
@@ -1381,7 +1394,7 @@ public class XrefsRoutes {
 
                 String[] lines = sourceLineCache.get(fromClassName);
                 if (lines == null) {
-                    lines = fetchSourceLines(fromClassName);
+                    lines = fetchSourceLines(fromClassName, decompiledHere);
                     sourceLineCache.put(fromClassName, lines != null ? lines : new String[0]);
                 }
                 if (lines == null || lines.length == 0) {
@@ -1410,9 +1423,23 @@ public class XrefsRoutes {
                 ref.put("snippet", null);
             }
         }
+
+        // Snippet text is already copied out of the decompiled source above, so releasing the
+        // referrers now costs nothing but returns their retained heap.
+        for (JavaClass cls : decompiledHere) {
+            WarmupManager.recycle(cls);
+        }
+        if (!decompiledHere.isEmpty()) {
+            logger.debug("[xref] released {} referrer(s) decompiled for snippets", decompiledHere.size());
+        }
     }
 
-    private String[] fetchSourceLines(String className) {
+    /**
+     * @param decompiledHere collects any class this call had to live-decompile (i.e. it was not
+     *                       already resident and the CodeStore did not have it), so the caller can
+     *                       release exactly those and nothing else.
+     */
+    private String[] fetchSourceLines(String className, List<JavaClass> decompiledHere) {
         try {
             Map<String, JavaClass> classMap = ClassCacheManager.getCache();
             JavaClass cls = ClassCacheManager.findClass(classMap, className);
@@ -1427,10 +1454,14 @@ public class XrefsRoutes {
                     return stored.split(java.util.regex.Pattern.quote(newLine), -1);
                 }
             }
+            // Last resort: live decompile. Note it BEFORE doing it, and only when the class was
+            // not already resident, so the caller releases exactly what this request created.
+            boolean wasResident = ClassCacheManager.getCachedCodeDirect(cls) != null;
             ICodeInfo codeInfo = cls.getCodeInfo();
             if (codeInfo == null) return null;
             String code = codeInfo.getCodeStr();
             if (code == null) return null;
+            if (!wasResident && decompiledHere != null) decompiledHere.add(cls);
             return code.split(java.util.regex.Pattern.quote(newLine), -1);
         } catch (Exception e) {
             logger.debug("fetchSourceLines failed for {}: {}", className, e.getMessage());

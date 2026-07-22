@@ -679,7 +679,12 @@ public class WarmupManager {
      * heap stays bounded — {@link JavaClass#unload()} drops the (heavy) processed IR, and the jadx
      * code-cache entry is evicted too. The trigram search index is NOT touched.
      */
-    private static void recycle(JavaClass cls) {
+    /**
+     * Release a class the caller loaded transiently: drop its decompiled form from jadx and from
+     * the code cache. Public because the live xref snippet path needs exactly this — it decompiles
+     * referrers it does not own and must give the heap back (see XrefsRoutes.attachSnippets).
+     */
+    public static void recycle(JavaClass cls) {
         try { cls.unload(); } catch (Exception ignored) {}
         try { ClassCacheManager.evictCodeCacheEntry(cls); } catch (Exception ignored) {}
     }

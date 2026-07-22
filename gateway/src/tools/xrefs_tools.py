@@ -177,6 +177,10 @@ def register_xrefs_tools(mcp):
     ) -> dict:
         """Find cross-references to a class, method, or field.
 
+        About to call this again on a caller you just found — walking a chain one hop at a time?
+        Stop: use find_callers_chain(target_class, target_method) for the whole backward chain in
+        one call, or export_callgraph for a full multi-method call graph in either direction.
+
         Args:
             target_type: class|method|field. class_name: Fully qualified class name.
             member_name: Method or field name (required for method/field). offset/count: Pagination.

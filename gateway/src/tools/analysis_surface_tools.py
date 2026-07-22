@@ -94,6 +94,9 @@ def register_analysis_surface_tools(mcp):
     ) -> dict:
         """Export the call graph for a method as structured JSON or Graphviz DOT.
 
+        Use this instead of assembling a call graph by hand from repeated get_xrefs /
+        method-callees calls — it returns the full multi-method neighborhood in one call.
+
         Depth is capped at 6 client-side. For deep call chains, start with depth=2
         and increase incrementally.
 
