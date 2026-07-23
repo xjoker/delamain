@@ -75,6 +75,12 @@ public class SearchRoutes {
     private static final int PER_CLASS_DECOMPILE_TIMEOUT_SECONDS = Integer.parseInt(
         System.getenv().getOrDefault("DELAMAIN_PER_CLASS_TIMEOUT", "30")
     );
+    // Short: renames hold JadxSearchLock's write lock only for the duration of a single reindex,
+    // so a read attempt should not need to wait long. On timeout the fast path returns null and
+    // the caller falls back to the O(N) scan instead of blocking the request.
+    private static final int NAME_INDEX_LOCK_TIMEOUT_SECONDS = Integer.parseInt(
+        System.getenv().getOrDefault("DELAMAIN_NAME_INDEX_LOCK_TIMEOUT_SECONDS", "3")
+    );
     // Broad-word guard (W1): the shard index knows a term's candidate-class cardinality in O(1)
     // (RoaringBitmap.getCardinality) BEFORE any content scan starts. A term like "AES" can yield
     // tens of thousands of candidates on a large APK — scanning them all under cold cache blows the
@@ -495,28 +501,46 @@ public class SearchRoutes {
 
         // Union in kind order, deduped: "class" first so class-name hits keep their matched_on
         // attribution even when the same class also matches on a method/field name.
+        //
+        // findBySubstringName/findByPrefixName iterate classNameIndex/methodNameIndex/fieldNameIndex's
+        // entrySet() directly; a concurrent rename (ClassCacheManager.reindexRenamedClass, which
+        // requires callers to hold JadxSearchLock's WRITE lock) does a structural index.put() on
+        // that same HashMap. Without a read lock here the two race -> ConcurrentModificationException
+        // -> 500. Take the read lock for the whole per-kind lookup loop (one acquisition, not one per
+        // kind) so it either fully happens-before or happens-after any in-flight rename. On contention
+        // timeout, fail closed to null rather than iterating unlocked: the caller (handleGetSearch)
+        // already treats a null fast-path result as "fall back to the O(N) scan", so this is safe,
+        // just slower under contention.
+        boolean gotReadLock = JadxSearchLock.tryAcquireRead(NAME_INDEX_LOCK_TIMEOUT_SECONDS);
+        if (!gotReadLock) {
+            return null;
+        }
         Set<JavaClass> classKindHits = new HashSet<>();
         Set<JavaClass> candidateSet = new LinkedHashSet<>();
-        for (String kind : kinds) {
-            List<JavaClass> perKind;
-            switch (matchMode) {
-                case EXACT:
-                    perKind = ClassCacheManager.findByExactName(kind, searchTerm);
-                    break;
-                case SUBSTRING:
-                    perKind = ClassCacheManager.findBySubstringName(kind, searchTerm);
-                    break;
-                case PREFIX:
-                    perKind = ClassCacheManager.findByPrefixName(kind, searchTerm);
-                    break;
-                default:
-                    return null;
+        try {
+            for (String kind : kinds) {
+                List<JavaClass> perKind;
+                switch (matchMode) {
+                    case EXACT:
+                        perKind = ClassCacheManager.findByExactName(kind, searchTerm);
+                        break;
+                    case SUBSTRING:
+                        perKind = ClassCacheManager.findBySubstringName(kind, searchTerm);
+                        break;
+                    case PREFIX:
+                        perKind = ClassCacheManager.findByPrefixName(kind, searchTerm);
+                        break;
+                    default:
+                        return null;
+                }
+                // A missing index for ANY requested kind means that location cannot be answered from
+                // the indices; falling through keeps the search sound rather than silently partial.
+                if (perKind == null) return null;
+                candidateSet.addAll(perKind);
+                if ("class".equals(kind)) classKindHits.addAll(perKind);
             }
-            // A missing index for ANY requested kind means that location cannot be answered from
-            // the indices; falling through keeps the search sound rather than silently partial.
-            if (perKind == null) return null;
-            candidateSet.addAll(perKind);
-            if ("class".equals(kind)) classKindHits.addAll(perKind);
+        } finally {
+            JadxSearchLock.releaseRead();
         }
         List<JavaClass> candidates = new ArrayList<>(candidateSet);
 
