@@ -115,3 +115,44 @@ def test_existing_opts_are_preserved():
     opts = heap_config.build_java_opts("-Dfoo=bar", 2457)
     assert "-Dfoo=bar" in opts
     assert "-Xmx2457m" in opts
+
+
+# --- GC thread cap ---------------------------------------------------------------
+# Cold-warmup incident (2026-07-23, 10.0.5.31): the container ran without `docker run
+# --cpus`, so the JVM saw all 48 host cores and G1 spun up ~46 GC threads (33 Parallel +
+# 8 Conc + 5 Refine). With the cold-warmup live set filling the heap, those threads burned
+# ~30 cores in continuous GC while only 6 decompile workers made progress → throughput fell
+# from ~216 to ~5.8 classes/s. Fix: pin the GC thread count directly. NOT via
+# -XX:ActiveProcessorCount, which would ALSO shrink Runtime.availableProcessors() and thereby
+# starve WarmupManager's decompile workers (byCores=max(2,cores/4)) and jadx's decoder threads.
+
+def test_emits_gc_thread_caps_by_default():
+    opts = heap_config.build_java_opts("", 2457)
+    assert "-XX:ParallelGCThreads=8" in opts
+    assert "-XX:ConcGCThreads=2" in opts
+
+
+def test_never_emits_active_processor_count():
+    """ActiveProcessorCount would cascade into WarmupManager worker sizing — never use it."""
+    opts = heap_config.build_java_opts("", 2457)
+    assert "ActiveProcessorCount" not in opts
+
+
+def test_operator_parallel_gc_threads_override_is_respected():
+    opts = heap_config.build_java_opts("-XX:ParallelGCThreads=24", 2457)
+    assert opts.count("ParallelGCThreads") == 1
+    assert "-XX:ParallelGCThreads=24" in opts
+
+
+def test_gc_thread_cap_disabled_when_zero(monkeypatch):
+    monkeypatch.setattr(heap_config, "DEFAULT_GC_THREADS", 0)
+    opts = heap_config.build_java_opts("", 2457)
+    assert "ParallelGCThreads" not in opts
+    assert "ConcGCThreads" not in opts
+
+
+def test_gc_thread_cap_is_env_tunable(monkeypatch):
+    monkeypatch.setattr(heap_config, "DEFAULT_GC_THREADS", 12)
+    opts = heap_config.build_java_opts("", 2457)
+    assert "-XX:ParallelGCThreads=12" in opts
+    assert "-XX:ConcGCThreads=3" in opts

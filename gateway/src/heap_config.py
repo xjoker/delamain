@@ -41,6 +41,15 @@ _V1_UNLIMITED_THRESHOLD = 1 << 62
 # instead of sitting on peak RSS forever (5 min).
 PERIODIC_GC_FLAG = "-XX:G1PeriodicGCInterval=300000"
 
+# Pin G1's GC thread count. Without `docker run --cpus`, the JVM sees every host core and G1
+# sizes ~ncpus ParallelGC threads (33 on a 48-core box) + ~1/4 that many ConcGC threads; during
+# cold warmup, when the live set fills the heap, they burn most of the cores in continuous GC and
+# starve the decompile workers (2026-07-23 incident: throughput fell to ~5.8 classes/s). We fix
+# the count instead of using -XX:ActiveProcessorCount, which would ALSO lower
+# Runtime.availableProcessors() and thereby shrink WarmupManager's worker count
+# (byCores=max(2,cores/4)) and jadx's decoder threads. 8 is G1's own pick on an 8-core box.
+DEFAULT_GC_THREADS = int(os.environ.get("DELAMAIN_GC_THREADS", "8"))
+
 
 def _read_int(path):
     try:
@@ -110,8 +119,8 @@ def build_java_opts(existing, heap_mb):
     """Prepend our derived flags to ``existing`` JAVA_OPTS without overriding the operator.
 
     An explicit ``-Xmx`` or ``-XX:MaxRAMPercentage`` in JAVA_OPTS means the operator already
-    decided the ceiling — we add no heap flag then. The idle-GC flag is added unless already
-    present (any value: theirs wins).
+    decided the ceiling — we add no heap flag then. The idle-GC flag and the GC thread caps are
+    each added unless already present (any operator value wins).
     """
     existing = (existing or "").strip()
     flags = []
@@ -119,6 +128,10 @@ def build_java_opts(existing, heap_mb):
         flags.append("-Xmx{}m".format(heap_mb))
     if "G1PeriodicGCInterval" not in existing:
         flags.append(PERIODIC_GC_FLAG)
+    if DEFAULT_GC_THREADS > 0 and "ParallelGCThreads" not in existing:
+        flags.append("-XX:ParallelGCThreads={}".format(DEFAULT_GC_THREADS))
+    if DEFAULT_GC_THREADS > 0 and "ConcGCThreads" not in existing:
+        flags.append("-XX:ConcGCThreads={}".format(max(1, DEFAULT_GC_THREADS // 4)))
     return " ".join(([existing] if existing else []) + flags).strip()
 
 
