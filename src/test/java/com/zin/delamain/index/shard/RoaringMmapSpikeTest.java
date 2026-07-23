@@ -35,14 +35,22 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class RoaringMmapSpikeTest {
 
-    /** Reads used heap after several GC hints (coarse but sufficient with generous thresholds). */
+    /** Reads used heap once it has settled to a steady state (min over several GC passes). */
     private static long usedHeapAfterGc() {
         Runtime rt = Runtime.getRuntime();
         long used = Long.MAX_VALUE;
-        // A few GC passes to settle; take the minimum observed as the steady-state estimate.
-        for (int i = 0; i < 6; i++) {
+        // Take the minimum over several passes as the steady-state estimate. The short sleeps
+        // let G1's concurrent cycle actually finish before we sample, so a slow collection can't
+        // leave uncollected garbage inflating the reading (which is what made the delta noisy).
+        for (int i = 0; i < 8; i++) {
             System.gc();
             System.runFinalization();
+            try {
+                Thread.sleep(15);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
             used = Math.min(used, rt.totalMemory() - rt.freeMemory());
         }
         return used;
@@ -61,6 +69,7 @@ class RoaringMmapSpikeTest {
         int serializedSize = rb.serializedSizeInBytes();
         assertTrue(serializedSize > 4 * 1024 * 1024,
                 "spike needs a multi-MB payload to measure zero-copy; got " + serializedSize + " bytes");
+        long expectedCardinality = rb.getCardinality();
 
         Path file = Files.createTempFile("roaring-spike", ".rb");
         try {
@@ -68,6 +77,15 @@ class RoaringMmapSpikeTest {
             rb.serialize(out);
             out.flip();
             Files.write(file, out.array());
+
+            // Drop the build-phase allocations (the 4M-element bitmap and its serialization buffer,
+            // tens of MB together) BEFORE measuring. Otherwise whether GC has already reclaimed them
+            // swamps the per-path heap deltas — that non-determinism is exactly what made this test
+            // flaky: a baseline sampled before the build garbage was collected, then collected during
+            // the path, produced a NEGATIVE growth and broke the comparison. After this the deltas
+            // reflect only what each path itself allocates.
+            rb = null;
+            out = null;
 
             // Path A — full heap-resident read: pull the whole file into a heap byte[] and
             // deserialize. Heap must grow by at least ~serializedSize (the byte[] alone).
@@ -77,7 +95,7 @@ class RoaringMmapSpikeTest {
             heapCopy.deserialize(ByteBuffer.wrap(whole));
             long heapGrowthA = usedHeapAfterGc() - baselineA;
             // Keep references alive across the measurement.
-            assertEquals(rb.getCardinality(), heapCopy.getCardinality());
+            assertEquals(expectedCardinality, heapCopy.getCardinality());
             assertTrue(whole.length == serializedSize);
 
             // Path B — mmap + ImmutableRoaringBitmap. Heap must grow far less than the payload,
@@ -88,7 +106,7 @@ class RoaringMmapSpikeTest {
                 ImmutableRoaringBitmap irb = new ImmutableRoaringBitmap(mbb);
                 long heapGrowthB = usedHeapAfterGc() - baselineB;
 
-                assertEquals(rb.getCardinality(), irb.getCardinality(),
+                assertEquals(expectedCardinality, irb.getCardinality(),
                         "mmap-backed bitmap must expose the same cardinality");
                 assertTrue(heapGrowthB < serializedSize / 2L,
                         "mmap construction should not copy the payload into heap: growthB="

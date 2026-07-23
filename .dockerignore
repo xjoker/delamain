@@ -13,6 +13,10 @@ target/
 # Dockerfile.local needs the pre-built fat jar (run `mvn -DskipTests package` first)
 !target/delamain.jar
 
+# Rust CLI (never COPYed into the image) — its target/ holds multi-hundred-MB build outputs
+# that would otherwise bloat the build context on every `docker build`.
+tools/
+
 # Maven local
 .mvn/
 .m2/

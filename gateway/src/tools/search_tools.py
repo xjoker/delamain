@@ -336,7 +336,8 @@ def register_search_tools(mcp):
         """Fetch multiple method sources in one request using "class:method" format. Auto size-managed.
 
         Args:
-            methods: List of "class_name:method_name" strings (max 20). chunk: 0=first, N=continue.
+            methods: List of "class_name:method_name" strings (~16 per call; more trips
+                BATCH_TOO_LARGE — either paginate with chunk or pass force=True). chunk: 0=first, N=continue.
             force: Bypass size guard. instance_id: Target JADX instance name.
         Returns:
             dict: {methods: [{class_name, method_name, code, found}]} or BATCH_TOO_LARGE error.
