@@ -3,7 +3,6 @@ package com.zin.delamain.server.routes;
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.gson.Gson;
 
 import com.zin.delamain.core.HeadlessJadxWrapper;
 import com.zin.delamain.server.AuthConfig;
@@ -90,13 +89,17 @@ public class BatchRoutes {
             return;
         }
 
-        int chunk = 0;
-        String chunkParam = ctx.queryParam("chunk");
-        if (chunkParam != null && !chunkParam.isEmpty()) {
+        int offset = 0;
+        String offsetParam = ctx.queryParam("offset");
+        if (offsetParam != null && !offsetParam.isEmpty()) {
             try {
-                chunk = Integer.parseInt(chunkParam.trim());
+                offset = Integer.parseInt(offsetParam.trim());
+                if (offset < 0) {
+                    ctx.status(400).json(Map.of("error", "Offset must be non-negative, got: " + offset));
+                    return;
+                }
             } catch (NumberFormatException e) {
-                ctx.status(400).json(Map.of("error", "Invalid chunk parameter: " + chunkParam));
+                ctx.status(400).json(Map.of("error", "Invalid offset parameter: " + offsetParam));
                 return;
             }
         }
@@ -207,59 +210,23 @@ public class BatchRoutes {
                 results.add(classResult);
             }
 
-            Map<String, Object> response = new HashMap<>();
-            response.put("status", "success");
-            response.put("classes", results);
-            response.put("total", classNames.length);
-            response.put("found", foundCount);
-
-            boolean forceChunk = "true".equalsIgnoreCase(ctx.queryParam("force_chunk"));
-            boolean forceRaw   = "true".equalsIgnoreCase(ctx.queryParam("force_raw"));
-
-            if (forceChunk) {
-                String responseJson = new Gson().toJson(response);
-                Map<String, Object> chunkedResponse = SmartChunker.chunkResponse(responseJson, chunk, "batch_result");
-                ctx.json(chunkedResponse);
+            // force_raw is a debug escape hatch: dump every requested class in one unpaginated
+            // response, bypassing the byte-budget pagination below. Not used by the gateway.
+            boolean forceRaw = "true".equalsIgnoreCase(ctx.queryParam("force_raw"));
+            if (forceRaw) {
+                Map<String, Object> response = new HashMap<>();
+                response.put("status", "success");
+                response.put("classes", results);
+                response.put("total", classNames.length);
+                response.put("found", foundCount);
+                ctx.json(response);
                 return;
             }
 
-            if (forceRaw) { ctx.json(response); return; }
-
-            int estimatedBytes = 512;
-            for (Map<String, Object> cls : results) {
-                Object content = cls.get("content");
-                if (content instanceof String) estimatedBytes += ((String) content).length();
-                Object err = cls.get("error");
-                if (err instanceof String) estimatedBytes += ((String) err).length();
-                Object name = cls.get("name");
-                if (name instanceof String) estimatedBytes += ((String) name).length() + 32;
-            }
-
-            if (estimatedBytes <= INLINE_RESPONSE_MAX_BYTES) {
-                ctx.json(response);
-            } else {
-                int actualBytes;
-                try {
-                    actualBytes = OBJECT_MAPPER.writeValueAsBytes(response).length;
-                } catch (Exception serEx) {
-                    logger.warn("Size check serialization failed: {}", serEx.getMessage());
-                    ctx.json(response);
-                    return;
-                }
-                if (actualBytes <= INLINE_RESPONSE_MAX_BYTES) {
-                    ctx.json(response);
-                } else {
-                    Map<String, Object> transferHint = new HashMap<>();
-                    transferHint.put("response_too_large", true);
-                    transferHint.put("size_bytes", actualBytes);
-                    transferHint.put("items_count", classNames.length);
-                    transferHint.put("found", foundCount);
-                    transferHint.put("message",
-                        "Response exceeds inline threshold (" + INLINE_RESPONSE_MAX_BYTES + " bytes). "
-                        + "Reduce class count or request individual classes.");
-                    ctx.json(transferHint);
-                }
-            }
+            // Class-granularity pagination: each page carries only whole, structurally-complete
+            // class result objects (never a JSON byte fragment) within a byte budget, so an
+            // oversized batch degrades to "call again with next_offset" instead of failing outright.
+            ctx.json(buildPagedBatchResponse(results, offset, INLINE_RESPONSE_MAX_BYTES));
 
         } catch (Exception e) {
             logger.error("Internal error retrieving batch class sources: {}", e.getMessage(), e);
@@ -544,6 +511,79 @@ public class BatchRoutes {
             transferHint.put("total_classes", matchedClasses.size());
             transferHint.put("message", "Use smaller count or omit force_chunk=true for streaming.");
             ctx.json(transferHint);
+        }
+    }
+
+    // ------------------------------- Class-granularity batch pagination --------
+
+    /**
+     * Slices an already-resolved list of {@code /batch-class-source} class result objects into
+     * one page, starting at {@code offset}, that stays within {@code byteBudget} serialized bytes.
+     * Each page is self-contained: every entry is the complete {name, found, content/error} object
+     * built by {@link #handleBatchClassSource}, never a partial JSON fragment.
+     *
+     * <p>A single class whose own serialized size exceeds {@code byteBudget} is still returned
+     * alone (flagged {@code oversize_single: true}) so pagination always makes forward progress
+     * and never returns an empty page while items remain.</p>
+     */
+    static Map<String, Object> buildPagedBatchResponse(
+            List<Map<String, Object>> allResults, int offset, int byteBudget) {
+        int total = allResults.size();
+        int start = Math.max(0, Math.min(offset, total));
+
+        List<Map<String, Object>> page = new ArrayList<>();
+        int bytesUsed = 0;
+        int i = start;
+        while (i < total) {
+            Map<String, Object> cls = allResults.get(i);
+            int size = estimateClassResultBytes(cls);
+            if (page.isEmpty()) {
+                page.add(cls);
+                bytesUsed = size;
+                if (size > byteBudget) {
+                    cls.put("oversize_single", true);
+                }
+                i++;
+                continue;
+            }
+            if (bytesUsed + size > byteBudget) {
+                break;
+            }
+            page.add(cls);
+            bytesUsed += size;
+            i++;
+        }
+
+        int foundInPage = 0;
+        for (Map<String, Object> cls : page) {
+            if (Boolean.TRUE.equals(cls.get("found"))) foundInPage++;
+        }
+        boolean hasMore = i < total;
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("status", "success");
+        response.put("classes", page);
+        response.put("total", total);
+        response.put("returned", page.size());
+        response.put("offset", start);
+        response.put("found", foundInPage);
+        response.put("has_more", hasMore);
+        if (hasMore) response.put("next_offset", i);
+        return response;
+    }
+
+    private static int estimateClassResultBytes(Map<String, Object> cls) {
+        try {
+            return OBJECT_MAPPER.writeValueAsBytes(cls).length;
+        } catch (Exception e) {
+            int estimate = 64;
+            Object content = cls.get("content");
+            if (content instanceof String) estimate += ((String) content).length();
+            Object err = cls.get("error");
+            if (err instanceof String) estimate += ((String) err).length();
+            Object name = cls.get("name");
+            if (name instanceof String) estimate += ((String) name).length();
+            return estimate;
         }
     }
 

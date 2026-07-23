@@ -5,7 +5,7 @@
 
     <groupId>com.zin.delamain</groupId>
     <artifactId>delamain</artifactId>
-    <version>20260723.2</version>
+    <version>20260723.3</version>
     <name>delamain</name>
     <description>MCP server that exposes the JADX Android decompiler to AI agents for headless, low-memory reverse engineering.</description>
     <url>https://github.com/xjoker/delamain</url>

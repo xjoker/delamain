@@ -53,39 +53,29 @@ def _estimate_batch_size(class_names: list[str]) -> int:
     return len(class_names) * 5000
 
 
-async def _execute_batch_request(class_names: list[str], chunk: int, instance_id: Optional[str]) -> dict:
+async def _execute_batch_request(class_names: list[str], offset: int, instance_id: Optional[str]) -> dict:
     params = {"class_names": ",".join(class_names)}
-    if chunk > 0:
-        params["chunk"] = str(chunk)
+    if offset > 0:
+        params["offset"] = str(offset)
     result = await get_from_jadx("batch-class-source", params, instance_id=instance_id)
-    if result.get("response_too_large"):
-        size_kb = round(result.get("size_bytes", 0) / 1024, 1)
-        result.pop("transfer_endpoint", None)
+    if result.get("has_more") and "next_offset" in result:
+        next_offset = result["next_offset"]
+        returned = result.get("returned", 0)
+        total = result.get("total", len(class_names))
         result["_ai_instruction"] = (
-            f"The batch response is {size_kb} KB which exceeds the inline threshold. "
-            "This oversized-response transfer path is not exposed (uploads via "
-            "create_transfer_token are supported; large-response downloads are not). "
-            "Reduce class_names to 2-3 items, request individual classes with "
-            "get_class_source(), or retry batch_get_class_source() with chunk pagination "
-            "when the response includes _chunking."
-        )
-        return result
-    if "_chunking" in result and result["_chunking"].get("has_more"):
-        chunk_info = result["_chunking"]
-        result["_ai_instruction"] = (
-            f"Response chunked ({chunk_info['current_chunk']}/{chunk_info['total_chunks']}). "
-            f"Call batch_get_class_source(class_names={class_names}, chunk={chunk_info['next_chunk']}) to get next chunk."
+            f"This page returned {returned} complete class(es) of {total} requested; more remain. "
+            f"Call batch_get_class_source(class_names={class_names}, offset={next_offset}) to fetch the next page."
         )
     return result
 
 
 async def batch_get_class_source(
     class_names: list[str],
-    chunk: int = 0,
+    offset: int = 0,
     force: bool = False,
     instance_id: Optional[str] = None,
 ) -> dict:
-    logger.info(f"batch_get_class_source: classes={class_names}, chunk={chunk}, force={force}")
+    logger.info(f"batch_get_class_source: classes={class_names}, offset={offset}, force={force}")
     if len(class_names) > 20:
         return {
             "error": "TOO_MANY_CLASSES",
@@ -93,8 +83,8 @@ async def batch_get_class_source(
             "requested": len(class_names),
             "maximum": 20,
         }
-    if chunk > 0:
-        return await _execute_batch_request(class_names, chunk, instance_id)
+    if offset > 0:
+        return await _execute_batch_request(class_names, offset, instance_id)
     estimated_size = _estimate_batch_size(class_names)
     if estimated_size > 50000 and not force:
         class_infos = []
@@ -117,11 +107,11 @@ async def batch_get_class_source(
                 "option4": f"Add force=True to proceed anyway: batch_get_class_source(class_names={class_names[:2]}, force=True)",
             },
         }
-    result = await _execute_batch_request(class_names, chunk, instance_id)
+    result = await _execute_batch_request(class_names, offset, instance_id)
     if estimated_size > 20000:
         result["_performance_warning"] = {
             "estimated_size_kb": round(estimated_size / 1024, 1),
-            "message": "Large batch request. Response may be chunked.",
+            "message": "Large batch request. Response may be paginated by whole classes.",
             "optimization_tip": "Consider using get_class_info first to check if you really need full source code",
         }
     return result
@@ -274,19 +264,28 @@ def register_class_tools(mcp):
     @with_busy_check
     async def batch_get_class_source(
         class_names: list[str],
-        chunk: int = 0,
+        offset: int = 0,
         force: bool = False,
         instance_id: Optional[str] = None,
     ) -> dict:
         """Fetch 2-20 class sources in one request with auto size-management. Use get_class_source for a single class.
 
+        Each page returns whole, ready-to-use class objects (never a JSON fragment to reassemble).
+        When a batch's total size exceeds the inline byte budget, the response comes back paginated
+        by whole classes: has_more=true plus next_offset. Call again with offset=next_offset to fetch
+        the remaining classes — no parsing or concatenation needed on your side.
+
         Args:
-            class_names: List of fully qualified class names (max 20). chunk: 0=first, N=continue.
-            force: Bypass size guard. instance_id: Target JADX instance name.
+            class_names: List of fully qualified class names (max 20, same list every call).
+            offset: Index into class_names to resume from (0=first page; use next_offset from a
+            prior response to continue). force: Bypass the pre-flight size guard. instance_id:
+            Target JADX instance name.
         Returns:
-            dict: {classes: [{class_name, content, found}]} or BATCH_TOO_LARGE error with suggestions.
+            dict: {classes: [{name, found, content|error}], total, returned, offset, found,
+            has_more, next_offset?} or BATCH_TOO_LARGE error with suggestions. _ai_instruction is
+            set when has_more=true, telling you the next offset to call.
         """
-        return await _batch_get_class_source(class_names, chunk=chunk, force=force, instance_id=instance_id)
+        return await _batch_get_class_source(class_names, offset=offset, force=force, instance_id=instance_id)
 
     @mcp.tool()
     @with_busy_check

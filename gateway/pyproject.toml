@@ -1,6 +1,6 @@
 [project]
 name = "delamain-gateway"
-version = "20260723.2"
+version = "20260723.3"
 description = "delamain gateway — MCP server exposing the JADX Android decompiler to AI agents"
 requires-python = ">=3.10"
 dependencies = [
