@@ -90,6 +90,7 @@ public class XrefsRoutes {
         private final long deadlineNanos;
         private final LongSupplier ticker;
         private volatile boolean truncated;
+        private volatile boolean invalidMetadataPosition;
 
         private Deadline(long deadlineNanos, LongSupplier ticker) {
             this.deadlineNanos = deadlineNanos;
@@ -122,6 +123,14 @@ public class XrefsRoutes {
         boolean truncated() {
             return truncated;
         }
+
+        void markInvalidMetadataPosition() {
+            invalidMetadataPosition = true;
+        }
+
+        boolean invalidMetadataPosition() {
+            return invalidMetadataPosition;
+        }
     }
 
     @FunctionalInterface
@@ -141,6 +150,98 @@ public class XrefsRoutes {
         }
     }
 
+    /** Per-referrer source index: one scan and binary lookups preserve JADX's line semantics. */
+    static final class SourceLineIndex {
+        private final String code;
+        private final int[] lineStarts;
+        private final int[] lineTransitions;
+        private final int newlineLength;
+
+        private SourceLineIndex(String code, int[] lineStarts, int[] lineTransitions, int newlineLength) {
+            this.code = code;
+            this.lineStarts = lineStarts;
+            this.lineTransitions = lineTransitions;
+            this.newlineLength = newlineLength;
+        }
+
+        static final class LineLocation {
+            final int number;
+            final String text;
+
+            LineLocation(int number, String text) {
+                this.number = number;
+                this.text = text;
+            }
+        }
+
+        static SourceLineIndex build(String code, String newline) {
+            return build(code, newline, null);
+        }
+
+        static SourceLineIndex build(String code, String newline, Runnable onBuild) {
+            if (onBuild != null) onBuild.run();
+            String effectiveNewline = (newline == null || newline.isEmpty()) ? "\n" : newline;
+            int newlineLength = effectiveNewline.length();
+            int lineCount = 1;
+            for (int offset = 0; (offset = code.indexOf(effectiveNewline, offset)) >= 0; offset += newlineLength) {
+                lineCount++;
+            }
+            int[] starts = new int[lineCount];
+            int[] transitions = new int[lineCount];
+            int line = 1;
+            int offset = 0;
+            int newlineOffset;
+            while (line < lineCount && (newlineOffset = code.indexOf(effectiveNewline, offset)) >= 0) {
+                starts[line] = newlineOffset + newlineLength;
+                // CodeUtils switches after the first newline character, including CRLF's LF.
+                transitions[line] = newlineOffset + 1;
+                offset = newlineOffset + newlineLength;
+                line++;
+            }
+            return new SourceLineIndex(code, starts, transitions, newlineLength);
+        }
+
+        LineLocation locate(int position) {
+            if (position < 0 || position > code.length()) return null;
+            // Metadata positions point at source characters; a position on any LF separator is
+            // not a resolvable source line, including the LF half of a CRLF separator.
+            if (position < code.length() && code.charAt(position) == '\n') return null;
+            int low = 0;
+            int high = lineTransitions.length - 1;
+            int line = 0;
+            while (low <= high) {
+                int mid = (low + high) >>> 1;
+                if (lineTransitions[mid] <= position) {
+                    line = mid;
+                    low = mid + 1;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            int start = lineStarts[line];
+            int end = line + 1 < lineStarts.length
+                ? lineStarts[line + 1] - newlineLength
+                : code.length();
+            return new LineLocation(line + 1, code.substring(start, end));
+        }
+
+        Integer lineNumberFor(int position) {
+            LineLocation location = locate(position);
+            return location == null ? null : location.number;
+        }
+
+        String lineFor(int position) {
+            LineLocation location = locate(position);
+            return location == null ? null : location.text;
+        }
+    }
+
+    static SourceLineIndex buildSourceLineIndexIfRunning(
+            String code, String newline, Deadline deadline, Runnable onBuild) {
+        if (deadline.shouldStop()) return null;
+        return SourceLineIndex.build(code, newline, onBuild);
+    }
+
     static <T, E extends Exception> BoundedVisitResult visitUntilStopped(
             Iterable<T> items, Deadline deadline, CheckedVisitor<T, E> visitor) throws E {
         int visitedCount = 0;
@@ -157,15 +258,22 @@ public class XrefsRoutes {
 
     /** Labels a response whose live path was cut short, so a caller can tell it from a complete one. */
     static void annotatePartial(Map<String, Object> result, Deadline deadline) {
-        if (deadline == null || !deadline.truncated()) {
+        if (deadline == null || (!deadline.truncated() && !deadline.invalidMetadataPosition())) {
             return;
         }
         result.put("partial_results", true);
-        result.put("partial_reason",
-            "Live decompile of the referrer set exceeded the server-side deadline of "
+        String reason = deadline.truncated()
+            ? "Live decompile of the referrer set exceeded the server-side deadline of "
                 + (LIVE_DEADLINE_MILLIS / 1000) + "s; the references below are a prefix of the full "
                 + "set. Run start-warmup (the indexed paths answer this instantly), narrow the "
-                + "target, or use POST /submit-xref for the unbounded async path.");
+                + "target, or use POST /submit-xref for the unbounded async path."
+            : "";
+        if (deadline.invalidMetadataPosition()) {
+            reason += (reason.isEmpty() ? "" : " ")
+                + "Some JADX metadata positions were invalid or could not be resolved in the decompiled "
+                + "source and were skipped.";
+        }
+        result.put("partial_reason", reason);
     }
 
     private static final TicketRegistry<Map<String, Object>> XREF_TICKETS = new TicketRegistry<>(600);
@@ -1050,7 +1158,7 @@ public class XrefsRoutes {
         }
     }
 
-    private Map<String, Object> buildXrefStatusResponse(Context ctx, Map<String, Object> payload) throws PaginationException {
+    Map<String, Object> buildXrefStatusResponse(Context ctx, Map<String, Object> payload) throws PaginationException {
         if ("batch".equals(payload.get("kind"))) {
             // Batch results are already complete and bounded (max MAX_BATCH_SIZE targets) — no
             // extra pagination needed, same as the sync /batch-xrefs response shape.
@@ -1066,8 +1174,18 @@ public class XrefsRoutes {
         if (payload.get("resolution") != null) result.put("resolution", payload.get("resolution"));
         if (payload.get("via") != null) result.put("via", payload.get("via"));
         if (payload.get("hint") != null) result.put("hint", payload.get("hint"));
+        copySinglePartialResult(payload, result);
         result.put("distinct_referrer_class_count", countDistinctReferrerClasses(references));
         return result;
+    }
+
+    static void copySinglePartialResult(Map<String, Object> payload, Map<String, Object> result) {
+        if (payload.get("partial_results") != null) {
+            result.put("partial_results", payload.get("partial_results"));
+        }
+        if (payload.get("partial_reason") != null) {
+            result.put("partial_reason", payload.get("partial_reason"));
+        }
     }
 
     /** Submits work to the xref background pool and registers/returns a ticket (status=submitted). */
@@ -1151,13 +1269,14 @@ public class XrefsRoutes {
 
         Map<String, Object> payload = new HashMap<>();
         payload.put("kind", "single");
+        Deadline deadline = Deadline.none();
 
         switch (type) {
             case "class": {
                 // No deadline on the async ticket path — it is not on a request thread and holds
                 // no read lock across HTTP responses, so the production-incident constraint the
                 // live-path deadline exists for does not apply here.
-                XrefComputeResult computed = computeClassXrefs(targetClass, includeSnippet, contextLines, Deadline.none());
+                XrefComputeResult computed = computeClassXrefs(targetClass, includeSnippet, contextLines, deadline);
                 if (includeSnippet) {
                     attachSnippets(snippetWindow(computed.references, 0, ASYNC_SNIPPET_CAP), contextLines);
                 }
@@ -1176,7 +1295,7 @@ public class XrefsRoutes {
                         if (!relatedMethods.contains(m)) relatedMethods.add(m);
                     }
                 }
-                XrefComputeResult computed = computeMethodXrefs(relatedMethods, includeSnippet, contextLines, Deadline.none());
+                XrefComputeResult computed = computeMethodXrefs(relatedMethods, includeSnippet, contextLines, deadline);
                 if (includeSnippet) {
                     attachSnippets(snippetWindow(computed.references, 0, ASYNC_SNIPPET_CAP), contextLines);
                 }
@@ -1189,12 +1308,13 @@ public class XrefsRoutes {
                     throw new XrefLookupException(
                         "Field " + memberName + " not found in class " + targetClass.getFullName());
                 }
-                payload.put("references", computeFieldXrefs(targetField, Deadline.none()));
+                payload.put("references", computeFieldXrefs(targetField, deadline));
                 break;
             }
             default:
                 throw new XrefLookupException("Invalid target_type: " + type);
         }
+        annotatePartial(payload, deadline);
         return payload;
     }
 
@@ -1477,12 +1597,21 @@ public class XrefsRoutes {
             }
 
             String code = codeInfo.getCodeStr();
+            SourceLineIndex lineIndex = buildSourceLineIndexIfRunning(
+                code, wrapper.getArgs().getCodeNewLineStr(), deadline, null);
+            if (lineIndex == null) return new BoundedVisitResult(0, false, true);
             return visitUntilStopped(usePositions, deadline, pos -> {
-                String line = CodeUtils.getLineForPos(code, pos).trim();
+                SourceLineIndex.LineLocation location = lineIndex.locate(pos);
+                if (location == null) {
+                    deadline.markInvalidMetadataPosition();
+                    return false;
+                }
+                String line = location.text.trim();
                 if (line.startsWith("import ")) return false;
                 // headless: enclosingNode not available — pass null
                 JavaNode enclosingNode = null;
-                Map<String, Object> refInfo = buildPreciseReferenceInfo(topUseClass, enclosingNode, line, code, pos);
+                Map<String, Object> refInfo = buildPreciseReferenceInfo(
+                    topUseClass, enclosingNode, line, location.number);
                 addIfUnique(referenceList, seenReferences, refInfo);
                 return true;
             });
@@ -1497,18 +1626,12 @@ public class XrefsRoutes {
             JavaClass topUseClass,
             JavaNode enclosingNode,
             String line,
-            String code,
-            int position) {
+            int decompiledLine) {
         Map<String, Object> refInfo = new HashMap<>();
         refInfo.put("class", topUseClass.getFullName());
         refInfo.put("raw_class", JadxApiAdapter.getClassRawName(topUseClass));
         refInfo.put("code_snippet", line);
 
-        int decompiledLine = CodeUtils.getLineNumForPos(
-            code,
-            position,
-            wrapper.getArgs().getCodeNewLineStr()
-        );
         refInfo.put("decompiled_line", decompiledLine);
         refInfo.put("source_line", topUseClass.getSourceLine(decompiledLine));
 
