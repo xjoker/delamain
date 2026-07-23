@@ -315,27 +315,10 @@ public class DelamainServer {
             resp.put("oom_detected", isOomDetected());
 
             resp.put("search_lock", com.zin.delamain.utils.JadxSearchLock.getStatus());
-
-            Map<String, Object> analysisLock = new HashMap<>();
-            analysisLock.put("read_lock_count", wrapper.getAnalysisReadLockCount());
-            analysisLock.put("reload_pending", wrapper.isReloadPending());
-            resp.put("analysis_lock", analysisLock);
-
-            long oldestStart = Long.MAX_VALUE;
-            for (long start : inFlightRequestStartTimes.values()) {
-                if (start < oldestStart) {
-                    oldestStart = start;
-                }
-            }
-            Map<String, Object> requests = new HashMap<>();
-            requests.put("in_flight", inFlightRequestStartTimes.size());
-            requests.put("oldest_in_flight_seconds",
-                    oldestStart == Long.MAX_VALUE ? 0 : (System.currentTimeMillis() - oldestStart) / 1000);
-            resp.put("requests", requests);
-
-            if (wrapper.getLastReloadError() != null) {
-                resp.put("last_reload_error", wrapper.getLastReloadError());
-            }
+            // /health keeps analysis_lock/requests/last_reload_error flattened at the top level
+            // (pre-existing contract, see DelamainServerHealthLockDiagnosticsTest) rather than
+            // nested under runtime_diagnostics like /decompile-status.
+            resp.putAll(buildRuntimeDiagnostics());
 
             Runtime rt = Runtime.getRuntime();
             long max = rt.maxMemory();
@@ -375,7 +358,9 @@ public class DelamainServer {
             ctx.json(resp);
         });
 
-        // GET /decompile-status — stub for Wave 1; Wave 2 will add full metrics
+        // GET /decompile-status — mirrors /health's lock/queue diagnostics (see
+        // buildRuntimeDiagnostics) so gateway callers can honor the documented
+        // search_lock.locked backoff contract (mcp_server.py MCP_INSTRUCTIONS, class_tools.py).
         app.get("/decompile-status", ctx -> {
             if (!wrapper.isLoaded()) {
                 Map<String, Object> response = new HashMap<>();
@@ -385,6 +370,8 @@ public class DelamainServer {
                 if (wrapper.getLoadError() != null) {
                     response.put("load_error", wrapper.getLoadError());
                 }
+                response.put("search_lock", com.zin.delamain.utils.JadxSearchLock.getStatus());
+                response.put("runtime_diagnostics", buildRuntimeDiagnostics());
                 ctx.json(response);
                 return;
             }
@@ -397,6 +384,8 @@ public class DelamainServer {
             Map<String, Object> resp = new HashMap<>();
             resp.put("status", "idle");
             resp.put("total_classes", total);
+            resp.put("search_lock", com.zin.delamain.utils.JadxSearchLock.getStatus());
+            resp.put("runtime_diagnostics", buildRuntimeDiagnostics());
 
             Map<String, Object> mem = new HashMap<>();
             mem.put("max_mb", max / (1024 * 1024));
@@ -406,6 +395,41 @@ public class DelamainServer {
 
             ctx.json(resp);
         });
+    }
+
+    /**
+     * Shared with /health: analysis_lock (read_lock_count/reload_pending), requests
+     * (in_flight/oldest_in_flight_seconds) and, when present, last_reload_error. Deliberately
+     * excludes memory and search_lock — each caller places those at the level its documented
+     * contract requires (flattened on /health, search_lock flattened but the rest namespaced
+     * under runtime_diagnostics on /decompile-status).
+     */
+    private Map<String, Object> buildRuntimeDiagnostics() {
+        Map<String, Object> diagnostics = new HashMap<>();
+
+        Map<String, Object> analysisLock = new HashMap<>();
+        analysisLock.put("read_lock_count", wrapper.getAnalysisReadLockCount());
+        analysisLock.put("reload_pending", wrapper.isReloadPending());
+        diagnostics.put("analysis_lock", analysisLock);
+
+        long oldestStart = Long.MAX_VALUE;
+        for (long start : inFlightRequestStartTimes.values()) {
+            if (start < oldestStart) {
+                oldestStart = start;
+            }
+        }
+        Map<String, Object> requests = new HashMap<>();
+        requests.put("in_flight", inFlightRequestStartTimes.size());
+        requests.put("oldest_in_flight_seconds",
+                oldestStart == Long.MAX_VALUE ? 0 : (System.currentTimeMillis() - oldestStart) / 1000);
+        diagnostics.put("requests", requests);
+
+        if (wrapper.getLastReloadError() != null) {
+            diagnostics.put("last_reload_error", wrapper.getLastReloadError());
+        }
+
+        assert !diagnostics.containsKey("memory") : "runtime diagnostics must not include memory";
+        return diagnostics;
     }
 
     // -------------------------------------------------------------------------
