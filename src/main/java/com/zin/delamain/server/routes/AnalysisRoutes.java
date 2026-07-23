@@ -1,6 +1,8 @@
 package com.zin.delamain.server.routes;
 
 import com.zin.delamain.core.HeadlessJadxWrapper;
+import com.zin.delamain.index.CodeStore;
+import com.zin.delamain.index.WarmupManager;
 import com.zin.delamain.server.AuthConfig;
 import com.zin.delamain.utils.ClassCacheManager;
 import com.zin.delamain.utils.JadxApiAdapter;
@@ -31,6 +33,7 @@ import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.StringReader;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -40,6 +43,14 @@ import java.util.regex.Pattern;
 public class AnalysisRoutes {
     private static final Logger logger = LoggerFactory.getLogger(AnalysisRoutes.class);
     private static final String ANDROID_NS = "http://schemas.android.com/apk/res/android";
+    static final int DEFAULT_LITERAL_SCAN_MAX_CLASSES = Integer.parseInt(
+        System.getenv().getOrDefault("DELAMAIN_LITERAL_SCAN_MAX_CLASSES", "20000")
+    );
+    static final int DEFAULT_LITERAL_SCAN_TIMEOUT_SECONDS = Integer.parseInt(
+        System.getenv().getOrDefault("DELAMAIN_LITERAL_SCAN_TIMEOUT_SECONDS", "10")
+    );
+    static int LITERAL_SCAN_MAX_CLASSES = DEFAULT_LITERAL_SCAN_MAX_CLASSES;
+    static int LITERAL_SCAN_TIMEOUT_SECONDS = DEFAULT_LITERAL_SCAN_TIMEOUT_SECONDS;
 
     /** Known DANGEROUS-level Android permissions. */
     private static final Set<String> DANGEROUS_PERMISSIONS = new HashSet<>(Arrays.asList(
@@ -449,56 +460,56 @@ public class AnalysisRoutes {
 
             List<JavaClass> allClasses = wrapper.getClassesWithInners();
             int totalClasses = allClasses.size();
+            boolean hasClassFilter = classFilter != null && !classFilter.isEmpty();
+            int candidateClasses = 0;
+            for (JavaClass cls : allClasses) {
+                if (!hasClassFilter || cls.getFullName().contains(classFilter)) {
+                    candidateClasses++;
+                }
+            }
             int scannedCount = 0;
             int cachedCount = 0;
+            int unreadableCount = 0;
+            int examinedCount = 0;
+            boolean scanLimited = false;
+            boolean timedOut = false;
+            long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(LITERAL_SCAN_TIMEOUT_SECONDS);
 
             List<Map<String, Object>> results = new ArrayList<>();
             boolean truncated = false;
-
-            for (JavaClass cls : allClasses) {
-                try {
-                    if (cls.getClassNode() != null && cls.getClassNode().getState().isProcessComplete()) {
-                        cachedCount++;
-                    }
-                } catch (Exception ignored) {
-                }
-            }
 
             for (JavaClass cls : allClasses) {
                 if (results.size() >= limit) {
                     truncated = true;
                     break;
                 }
+                if (System.nanoTime() >= deadlineNanos) {
+                    timedOut = true;
+                    break;
+                }
 
                 String fullName = cls.getFullName();
-                if (classFilter != null && !classFilter.isEmpty()) {
+                if (hasClassFilter) {
                     if (!fullName.contains(classFilter)) continue;
                 }
 
-                boolean isCached = false;
+                if (examinedCount >= LITERAL_SCAN_MAX_CLASSES) {
+                    scanLimited = true;
+                    break;
+                }
+                examinedCount++;
                 try {
-                    isCached = cls.getClassNode() != null && cls.getClassNode().getState().isProcessComplete();
+                    if (cls.getClassNode() != null && cls.getClassNode().getState().isProcessComplete()) {
+                        cachedCount++;
+                    }
                 } catch (Exception ignored) {
                 }
 
-                String code = null;
-                if (isCached) {
-                    code = ClassCacheManager.getCachedCodeDirect(cls);
-                } else if (forceDecompile) {
-                    boolean locked = JadxSearchLock.tryAcquire(10);
-                    if (locked) {
-                        try {
-                            String freshCode = cls.getCode();
-                            if (freshCode != null && !freshCode.isEmpty()) {
-                                code = freshCode;
-                            }
-                        } catch (Exception ignored) {
-                        } finally {
-                            JadxSearchLock.release();
-                        }
-                    }
-                    if (code == null) continue;
-                } else {
+                // A literal search is a bulk operation. force_decompile remains accepted for
+                // compatibility, but never permits per-class live JADX work on this path.
+                String code = readBulkLiteralSource(cls, forceDecompile);
+                if (code == null) {
+                    unreadableCount++;
                     continue;
                 }
 
@@ -534,14 +545,10 @@ public class AnalysisRoutes {
                 }
             }
 
-            int cachedPct = totalClasses > 0 ? (cachedCount * 100 / totalClasses) : 0;
-            int coveragePct = totalClasses > 0 ? (scannedCount * 100 / totalClasses) : 0;
-            String coverageNote = scannedCount < totalClasses
-                ? "PARTIAL SCAN: only " + scannedCount + "/" + totalClasses
-                    + " classes scanned (only decompiled classes included). "
-                    + "Empty result does NOT mean the string is absent. "
-                    + "Use class_filter + force_decompile=true for complete coverage."
-                : "FULL SCAN: all " + totalClasses + " classes scanned.";
+            Map<String, Object> metadata = literalScanMetadata(
+                totalClasses, candidateClasses, scannedCount, cachedCount, unreadableCount,
+                scanLimited, timedOut, truncated, hasClassFilter);
+            boolean partialResults = (Boolean) metadata.get("partial_results");
 
             Map<String, Object> response = new LinkedHashMap<>();
             response.put("results", results);
@@ -550,15 +557,65 @@ public class AnalysisRoutes {
             response.put("limit", limit);
             response.put("scanned_classes", scannedCount);
             response.put("total_classes", totalClasses);
-            response.put("coverage_pct", coveragePct);
-            response.put("coverage_note", coverageNote);
-            response.put("cached_percentage_at_scan", cachedPct);
+            response.putAll(metadata);
+            response.put("force_decompile_ignored", forceDecompile);
+            response.put("source_unreadable_classes", unreadableCount);
+            response.put("scan_examined_classes", examinedCount);
+            response.put("partial_results", partialResults);
+            response.put("timed_out", timedOut);
+            response.put("scan_limited", scanLimited);
+            if (partialResults) {
+                response.put("hint", "Bulk literal search reads only cached or persisted source; "
+                    + "run start_warmup to materialise skipped classes.");
+            }
             ctx.json(response);
 
         } catch (Exception e) {
             logger.error("Error: {}", e.getMessage(), e);
             ctx.status(500).json(Map.of("error", "Failed to search string literals: " + e.getMessage()));
         }
+    }
+
+    /**
+     * Resolves already materialised source for a bulk literal scan. The force flag is deliberately
+     * ignored: calling {@link JavaClass#getCode()} here would make a request unbounded.
+     */
+    static String readBulkLiteralSource(JavaClass cls, boolean forceDecompile) {
+        String code = ClassCacheManager.getCachedCodeDirect(cls);
+        if (code != null) return code;
+        try {
+            CodeStore codeStore = WarmupManager.codeStore();
+            if (codeStore == null) return null;
+            String rawName = cls.getRawName();
+            return rawName == null || rawName.isEmpty() ? null : codeStore.get(rawName);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    static Map<String, Object> literalScanMetadata(
+        int totalClasses, int candidateClasses, int scannedCount, int cachedCount,
+        int unreadableCount, boolean scanLimited, boolean timedOut, boolean truncated,
+        boolean hasClassFilter
+    ) {
+        int denominator = hasClassFilter ? candidateClasses : totalClasses;
+        int cachedPct = denominator > 0 ? cachedCount * 100 / denominator : 0;
+        int coveragePct = denominator > 0 ? scannedCount * 100 / denominator : 0;
+        boolean partialResults = unreadableCount > 0 || scanLimited || timedOut || truncated;
+        String candidateLabel = hasClassFilter ? " candidate" : "";
+        String coverageNote = partialResults
+            ? "PARTIAL SCAN: only " + scannedCount + "/" + denominator + candidateLabel
+                + " classes scanned from already materialised source. "
+                + "Empty result does NOT mean the string is absent. "
+                + "Run warmup to materialise more source."
+            : "FULL SCAN: all " + denominator + candidateLabel + " classes scanned.";
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("candidate_classes", candidateClasses);
+        metadata.put("coverage_pct", coveragePct);
+        metadata.put("coverage_note", coverageNote);
+        metadata.put("cached_percentage_at_scan", cachedPct);
+        metadata.put("partial_results", partialResults);
+        return metadata;
     }
 
     private int findLineNumber(String code, int charPos) {

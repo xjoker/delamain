@@ -581,7 +581,9 @@ public class BatchRoutes {
 
         int effectiveLimit;
         if (hasCustomLimit) {
-            effectiveLimit = requestedLimit == 0 ? Math.max(0, totalItems - offset) : requestedLimit;
+            effectiveLimit = requestedLimit == 0
+                ? Math.min(paginationUtils.MAX_PAGE_SIZE, Math.max(0, totalItems - offset))
+                : requestedLimit;
         } else {
             effectiveLimit = Math.min(paginationUtils.DEFAULT_PAGE_SIZE, Math.max(0, totalItems - offset));
         }

@@ -23,7 +23,7 @@ _METADATA_ENDPOINTS = frozenset({
     "class-info", "methods-of-class", "fields-of-class", "all-classes",
     "search-classes-by-keyword", "search-native-methods", "file-info",
     "package-classes", "decompile-status", "apk-info", "memory-diagnostics",
-    "rename-class", "rename-method", "rename-field", "get-method-signature",
+    "rename-class", "rename-method", "rename-field", "method-signature",
 })
 _HEALTH_ENDPOINTS = frozenset({"health", "start-warmup", "warmup-status"})
 

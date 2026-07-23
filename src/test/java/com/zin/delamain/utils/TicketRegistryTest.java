@@ -8,10 +8,14 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -126,18 +130,125 @@ class TicketRegistryTest {
 
     @Test
     void poll_afterTtlExpiry_returnsNotFound() throws InterruptedException {
-        // TTL is checked lazily (pruneExpired() runs on register()/poll()), not by a background
-        // timer, so a short TTL plus a real sleep is enough to observe expiry deterministically.
         TicketRegistry<String> registry = new TicketRegistry<>(1);
-        CompletableFuture<String> future = new CompletableFuture<>(); // never completes
-        String ticket = registry.register(future);
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        FutureTask<String> task = new FutureTask<>(() -> {
+            started.countDown();
+            try {
+                Thread.sleep(TimeUnit.MINUTES.toMillis(1));
+                return "unexpected";
+            } catch (InterruptedException e) {
+                interrupted.countDown();
+                throw e;
+            }
+        });
+        String ticket = registry.register(task);
+        Thread worker = new Thread(task, "ticket-registry-ttl-test");
+        worker.start();
+
+        assertTrue(started.await(1, TimeUnit.SECONDS));
+        assertTrue(interrupted.await(3, TimeUnit.SECONDS),
+            "TTL expiry must actively interrupt running work without requiring poll/register");
+        assertTrue(task.isCancelled());
+        assertEquals(TicketRegistry.Status.NOT_FOUND, registry.poll(ticket).getStatus());
+        worker.join(1000);
+    }
+
+    @Test
+    void completedTicketExpiresWhenNobodyPollsIt() throws InterruptedException {
+        TicketRegistry<String> registry = new TicketRegistry<>(1);
+        String ticket = registry.register(CompletableFuture.completedFuture("done"));
 
         TimeUnit.MILLISECONDS.sleep(1100);
 
+        assertEquals(TicketRegistry.Status.NOT_FOUND, registry.poll(ticket).getStatus(),
+            "TTL must release completed tickets that were never consumed by poll");
+    }
+
+    @Test
+    void cancelQueuedTaskPreventsBodyFromRunningAndRemovesTicket() {
+        TicketRegistry<String> registry = new TicketRegistry<>(60);
+        AtomicBoolean ran = new AtomicBoolean();
+        FutureTask<String> task = new FutureTask<>(() -> {
+            ran.set(true);
+            return "unexpected";
+        });
+        String ticket = registry.register(task);
+
+        assertTrue(registry.cancel(ticket));
+        task.run();
+
+        assertFalse(ran.get(), "register -> cancel -> execute must never enter the task body");
+        assertTrue(task.isCancelled());
+        assertEquals(TicketRegistry.Status.NOT_FOUND, registry.poll(ticket).getStatus());
+    }
+
+    @Test
+    void cancelCompletedTaskReturnsFalseAndLeavesResultAvailableToPoll() {
+        TicketRegistry<String> registry = new TicketRegistry<>(60);
+        CompletableFuture<String> future = CompletableFuture.completedFuture("done");
+        String ticket = registry.register(future);
+
+        assertFalse(registry.cancel(ticket),
+            "the cancel endpoint reports completed work as not found rather than cancelled");
+        assertEquals(TicketRegistry.Status.DONE, registry.poll(ticket).getStatus());
+    }
+
+    @Test
+    void cancelThatRacesWithCompletionKeepsCompletedResultAvailableToPoll() {
+        TicketRegistry<String> registry = new TicketRegistry<>(60);
+        Future<String> future = new CompletionDuringCancelFuture("done");
+        String ticket = registry.register(future);
+
+        assertFalse(registry.cancel(ticket),
+            "a cancellation that loses the race to completion must report false");
+        TicketRegistry.PollResult<String> pollResult = registry.poll(ticket);
+        assertEquals(TicketRegistry.Status.DONE, pollResult.getStatus());
+        assertEquals("done", pollResult.getResult());
+    }
+
+    @Test
+    void cancelRunningTaskInterruptsItAndRemovesTicket() throws Exception {
+        TicketRegistry<String> registry = new TicketRegistry<>(60);
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        FutureTask<String> task = new FutureTask<>(() -> {
+            started.countDown();
+            try {
+                Thread.sleep(TimeUnit.MINUTES.toMillis(1));
+                return "unexpected";
+            } catch (InterruptedException e) {
+                interrupted.countDown();
+                throw e;
+            }
+        });
+        String ticket = registry.register(task);
+        Thread worker = new Thread(task, "ticket-registry-cancel-test");
+        worker.start();
+
+        assertTrue(started.await(1, TimeUnit.SECONDS));
+        assertTrue(registry.cancel(ticket));
+        assertTrue(interrupted.await(1, TimeUnit.SECONDS));
+        assertTrue(task.isCancelled());
+        assertEquals(TicketRegistry.Status.NOT_FOUND, registry.poll(ticket).getStatus());
+        worker.join(1000);
+    }
+
+    @Test
+    void pollFutureTaskFailureUnwrapsExecutionExceptionCause() {
+        TicketRegistry<String> registry = new TicketRegistry<>(60);
+        FutureTask<String> task = new FutureTask<>(() -> {
+            throw new IllegalStateException("future-task-boom");
+        });
+        String ticket = registry.register(task);
+        task.run();
+
         TicketRegistry.PollResult<String> result = registry.poll(ticket);
 
-        assertEquals(TicketRegistry.Status.NOT_FOUND, result.getStatus(),
-            "a ticket older than its TTL must be pruned even if the underlying work never finished");
+        assertEquals(TicketRegistry.Status.ERROR, result.getStatus());
+        assertEquals(IllegalStateException.class, result.getError().getClass());
+        assertEquals("future-task-boom", result.getError().getMessage());
     }
 
     @Test
@@ -193,5 +304,40 @@ class TicketRegistryTest {
 
         assertTrue(errors.isEmpty(), "no thread should throw: " + errors);
         assertEquals(0, mismatches.get(), "every ticket must resolve to exactly the value it was registered with");
+    }
+
+    private static final class CompletionDuringCancelFuture implements Future<String> {
+        private final String result;
+        private boolean done;
+
+        CompletionDuringCancelFuture(String result) {
+            this.result = result;
+        }
+
+        @Override
+        public boolean cancel(boolean mayInterruptIfRunning) {
+            done = true;
+            return false;
+        }
+
+        @Override
+        public boolean isCancelled() {
+            return false;
+        }
+
+        @Override
+        public boolean isDone() {
+            return done;
+        }
+
+        @Override
+        public String get() {
+            return result;
+        }
+
+        @Override
+        public String get(long timeout, TimeUnit unit) {
+            return result;
+        }
     }
 }

@@ -24,6 +24,9 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.function.LongSupplier;
 
 import com.zin.delamain.core.HeadlessJadxWrapper;
 import com.zin.delamain.index.CodeStore;
@@ -85,24 +88,31 @@ public class XrefsRoutes {
      */
     static final class Deadline {
         private final long deadlineNanos;
+        private final LongSupplier ticker;
         private volatile boolean truncated;
 
-        private Deadline(long deadlineNanos) {
+        private Deadline(long deadlineNanos, LongSupplier ticker) {
             this.deadlineNanos = deadlineNanos;
+            this.ticker = ticker;
         }
 
         static Deadline in(long millis) {
-            return new Deadline(System.nanoTime() + millis * 1_000_000L);
+            return in(millis, System::nanoTime);
+        }
+
+        static Deadline in(long millis, LongSupplier ticker) {
+            return new Deadline(ticker.getAsLong() + millis * 1_000_000L, ticker);
         }
 
         /** No budget — used by the async ticket path, which is not on a request thread. */
         static Deadline none() {
-            return new Deadline(Long.MAX_VALUE);
+            return new Deadline(Long.MAX_VALUE, System::nanoTime);
         }
 
-        /** True once the budget is spent; records that results from here on are missing. */
-        boolean expired() {
-            if (deadlineNanos != Long.MAX_VALUE && System.nanoTime() - deadlineNanos >= 0) {
+        /** True once the budget is spent or cooperative cancellation interrupts this thread. */
+        boolean shouldStop() {
+            if (Thread.currentThread().isInterrupted()
+                    || (deadlineNanos != Long.MAX_VALUE && ticker.getAsLong() - deadlineNanos >= 0)) {
                 truncated = true;
                 return true;
             }
@@ -112,6 +122,37 @@ public class XrefsRoutes {
         boolean truncated() {
             return truncated;
         }
+    }
+
+    @FunctionalInterface
+    interface CheckedVisitor<T, E extends Exception> {
+        boolean visit(T item) throws E;
+    }
+
+    static final class BoundedVisitResult {
+        final int visitedCount;
+        final boolean anyAccepted;
+        final boolean stoppedEarly;
+
+        BoundedVisitResult(int visitedCount, boolean anyAccepted, boolean stoppedEarly) {
+            this.visitedCount = visitedCount;
+            this.anyAccepted = anyAccepted;
+            this.stoppedEarly = stoppedEarly;
+        }
+    }
+
+    static <T, E extends Exception> BoundedVisitResult visitUntilStopped(
+            Iterable<T> items, Deadline deadline, CheckedVisitor<T, E> visitor) throws E {
+        int visitedCount = 0;
+        boolean anyAccepted = false;
+        for (T item : items) {
+            if (deadline.shouldStop()) {
+                return new BoundedVisitResult(visitedCount, anyAccepted, true);
+            }
+            visitedCount++;
+            anyAccepted |= visitor.visit(item);
+        }
+        return new BoundedVisitResult(visitedCount, anyAccepted, false);
     }
 
     /** Labels a response whose live path was cut short, so a caller can tell it from a complete one. */
@@ -130,15 +171,27 @@ public class XrefsRoutes {
     private static final TicketRegistry<Map<String, Object>> XREF_TICKETS = new TicketRegistry<>(600);
     private static final int XREF_CACHE_WAIT_TIMEOUT_SECONDS = 60;
     private static final int MAX_BATCH_SIZE = 10;
-    private final ExecutorService xrefExecutor = Executors.newFixedThreadPool(2, r -> {
-        Thread t = new Thread(r, "jadx-xref-async");
-        t.setDaemon(true);
-        return t;
-    });
+    private final ExecutorService xrefExecutor;
 
     public XrefsRoutes(HeadlessJadxWrapper wrapper, PaginationUtils paginationUtils) {
+        this(wrapper, paginationUtils, newXrefExecutor());
+    }
+
+    XrefsRoutes(
+            HeadlessJadxWrapper wrapper,
+            PaginationUtils paginationUtils,
+            ExecutorService xrefExecutor) {
         this.wrapper = wrapper;
         this.paginationUtils = paginationUtils;
+        this.xrefExecutor = xrefExecutor;
+    }
+
+    private static ExecutorService newXrefExecutor() {
+        return Executors.newFixedThreadPool(2, r -> {
+            Thread t = new Thread(r, "jadx-xref-async");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     public void register(Javalin app, AuthConfig authConfig) {
@@ -151,6 +204,7 @@ public class XrefsRoutes {
         app.get("/diag/usage-harvest", this::handleUsageHarvestProbe);
         app.post("/submit-xref",    this::handleSubmitXref);
         app.get("/xref-status",     this::handleXrefStatus);
+        app.post("/cancel-xref",    this::handleCancelXref);
     }
 
     /**
@@ -950,7 +1004,7 @@ public class XrefsRoutes {
             return;
         }
 
-        TicketRegistry.PollResult<Map<String, Object>> poll = XREF_TICKETS.poll(ticket);
+        TicketRegistry.PollResult<Map<String, Object>> poll = pollAsyncTask(ticket);
         switch (poll.getStatus()) {
             case DONE:
                 try {
@@ -980,6 +1034,22 @@ public class XrefsRoutes {
         }
     }
 
+    /** Cancels a queued/running async xref. Completed, expired, or unknown tickets are absent. */
+    public void handleCancelXref(Context ctx) {
+        String ticket = ctx.queryParam("ticket");
+        if (ticket == null || ticket.isEmpty()) {
+            ctx.status(400).json(Map.of("error", "Missing 'ticket' parameter"));
+            return;
+        }
+        if (cancelAsyncTask(ticket)) {
+            ctx.json(Map.of("status", "cancelled"));
+        } else {
+            ctx.status(404).json(Map.of(
+                "status", "not_found",
+                "message", "Ticket not found, completed, or expired"));
+        }
+    }
+
     private Map<String, Object> buildXrefStatusResponse(Context ctx, Map<String, Object> payload) throws PaginationException {
         if ("batch".equals(payload.get("kind"))) {
             // Batch results are already complete and bounded (max MAX_BATCH_SIZE targets) — no
@@ -1002,8 +1072,12 @@ public class XrefsRoutes {
 
     /** Submits work to the xref background pool and registers/returns a ticket (status=submitted). */
     private void submitAsync(Context ctx, java.util.concurrent.Callable<Map<String, Object>> work) {
-        CompletableFuture<Map<String, Object>> future = new CompletableFuture<>();
-        xrefExecutor.submit(() -> {
+        String ticket = submitAsyncTask(work);
+        ctx.json(Map.of("ticket", ticket, "status", "submitted", "retry_after_seconds", 3));
+    }
+
+    String submitAsyncTask(java.util.concurrent.Callable<Map<String, Object>> work) {
+        FutureTask<Map<String, Object>> task = new FutureTask<>(() -> {
             // The HTTP request's own analysisLock read lock is released by the load-state
             // middleware as soon as this method returns a ticket, but the task body below keeps
             // touching jadx after that — without its own permit a reload's write lock has nothing
@@ -1011,20 +1085,31 @@ public class XrefsRoutes {
             // must happen on this same executor thread: ReentrantReadWriteLock's read lock cannot
             // be released by a different thread than the one that acquired it.
             if (!wrapper.tryAcquireAnalysisAccess()) {
-                future.completeExceptionally(new IllegalStateException(
-                        "APK is reloading or not ready; xref computation was not started"));
-                return;
+                throw new IllegalStateException(
+                    "APK is reloading or not ready; xref computation was not started");
             }
             try {
-                future.complete(work.call());
-            } catch (Exception e) {
-                future.completeExceptionally(e);
+                return work.call();
             } finally {
                 wrapper.releaseAnalysisAccess();
             }
         });
-        String ticket = XREF_TICKETS.register(future);
-        ctx.json(Map.of("ticket", ticket, "status", "submitted", "retry_after_seconds", 3));
+        String ticket = XREF_TICKETS.register(task);
+        try {
+            xrefExecutor.execute(task);
+        } catch (RejectedExecutionException e) {
+            XREF_TICKETS.cancel(ticket);
+            throw e;
+        }
+        return ticket;
+    }
+
+    boolean cancelAsyncTask(String ticket) {
+        return XREF_TICKETS.cancel(ticket);
+    }
+
+    TicketRegistry.PollResult<Map<String, Object>> pollAsyncTask(String ticket) {
+        return XREF_TICKETS.poll(ticket);
     }
 
     private void waitForClassCacheReady() throws InterruptedException {
@@ -1315,40 +1400,46 @@ public class XrefsRoutes {
             Deadline deadline) {
         LinkedHashMap<String, JavaClass> topUseClasses = new LinkedHashMap<>();
         for (JavaClass classNode : classNodes) {
-            if (deadline.expired()) break;
+            if (deadline.shouldStop()) break;
             JavaClass javaClass = ensureClassDecompiled(classNode);
             if (javaClass != null) {
                 topUseClasses.put(javaClass.getFullName(), javaClass);
             }
         }
-        for (JavaMethod methodNode : methodNodes) {
-            if (deadline.expired()) break;
+        BoundedVisitResult methodWarmup = visitUntilStopped(methodNodes, deadline, methodNode -> {
             JavaClass parentClass = methodNode.getDeclaringClass();
-            if (parentClass == null) continue;
+            if (parentClass == null) return false;
             JavaClass javaClass = ensureClassDecompiled(parentClass);
             if (javaClass != null) {
                 topUseClasses.put(javaClass.getFullName(), javaClass);
             }
+            return javaClass != null;
+        });
+        if (methodWarmup.stoppedEarly) {
+            return Collections.emptyList();
         }
 
         List<Map<String, Object>> referenceList = new ArrayList<>();
         Set<String> seenReferences = new HashSet<>();
 
         for (JavaClass topUseClass : topUseClasses.values()) {
-            if (deadline.expired()) break;
-            boolean preciseAdded = collectUsePlacesForClass(targetNode, topUseClass, referenceList, seenReferences);
-            if (preciseAdded) continue;
+            if (deadline.shouldStop()) break;
+            BoundedVisitResult preciseVisit = collectUsePlacesForClass(
+                targetNode, topUseClass, referenceList, seenReferences, deadline);
+            if (preciseVisit.stoppedEarly) break;
+            if (preciseVisit.anyAccepted) continue;
 
-            boolean hasMethodReferenceInClass = false;
-            for (JavaMethod methodNode : methodNodes) {
+            BoundedVisitResult methodVisit = visitUntilStopped(methodNodes, deadline, methodNode -> {
                 if (methodNode.getDeclaringClass() != null
                         && topUseClass.getFullName().equals(methodNode.getDeclaringClass().getFullName())) {
-                    hasMethodReferenceInClass = true;
                     addIfUnique(referenceList, seenReferences, extractMethodReferenceInfo(methodNode));
+                    return true;
                 }
-            }
+                return false;
+            });
+            if (methodVisit.stoppedEarly) break;
 
-            if (!hasMethodReferenceInClass) {
+            if (!methodVisit.anyAccepted) {
                 Map<String, Object> classRefInfo = new HashMap<>();
                 classRefInfo.put("class", topUseClass.getFullName());
                 classRefInfo.put("raw_class", JadxApiAdapter.getClassRawName(topUseClass));
@@ -1368,35 +1459,37 @@ public class XrefsRoutes {
         return (related != null && !related.isEmpty()) ? related : Collections.singletonList(javaMethod);
     }
 
-    private boolean collectUsePlacesForClass(
+    private BoundedVisitResult collectUsePlacesForClass(
             JavaNode targetNode,
             JavaClass topUseClass,
             List<Map<String, Object>> referenceList,
-            Set<String> seenReferences) {
+            Set<String> seenReferences,
+            Deadline deadline) {
         try {
             ICodeInfo codeInfo = topUseClass.getCodeInfo();
-            if (codeInfo == null || !codeInfo.hasMetadata()) return false;
+            if (codeInfo == null || !codeInfo.hasMetadata()) {
+                return new BoundedVisitResult(0, false, false);
+            }
 
             List<Integer> usePositions = topUseClass.getUsePlacesFor(codeInfo, targetNode);
-            if (usePositions.isEmpty()) return false;
+            if (usePositions.isEmpty()) {
+                return new BoundedVisitResult(0, false, false);
+            }
 
             String code = codeInfo.getCodeStr();
-            boolean added = false;
-
-            for (int pos : usePositions) {
+            return visitUntilStopped(usePositions, deadline, pos -> {
                 String line = CodeUtils.getLineForPos(code, pos).trim();
-                if (line.startsWith("import ")) continue;
+                if (line.startsWith("import ")) return false;
                 // headless: enclosingNode not available — pass null
                 JavaNode enclosingNode = null;
                 Map<String, Object> refInfo = buildPreciseReferenceInfo(topUseClass, enclosingNode, line, code, pos);
                 addIfUnique(referenceList, seenReferences, refInfo);
-                added = true;
-            }
-            return added;
+                return true;
+            });
         } catch (Exception e) {
             logger.debug("Precise xref collection failed for {} in {}: {}",
                 targetNode.getFullName(), topUseClass.getFullName(), e.getMessage());
-            return false;
+            return new BoundedVisitResult(0, false, false);
         }
     }
 
@@ -1528,7 +1621,7 @@ public class XrefsRoutes {
         for (Map<String, Object> ref : referenceList) {
             // Snippet rendering live-decompiles referrers too, so it is on the same budget as the
             // referrer walk — rows past the deadline simply come back without a snippet.
-            if (deadline.expired()) break;
+            if (deadline.shouldStop()) break;
             try {
                 String fromClassName = (String) ref.get("class");
                 if (fromClassName == null || fromClassName.isEmpty()) {

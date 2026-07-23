@@ -10,6 +10,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -295,7 +297,7 @@ public class HeadlessJadxWrapper {
         return reloadLockTimeoutMillis;
     }
 
-    /** Error text of the last reload that failed to start; null once a reload succeeds. */
+    /** Error text of the last failed reload; null once a reload succeeds. */
     public String getLastReloadError() {
         return lastReloadError;
     }
@@ -398,9 +400,6 @@ public class HeadlessJadxWrapper {
                 lastReloadError = null;
             }
             doReload(newInputFiles, outputDir, threads, postLoadAction);
-        } catch (RuntimeException | Error t) {
-            markLoadFailed(t);
-            throw t;
         } finally {
             synchronized (loadStateLock) {
                 reloadPending = false;
@@ -420,25 +419,77 @@ public class HeadlessJadxWrapper {
 
     private void doReload(List<File> newInputFiles, File outputDir, int threads,
                           Runnable postLoadAction) {
+        List<File> previousInputFiles = List.copyOf(this.inputFiles);
+        File previousOutputDir = this.outputDir;
+        int previousThreads = this.threads;
+        boolean previousInputWasLoaded = stateBeforeReload == LoadState.LOADED;
+        boolean previousDecompilerNeedsRebuild = false;
+
         logger.info("[JADX] Reloading: {} file(s), output={}, threads={}",
                 newInputFiles.size(), outputDir, threads);
-        // Stop background work that does not hold the analysis read lock (warmup) before the
-        // decompiler it is walking gets closed underneath it. Holding the write lock only quiesces
-        // request handlers; this covers the rest.
-        for (Runnable hook : preCloseQuiesceHooks) {
-            try {
-                hook.run();
-            } catch (Exception e) {
-                logger.warn("[JADX] Pre-close quiesce hook failed: {}", e.getMessage());
-            }
-        }
-        // Close the existing decompiler before creating a new one
         try {
-            jadx.close();
-        } catch (Exception e) {
-            logger.warn("[JADX] Error closing previous decompiler during reload: {}", e.getMessage());
-        }
+            // Reject missing/unreadable inputs before quiescing background work or touching the
+            // currently-loaded decompiler. This keeps the old APK continuously available.
+            validateInputFilesReadable(newInputFiles);
 
+            // Stop background work that does not hold the analysis read lock (warmup) before the
+            // decompiler it is walking gets closed underneath it. Holding the write lock only
+            // quiesces request handlers; this covers the rest.
+            for (Runnable hook : preCloseQuiesceHooks) {
+                try {
+                    hook.run();
+                } catch (Exception e) {
+                    logger.warn("[JADX] Pre-close quiesce hook failed: {}", e.getMessage());
+                }
+            }
+            previousDecompilerNeedsRebuild = true;
+            // Do not start loading the replacement if the old instance cannot be closed. Keeping
+            // that error in the rollback path avoids two fully-loaded large APKs coexisting.
+            jadx.close();
+            configureDecompiler(newInputFiles, outputDir, threads);
+            int totalClasses = loadCurrentDecompiler(postLoadAction);
+            markLoadSucceeded();
+            logger.info("[JADX] Reload complete: {} classes", totalClasses);
+        } catch (RuntimeException | Error reloadFailure) {
+            String reloadMessage = throwableMessage(reloadFailure);
+            if (!previousInputWasLoaded) {
+                markLoadFailed(reloadFailure);
+                synchronized (loadStateLock) {
+                    lastReloadError = reloadMessage;
+                }
+                throw reloadFailure;
+            }
+
+            if (!previousDecompilerNeedsRebuild) {
+                restoreLoadedStateAfterFailedReload(reloadMessage);
+                throw reloadFailure;
+            }
+
+            try {
+                // Closing the failed replacement is part of rollback. Unlike the best-effort close
+                // of a successfully quiesced old instance, a failure here must be reported as a
+                // rollback failure instead of being hidden behind a warning.
+                jadx.close();
+                configureDecompiler(previousInputFiles, previousOutputDir, previousThreads);
+                // Restoring the old JADX instance must not run the callback: that callback owns
+                // external caches and is only valid after a successful replacement.
+                int restoredClasses = loadCurrentDecompiler(null);
+                restoreLoadedStateAfterFailedReload(reloadMessage);
+                logger.warn("[JADX] Reload failed; restored previous input with {} classes: {}",
+                        restoredClasses, reloadMessage);
+            } catch (RuntimeException | Error rollbackFailure) {
+                reloadFailure.addSuppressed(rollbackFailure);
+                String combinedMessage = "Reload failed for new input: " + reloadMessage
+                        + "; rollback of previous input failed: "
+                        + throwableMessage(rollbackFailure);
+                markReloadAndRollbackFailed(combinedMessage);
+                throw reloadFailure;
+            }
+            throw reloadFailure;
+        }
+    }
+
+    private void configureDecompiler(List<File> newInputFiles, File outputDir, int threads) {
         this.inputFiles = Collections.unmodifiableList(new ArrayList<>(newInputFiles));
         this.outputDir = outputDir;
         this.threads = threads;
@@ -451,7 +502,6 @@ public class HeadlessJadxWrapper {
         applyDeobfConfig(args, outputDir);
 
         this.jadx = new JadxDecompiler(args);
-        loadReserved(postLoadAction);
     }
 
     private void loadReserved() {
@@ -462,19 +512,9 @@ public class HeadlessJadxWrapper {
         analysisLock.writeLock().lock();
         try {
             logger.info("[JADX] Loading {} file(s)...", inputFiles.size());
-            long start = System.currentTimeMillis();
-            jadx.load();
-            classesWithInnersCache = null; // rebuild lazily against the freshly loaded class set
-            if (postLoadAction != null) {
-                postLoadAction.run();
-            }
-            long elapsed = System.currentTimeMillis() - start;
-            synchronized (loadStateLock) {
-                loadState = LoadState.LOADED;
-                loadError = null;
-            }
-            logger.info("[JADX] Load complete: {} classes in {}ms",
-                    jadx.getClasses().size(), elapsed);
+            int totalClasses = loadCurrentDecompiler(postLoadAction);
+            markLoadSucceeded();
+            logger.info("[JADX] Load complete: {} classes", totalClasses);
         } catch (RuntimeException | Error t) {
             markLoadFailed(t);
             throw t;
@@ -486,13 +526,85 @@ public class HeadlessJadxWrapper {
         }
     }
 
+    private int loadCurrentDecompiler(Runnable postLoadAction) {
+        validateInputFilesReadable(inputFiles);
+        long start = System.currentTimeMillis();
+        jadx.load();
+        classesWithInnersCache = null; // rebuild lazily against the freshly loaded class set
+        int totalClasses = jadx.getClasses().size();
+        if (totalClasses == 0) {
+            throw new IllegalStateException("JADX loaded zero classes from input file(s): "
+                    + describeInputFiles(inputFiles)
+                    + ". Verify that the file is a supported APK/JAR/DEX with code and that "
+                    + "the service account can read it.");
+        }
+        if (postLoadAction != null) {
+            postLoadAction.run();
+        }
+        logger.info("[JADX] Loaded {} classes in {}ms",
+                totalClasses, System.currentTimeMillis() - start);
+        return totalClasses;
+    }
+
+    private void validateInputFilesReadable(List<File> files) {
+        for (File inputFile : files) {
+            Path path = inputFile.toPath();
+            String displayPath = path.toAbsolutePath().toString();
+            if (!Files.exists(path)) {
+                throw new IllegalArgumentException("Cannot load input file " + displayPath
+                        + ": file does not exist");
+            }
+            if (!Files.isRegularFile(path)) {
+                throw new IllegalArgumentException("Cannot load input file " + displayPath
+                        + ": not a regular file");
+            }
+            if (!Files.isReadable(path)) {
+                throw new IllegalArgumentException("Cannot load input file " + displayPath
+                        + ": file is not readable by the current process");
+            }
+        }
+    }
+
+    private String describeInputFiles(List<File> files) {
+        return files.stream()
+                .map(file -> file.toPath().toAbsolutePath().toString())
+                .collect(java.util.stream.Collectors.joining(", "));
+    }
+
+    private void markLoadSucceeded() {
+        synchronized (loadStateLock) {
+            loadState = LoadState.LOADED;
+            loadError = null;
+        }
+    }
+
+    private void restoreLoadedStateAfterFailedReload(String reloadMessage) {
+        synchronized (loadStateLock) {
+            loadState = LoadState.LOADED;
+            loadError = reloadMessage;
+            lastReloadError = reloadMessage;
+        }
+    }
+
+    private void markReloadAndRollbackFailed(String combinedMessage) {
+        synchronized (loadStateLock) {
+            loadState = LoadState.FAILED;
+            loadError = combinedMessage;
+            lastReloadError = combinedMessage;
+        }
+    }
+
+    private String throwableMessage(Throwable t) {
+        String message = t.getMessage();
+        return (message == null || message.isBlank())
+                ? t.getClass().getSimpleName()
+                : message;
+    }
+
     private void markLoadFailed(Throwable t) {
         synchronized (loadStateLock) {
             loadState = LoadState.FAILED;
-            String message = t.getMessage();
-            loadError = (message == null || message.isBlank())
-                    ? t.getClass().getSimpleName()
-                    : message;
+            loadError = throwableMessage(t);
         }
     }
 

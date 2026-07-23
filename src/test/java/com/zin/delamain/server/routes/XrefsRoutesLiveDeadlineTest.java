@@ -16,6 +16,8 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.IntStream;
 
 import com.zin.delamain.core.HeadlessJadxWrapper;
 import com.zin.delamain.utils.ClassCacheManager;
@@ -40,6 +42,50 @@ class XrefsRoutesLiveDeadlineTest {
 
     private HeadlessJadxWrapper wrapper;
     private XrefsRoutes routes;
+
+    @Test
+    void syntheticVisitorStopsAtExactDeadlineBoundary() throws Exception {
+        AtomicLong ticker = new AtomicLong();
+        XrefsRoutes.Deadline deadline = XrefsRoutes.Deadline.in(3, ticker::get);
+        List<Integer> items = IntStream.range(0, 100).boxed().toList();
+
+        XrefsRoutes.BoundedVisitResult result = XrefsRoutes.visitUntilStopped(
+            items,
+            deadline,
+            item -> {
+                ticker.addAndGet(1_000_000L);
+                return item == 1;
+            });
+
+        assertEquals(3, result.visitedCount);
+        assertTrue(result.anyAccepted);
+        assertTrue(result.stoppedEarly);
+        assertTrue(deadline.truncated());
+    }
+
+    @Test
+    void deadlineNoneStillStopsAfterVisitorInterruptsThirdItem() throws Exception {
+        List<Integer> items = IntStream.range(0, 100).boxed().toList();
+        try {
+            XrefsRoutes.BoundedVisitResult result = XrefsRoutes.visitUntilStopped(
+                items,
+                XrefsRoutes.Deadline.none(),
+                item -> {
+                    if (item == 2) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return true;
+                });
+
+            assertEquals(3, result.visitedCount);
+            assertTrue(result.anyAccepted);
+            assertTrue(result.stoppedEarly);
+            assertTrue(Thread.currentThread().isInterrupted(),
+                "cooperative cancellation must preserve the interrupt for outer cleanup");
+        } finally {
+            Thread.interrupted();
+        }
+    }
 
     @BeforeEach
     void setUp(@TempDir Path workDir) throws Exception {

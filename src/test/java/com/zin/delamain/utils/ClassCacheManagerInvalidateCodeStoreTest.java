@@ -9,6 +9,7 @@ import com.zin.delamain.index.shard.ContentShardIndex;
 import jadx.api.JavaClass;
 
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -40,6 +41,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * shard id is tombstoned.</p>
  */
 class ClassCacheManagerInvalidateCodeStoreTest {
+
+    @BeforeEach
+    void setUp() {
+        // CodeContentIndex assigns process-wide IDs that must start at zero for the shard IDs
+        // built below; another test's IDs otherwise make this test's class-to-shard lookup stale.
+        ClassCacheManager.clearCacheIncludingDecompiled();
+        ContentShardIndex.clear();
+        CodeContentIndex.clear();
+    }
 
     @AfterEach
     void tearDown() {
