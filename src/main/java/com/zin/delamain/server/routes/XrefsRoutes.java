@@ -8,8 +8,6 @@ import jadx.api.JavaClass;
 import jadx.api.JavaField;
 import jadx.api.JavaMethod;
 import jadx.api.JavaNode;
-import jadx.api.utils.CodeUtils;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -1475,16 +1473,15 @@ public class XrefsRoutes {
         }
     }
 
-    private Map<String, Object> extractMethodReferenceInfo(JavaMethod method) {
+    private Map<String, Object> extractMethodReferenceInfo(
+            JavaMethod method, JavaClass sourceClass, SourceLineIndex definitionLineIndex) {
         if (method == null) return null;
         try {
             Map<String, Object> refInfo = new HashMap<>();
             JavaClass parent = method.getDeclaringClass();
-            JavaClass parentJavaClass = null;
             if (parent != null) {
                 refInfo.put("class", parent.getFullName());
                 refInfo.put("raw_class", JadxApiAdapter.getClassRawName(parent));
-                parentJavaClass = ensureClassDecompiled(parent);
             }
             String name = method.isClassInit() ? "" : method.getName();
             if ("<clinit>".equals(name)) name = "";
@@ -1493,7 +1490,8 @@ public class XrefsRoutes {
             JadxApiAdapter.MethodInfoSnapshot methodInfo = JadxApiAdapter.getMethodInfo(method);
             refInfo.put("from_method", methodInfo != null ? methodInfo.getFullId() : method.getFullName());
             refInfo.put("raw_from_method", JadxApiAdapter.getMethodRawFullId(method));
-            refInfo.put("source_line", resolveDefinitionSourceLine(parentJavaClass, method.getDefPos()));
+            refInfo.put("source_line", resolveDefinitionSourceLine(
+                sourceClass, definitionLineIndex, method.getDefPos()));
             return refInfo;
         } catch (Exception e) {
             logger.warn("Failed to extract reference info: {}", e.getMessage());
@@ -1518,12 +1516,22 @@ public class XrefsRoutes {
             List<JavaClass> classNodes,
             List<JavaMethod> methodNodes,
             Deadline deadline) {
+        return collectPreciseReferences(targetNode, classNodes, methodNodes, deadline, null);
+    }
+
+    List<Map<String, Object>> collectPreciseReferences(
+            JavaNode targetNode,
+            List<JavaClass> classNodes,
+            List<JavaMethod> methodNodes,
+            Deadline deadline,
+            Runnable onDefinitionLineIndexBuild) {
         LinkedHashMap<String, JavaClass> topUseClasses = new LinkedHashMap<>();
+        LinkedHashMap<String, List<JavaMethod>> methodsByDeclaringClass = new LinkedHashMap<>();
         for (JavaClass classNode : classNodes) {
             if (deadline.shouldStop()) break;
             JavaClass javaClass = ensureClassDecompiled(classNode);
             if (javaClass != null) {
-                topUseClasses.put(javaClass.getFullName(), javaClass);
+                topUseClasses.put(classIdentity(javaClass), javaClass);
             }
         }
         BoundedVisitResult methodWarmup = visitUntilStopped(methodNodes, deadline, methodNode -> {
@@ -1531,7 +1539,9 @@ public class XrefsRoutes {
             if (parentClass == null) return false;
             JavaClass javaClass = ensureClassDecompiled(parentClass);
             if (javaClass != null) {
-                topUseClasses.put(javaClass.getFullName(), javaClass);
+                String classIdentity = classIdentity(javaClass);
+                topUseClasses.put(classIdentity, javaClass);
+                methodsByDeclaringClass.computeIfAbsent(classIdentity, ignored -> new ArrayList<>()).add(methodNode);
             }
             return javaClass != null;
         });
@@ -1549,13 +1559,15 @@ public class XrefsRoutes {
             if (preciseVisit.stoppedEarly) break;
             if (preciseVisit.anyAccepted) continue;
 
-            BoundedVisitResult methodVisit = visitUntilStopped(methodNodes, deadline, methodNode -> {
-                if (methodNode.getDeclaringClass() != null
-                        && topUseClass.getFullName().equals(methodNode.getDeclaringClass().getFullName())) {
-                    addIfUnique(referenceList, seenReferences, extractMethodReferenceInfo(methodNode));
-                    return true;
-                }
-                return false;
+            SourceLineIndex definitionLineIndex = buildDefinitionSourceLineIndexIfRunning(
+                topUseClass, deadline, onDefinitionLineIndexBuild);
+            if (deadline.shouldStop()) break;
+            List<JavaMethod> methodsForClass = methodsByDeclaringClass.getOrDefault(
+                classIdentity(topUseClass), Collections.emptyList());
+            BoundedVisitResult methodVisit = visitUntilStopped(methodsForClass, deadline, methodNode -> {
+                addIfUnique(referenceList, seenReferences,
+                    extractMethodReferenceInfo(methodNode, topUseClass, definitionLineIndex));
+                return true;
             });
             if (methodVisit.stoppedEarly) break;
 
@@ -1567,11 +1579,16 @@ public class XrefsRoutes {
                 classRefInfo.put("raw_method", "");
                 classRefInfo.put("from_method", "");
                 classRefInfo.put("raw_from_method", "");
-                classRefInfo.put("source_line", resolveDefinitionSourceLine(topUseClass, topUseClass.getDefPos()));
+                classRefInfo.put("source_line", resolveDefinitionSourceLine(
+                    topUseClass, definitionLineIndex, topUseClass.getDefPos()));
                 addIfUnique(referenceList, seenReferences, classRefInfo);
             }
         }
         return referenceList;
+    }
+
+    private static String classIdentity(JavaClass javaClass) {
+        return javaClass.getFullName() + "\u0000" + JadxApiAdapter.getClassRawName(javaClass);
     }
 
     private List<JavaMethod> getMethodWithOverrides(JavaMethod javaMethod) {
@@ -1652,16 +1669,36 @@ public class XrefsRoutes {
         return refInfo;
     }
 
-    private Integer resolveDefinitionSourceLine(JavaClass javaClass, int definitionPosition) {
-        if (javaClass == null || definitionPosition <= 0) return null;
+    private SourceLineIndex buildDefinitionSourceLineIndexIfRunning(
+            JavaClass javaClass, Deadline deadline, Runnable onBuild) {
+        if (javaClass == null || deadline.shouldStop()) return null;
         try {
             ICodeInfo codeInfo = javaClass.getCodeInfo();
             if (codeInfo == null) return null;
-            int decompiledLine = CodeUtils.getLineNumForPos(
-                codeInfo.getCodeStr(),
-                definitionPosition,
-                wrapper.getArgs().getCodeNewLineStr()
-            );
+            return buildDefinitionLineIndexIfRunning(
+                codeInfo.getCodeStr(), wrapper.getArgs().getCodeNewLineStr(), deadline, onBuild);
+        } catch (Exception e) {
+            logger.debug("Failed to build definition line index for {}: {}", javaClass.getFullName(), e.getMessage());
+            return null;
+        }
+    }
+
+    static SourceLineIndex buildDefinitionLineIndexIfRunning(
+            String code, String newline, Deadline deadline, Runnable onBuild) {
+        return buildSourceLineIndexIfRunning(code, newline, deadline, onBuild);
+    }
+
+    static Integer resolveDefinitionDecompiledLine(SourceLineIndex lineIndex, int definitionPosition) {
+        if (lineIndex == null || definitionPosition <= 0) return null;
+        return lineIndex.lineNumberFor(definitionPosition);
+    }
+
+    private Integer resolveDefinitionSourceLine(
+            JavaClass javaClass, SourceLineIndex lineIndex, int definitionPosition) {
+        if (javaClass == null) return null;
+        try {
+            Integer decompiledLine = resolveDefinitionDecompiledLine(lineIndex, definitionPosition);
+            if (decompiledLine == null) return null;
             return javaClass.getSourceLine(decompiledLine);
         } catch (Exception e) {
             logger.debug("Failed to resolve definition source line for {}: {}", javaClass.getFullName(), e.getMessage());

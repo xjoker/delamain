@@ -1,11 +1,22 @@
 package com.zin.delamain.server.routes;
 
+import com.zin.delamain.core.HeadlessJadxWrapper;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import com.zin.delamain.utils.PaginationUtils;
 import io.javalin.http.Context;
 
+import jadx.api.ICodeInfo;
+import jadx.api.JavaClass;
+import jadx.api.JavaMethod;
+import jadx.api.JavaNode;
+
+import java.io.File;
 import java.lang.reflect.Proxy;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -13,7 +24,9 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class XrefsRoutesLineOffsetIndexTest {
 
@@ -106,15 +119,113 @@ class XrefsRoutesLineOffsetIndexTest {
     }
 
     @Test
-    void stoppedDeadlineSkipsSourceIndexBuild() {
+    void stoppedDeadlineSkipsDefinitionIndexBuild() {
         AtomicInteger builds = new AtomicInteger();
         XrefsRoutes.Deadline deadline = XrefsRoutes.Deadline.in(0, () -> 0L);
 
-        XrefsRoutes.SourceLineIndex index = XrefsRoutes.buildSourceLineIndexIfRunning(
+        XrefsRoutes.SourceLineIndex index = XrefsRoutes.buildDefinitionLineIndexIfRunning(
             "large source\n", "\n", deadline, builds::incrementAndGet);
 
         assertNull(index);
         assertEquals(0, builds.get());
+    }
+
+    @Test
+    void definitionLineHelperHandlesLastCharacterAndEofWithoutScanningForever() {
+        XrefsRoutes.SourceLineIndex index = XrefsRoutes.SourceLineIndex.build("first\nlast", "\n");
+
+        assertEquals(2, XrefsRoutes.resolveDefinitionDecompiledLine(index, "first\nlast".length() - 1));
+        assertEquals(2, XrefsRoutes.resolveDefinitionDecompiledLine(index, "first\nlast".length()));
+    }
+
+    @Test
+    void definitionLineHelperRejectsLfAndOutOfRangePositions() {
+        XrefsRoutes.SourceLineIndex index = XrefsRoutes.SourceLineIndex.build("first\nlast", "\n");
+
+        assertNull(XrefsRoutes.resolveDefinitionDecompiledLine(index, 5));
+        assertNull(XrefsRoutes.resolveDefinitionDecompiledLine(index, -1));
+        assertNull(XrefsRoutes.resolveDefinitionDecompiledLine(index, 0));
+        assertNull(XrefsRoutes.resolveDefinitionDecompiledLine(index, 11));
+    }
+
+    @Test
+    void definitionIndexBuildIsReusedForMultipleDefinitionPositions() {
+        AtomicInteger builds = new AtomicInteger();
+        XrefsRoutes.SourceLineIndex index = XrefsRoutes.buildDefinitionLineIndexIfRunning(
+            "first\nlast", "\n", XrefsRoutes.Deadline.none(), builds::incrementAndGet);
+
+        assertEquals(1, XrefsRoutes.resolveDefinitionDecompiledLine(index, 1));
+        assertEquals(2, XrefsRoutes.resolveDefinitionDecompiledLine(index, 6));
+        assertEquals(1, builds.get(), "one fallback class must reuse one definition index");
+    }
+
+    @Test
+    void methodFallbackGroupsRealMethodsAndBuildsOneDefinitionIndexPerClass(@TempDir Path workDir) throws Exception {
+        File apk = new File("test-harness/real/UnCrackable-Level1.apk");
+        assertTrue(apk.exists(), "test APK must exist: " + apk.getAbsolutePath());
+        HeadlessJadxWrapper wrapper = new HeadlessJadxWrapper(List.of(apk), new File(workDir.toFile(), "out"), 2);
+        try {
+            wrapper.load();
+            FallbackFixture fixture = findFallbackFixture(wrapper);
+            assertNotNull(fixture, "fixture must provide two method definitions with no precise use-place");
+
+            XrefsRoutes routes = new XrefsRoutes(wrapper, null);
+            AtomicInteger builds = new AtomicInteger();
+            List<Map<String, Object>> references = routes.collectPreciseReferences(
+                fixture.target, Collections.emptyList(), fixture.methods, XrefsRoutes.Deadline.none(),
+                builds::incrementAndGet);
+
+            assertEquals(2, references.size(), "fallback must retain both method definitions");
+            for (int index = 0; index < fixture.methods.size(); index++) {
+                JavaMethod method = fixture.methods.get(index);
+                Map<String, Object> reference = references.get(index);
+                assertEquals(method.getDeclaringClass().getFullName(), reference.get("class"));
+                assertEquals(method.getDeclaringClass().getRawName(), reference.get("raw_class"));
+                assertEquals(method.getName(), reference.get("method"), "method order must follow input order");
+                assertEquals(fixture.sourceLines.get(index), reference.get("source_line"));
+            }
+            assertEquals(1, builds.get(), "two methods in one declaring class must share one definition index");
+        } finally {
+            wrapper.close();
+        }
+    }
+
+    private static FallbackFixture findFallbackFixture(HeadlessJadxWrapper wrapper) throws Exception {
+        List<JavaClass> classes = wrapper.getClassesWithInners();
+        for (JavaClass candidate : classes) {
+            ICodeInfo codeInfo = candidate.getCodeInfo();
+            if (codeInfo == null) continue;
+            XrefsRoutes.SourceLineIndex index = XrefsRoutes.SourceLineIndex.build(codeInfo.getCodeStr(), "\n");
+            List<JavaMethod> methods = new ArrayList<>();
+            List<Integer> sourceLines = new ArrayList<>();
+            for (JavaMethod method : candidate.getMethods()) {
+                Integer line = XrefsRoutes.resolveDefinitionDecompiledLine(index, method.getDefPos());
+                if (line == null) continue;
+                methods.add(method);
+                sourceLines.add(candidate.getSourceLine(line));
+                if (methods.size() == 2) break;
+            }
+            if (methods.size() != 2) continue;
+            for (JavaClass targetClass : classes) {
+                for (JavaMethod target : targetClass.getMethods()) {
+                    if (!candidate.getUsePlacesFor(codeInfo, target).isEmpty()) continue;
+                    return new FallbackFixture(target, methods, sourceLines);
+                }
+            }
+        }
+        return null;
+    }
+
+    private static final class FallbackFixture {
+        final JavaNode target;
+        final List<JavaMethod> methods;
+        final List<Integer> sourceLines;
+
+        FallbackFixture(JavaNode target, List<JavaMethod> methods, List<Integer> sourceLines) {
+            this.target = target;
+            this.methods = methods;
+            this.sourceLines = sourceLines;
+        }
     }
 
     private static void assertEquivalent(String source, String newLine) {
