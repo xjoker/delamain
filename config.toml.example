@@ -38,7 +38,12 @@ allowed_tokens = [
 [defaults]
 # Default token used to authenticate this gateway to the JADX plugin/backend
 # itself (distinct from the MCP client tokens above). Equivalent env var
-# (higher priority): DELAMAIN_AUTH_TOKEN. See gateway/main.py.
+# (lower priority, used only as a fallback): DELAMAIN_AUTH_TOKEN. See
+# gateway/main.py:resolve_jadx_token(). In the fused container, this internal
+# token is generated and passed to both processes via --auth-token by
+# docker/entrypoint.sh — do NOT set DELAMAIN_AUTH_TOKEN there yourself, it
+# would only apply if --auth-token were empty and could desync the gateway
+# from the Java backend.
 # jadx_token = ""
 
 [jadx]

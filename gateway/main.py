@@ -40,6 +40,20 @@ def _resolve_allowed_tokens(env_value: str | None, config_tokens: list[str]) -> 
     return tokens
 
 
+def resolve_jadx_token(cli_token: str | None, config_token: str | None, env_value: str | None) -> str:
+    """Internal JADX-plugin handshake token: CLI --auth-token > config.toml
+    [defaults] jadx_token > env DELAMAIN_AUTH_TOKEN, matching the Java side's
+    priority (Main.java: CLI wins, env is only a fallback when CLI is empty).
+
+    Kept in this order deliberately: docker/entrypoint.sh passes the same
+    generated JADX_INTERNAL_TOKEN via --auth-token to both processes and does
+    not set DELAMAIN_AUTH_TOKEN. If the two sides disagreed on priority, an
+    operator setting DELAMAIN_AUTH_TOKEN directly (as older docs suggested)
+    would desync the gateway from Java and cause every backend call to 401.
+    """
+    return cli_token or config_token or env_value or ""
+
+
 def main():
     parser = argparse.ArgumentParser("delamain-gateway")
     parser.add_argument("--host", default="0.0.0.0")
@@ -65,12 +79,12 @@ def main():
         config = _loader.load()
         set_config_loader(_loader)
 
-    # 2. Resolve JADX plugin token (env > config > CLI)
-    jadx_token = (
-        os.environ.get("DELAMAIN_AUTH_TOKEN")
-        or config.defaults.jadx_token
-        or args.auth_token
-        or ""
+    # 2. Resolve JADX plugin token (CLI > config > env; see resolve_jadx_token
+    #    docstring for why this must match the Java side's priority).
+    jadx_token = resolve_jadx_token(
+        cli_token=args.auth_token,
+        config_token=config.defaults.jadx_token,
+        env_value=os.environ.get("DELAMAIN_AUTH_TOKEN"),
     )
     InstanceRegistry.set_auth_token(jadx_token)
 
