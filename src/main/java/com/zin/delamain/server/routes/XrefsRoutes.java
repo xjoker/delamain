@@ -371,6 +371,13 @@ public class XrefsRoutes {
      *       expensive part we'd harvest once and persist.
      * Returns aggregate timings + edge counts + heap delta so we can size a persistent index.
      */
+    // Hard ceiling for the usage-harvest probe. It runs under the analysis read lock and (when
+    // precise) live-decompiles each referrer without the search lock or a deadline, so an
+    // unbounded scan over ~138k classes reproduces the 2026-07-22 outage model (one request pins
+    // the read lock for minutes, stalling /load-file). The projection field still extrapolates to
+    // the full corpus, so a capped sample keeps the diagnostic useful.
+    private static final int USAGE_HARVEST_MAX_PROBE = 20000;
+
     public void handleUsageHarvestProbe(Context ctx) {
         int limit = parseIntParam(ctx.queryParam("limit"), 2000);
         boolean precise = "true".equalsIgnoreCase(ctx.queryParam("precise"));
@@ -379,8 +386,16 @@ public class XrefsRoutes {
         long memBefore = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
 
         List<JavaClass> all = wrapper.getClassesWithInners();
-        int n = (limit <= 0) ? all.size() : Math.min(limit, all.size());
+        int requested = (limit <= 0) ? all.size() : limit;
+        int n = Math.min(Math.min(requested, USAGE_HARVEST_MAX_PROBE), all.size());
+        boolean probeCapped = requested > n;
 
+        // Time budget on top of the count cap: this probe holds the analysis read lock and (when
+        // precise) live-decompiles referrers, exactly the shape that took the service down on
+        // 2026-07-22. Reuse the xref live deadline so it can never pin the read lock longer than
+        // that path can. Check the inner precise loop too — a single high-fan-in class can spend
+        // the whole budget there (the 20260722.7 inner-loop lesson).
+        Deadline deadline = Deadline.in(LIVE_DEADLINE_MILLIS);
         long t0 = System.nanoTime();
         long totalEdges = 0;
         long useInNsTotal = 0, useInNsMax = 0;
@@ -388,8 +403,11 @@ public class XrefsRoutes {
         int over1ms = 0, over10ms = 0, over100ms = 0;
         long preciseNsTotal = 0, precisePlaces = 0;
         int errors = 0;
+        int probed = 0;
 
         for (int i = 0; i < n; i++) {
+            if (deadline.shouldStop()) break;
+            probed++;
             JavaClass cls = all.get(i);
             long c0 = System.nanoTime();
             List<JavaNode> uses;
@@ -410,6 +428,7 @@ public class XrefsRoutes {
             if (precise && uses != null) {
                 long p0 = System.nanoTime();
                 for (JavaNode u : uses) {
+                    if (deadline.shouldStop()) break;
                     if (u instanceof JavaClass) {
                         try {
                             ICodeInfo ci = ((JavaClass) u).getCodeInfo();
@@ -426,13 +445,17 @@ public class XrefsRoutes {
         long memAfter = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
 
         Map<String, Object> r = new HashMap<>();
-        r.put("classes_probed", n);
+        r.put("classes_probed", probed);
+        r.put("probe_capped", probeCapped);
+        r.put("probe_cap", USAGE_HARVEST_MAX_PROBE);
+        r.put("deadline_truncated", deadline.truncated());
+        r.put("partial_results", probeCapped || deadline.truncated());
         r.put("total_classes", all.size());
         r.put("errors", errors);
         r.put("total_edges", totalEdges);
-        r.put("avg_edges_per_class", n > 0 ? (totalEdges / (double) n) : 0);
+        r.put("avg_edges_per_class", probed > 0 ? (totalEdges / (double) probed) : 0);
         r.put("getUseIn_total_ms", useInNsTotal / 1_000_000L);
-        r.put("getUseIn_avg_us", n > 0 ? (useInNsTotal / 1000L / n) : 0);
+        r.put("getUseIn_avg_us", probed > 0 ? (useInNsTotal / 1000L / probed) : 0);
         r.put("getUseIn_max_ms", useInNsMax / 1_000_000L);
         r.put("getUseIn_slowest_class", slowest);
         r.put("getUseIn_calls_over_1ms", over1ms);
@@ -445,8 +468,8 @@ public class XrefsRoutes {
         r.put("heap_before_mb", memBefore);
         r.put("heap_after_mb", memAfter);
         r.put("heap_delta_mb", memAfter - memBefore);
-        r.put("projected_full_graph_edges", all.size() > 0
-            ? (long) (totalEdges / (double) n * all.size()) : 0);
+        r.put("projected_full_graph_edges", probed > 0
+            ? (long) (totalEdges / (double) probed * all.size()) : 0);
         ctx.json(r);
     }
 

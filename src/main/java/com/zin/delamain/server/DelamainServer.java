@@ -447,7 +447,7 @@ public class DelamainServer {
     private void quiesceWarmupBeforeClose() {
         com.zin.delamain.index.WarmupManager.cancel();
         long deadline = System.currentTimeMillis() + WARMUP_QUIESCE_TIMEOUT_MILLIS;
-        while (Boolean.TRUE.equals(com.zin.delamain.index.WarmupManager.getStatus().get("running"))) {
+        while (warmupStillActive()) {
             if (System.currentTimeMillis() > deadline) {
                 logger.warn("Warmup did not quiesce within {}ms before reload close; proceeding anyway",
                         WARMUP_QUIESCE_TIMEOUT_MILLIS);
@@ -460,6 +460,22 @@ public class DelamainServer {
                 return;
             }
         }
+    }
+
+    /**
+     * True while any warmup work still touches the live JADX engine. The main warmup thread
+     * ({@code "running"}) is only part of it: {@code startBackgroundShardBuild} /
+     * {@code startBackgroundTrigramBuild} / {@code startBackgroundUsePlacesHarvest} are separate
+     * daemon threads that keep calling {@code getCode()}/{@code getRawName()} after {@code running}
+     * has flipped to false. Waiting only on {@code running} let {@code jadx.close()} race them
+     * (use-after-close), and a subsequent {@code triggerAutoWarmup} could even reset the cancel
+     * flag before they observed it — so quiesce must drain all four.
+     */
+    private boolean warmupStillActive() {
+        return Boolean.TRUE.equals(com.zin.delamain.index.WarmupManager.getStatus().get("running"))
+                || com.zin.delamain.index.WarmupManager.isShardBuildRunning()
+                || com.zin.delamain.index.WarmupManager.isTrigramBuildRunning()
+                || com.zin.delamain.index.WarmupManager.isUsePlacesHarvestRunning();
     }
 
     // -------------------------------------------------------------------------
