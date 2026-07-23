@@ -700,6 +700,17 @@ public class ClassCacheManager {
         return ownerKey.toString();
     }
 
+    /**
+     * Test-only: reset all cache + project-owner state to the clean baseline so a shared-JVM test
+     * starts from a known slate. {@link #cacheOwnerKey} is process-global static and otherwise leaks
+     * between tests — a later test's warmup-triggered {@link #initCache} then sees a foreign owner and
+     * fires a "project owner changed" clear that wipes freshly pre-assigned CodeContentIndex ids
+     * mid-test (an order-dependent flake, not a production path).
+     */
+    public static void resetForTests() {
+        clearCacheState("test reset", true);
+    }
+
     private static void clearCacheState(String reason, boolean evictCodeCache) {
         lastClearTime.set(System.currentTimeMillis());
         if (evictCodeCache) {

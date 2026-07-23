@@ -2,6 +2,7 @@ package com.zin.delamain.index;
 
 import com.zin.delamain.core.HeadlessJadxWrapper;
 import com.zin.delamain.index.shard.ContentShardIndex;
+import com.zin.delamain.utils.ClassCacheManager;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -34,6 +35,12 @@ class WarmupManagerNoPhase2Test {
 
     @BeforeEach
     void disableTrigramHeap() {
+        // ClassCacheManager.cacheOwnerKey is process-global static and leaks between tests in the
+        // shared JVM. If a prior test left a non-empty owner, this test's warmup-triggered initCache
+        // sees a foreign owner and fires a "project owner changed" clear that wipes the id machine
+        // AFTER preAssignIds — nulling resolveClass(0) mid-test. Reset to the clean baseline so the
+        // owner starts empty and no project-switch clear fires (makes the assertion order-independent).
+        ClassCacheManager.resetForTests();
         originalTrigramHeap = CodeContentIndex.TRIGRAM_HEAP;
         CodeContentIndex.TRIGRAM_HEAP = false;
         CodeContentIndex.clear();
@@ -43,6 +50,7 @@ class WarmupManagerNoPhase2Test {
     void tearDown() {
         ContentShardIndex.clear();
         CodeContentIndex.clear();
+        ClassCacheManager.resetForTests(); // don't leak this test's owner to the next test
         CodeContentIndex.TRIGRAM_HEAP = originalTrigramHeap;
         WarmupManager.setIndexDir(new File(System.getProperty("java.io.tmpdir"), "delamain-index").toPath());
     }
