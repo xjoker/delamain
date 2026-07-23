@@ -60,17 +60,131 @@ sed_inplace() {
     if sed --version >/dev/null 2>&1; then sed -i "$@"; else sed -i '' "$@"; fi
 }
 
+file_mode() {
+    if stat -f '%Lp' "$1" >/dev/null 2>&1; then
+        stat -f '%Lp' "$1"
+    else
+        stat -c '%a' "$1"
+    fi
+}
+
+replace_with_temp() {
+    local temp_file="$1"
+    local target_file="$2"
+    local target_mode
+    target_mode="$(file_mode "$target_file")"
+    mv "$temp_file" "$target_file"
+    chmod "$target_mode" "$target_file"
+}
+
+read_pom_project_version() {
+    awk '
+        /^[[:space:]]*<parent>[[:space:]]*$/ { in_parent = 1; next }
+        /^[[:space:]]*<\/parent>[[:space:]]*$/ { in_parent = 0; next }
+        /<dependencies>/ { exit }
+        !in_parent && /^[[:space:]]*<version>[^<]+<\/version>[[:space:]]*$/ {
+            value = $0
+            sub(/^.*<version>/, "", value)
+            sub(/<\/version>.*$/, "", value)
+            print value
+            exit
+        }
+    ' pom.xml
+}
+
+read_gateway_project_version() {
+    awk '
+        /^\[project\][[:space:]]*$/ { in_project = 1; next }
+        in_project && /^\[/ { exit }
+        in_project && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"/ {
+            value = $0
+            sub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/, "", value)
+            sub(/".*$/, "", value)
+            print value
+            exit
+        }
+    ' gateway/pyproject.toml
+}
+
+read_gateway_lock_version() {
+    awk '
+        /^\[\[package\]\]/ { in_gateway_package = 0 }
+        /^name = "delamain-gateway"$/ { in_gateway_package = 1; next }
+        in_gateway_package && /^version = "[^"]+"/ {
+            value = $0
+            sub(/^version = "/, "", value)
+            sub(/".*$/, "", value)
+            print value
+            exit
+        }
+    ' gateway/uv.lock
+}
+
+POM_VERSION="$(read_pom_project_version)"
+GATEWAY_VERSION="$(read_gateway_project_version)"
+GATEWAY_LOCK_VERSION="$(read_gateway_lock_version)"
+if [[ -z "$POM_VERSION" || -z "$GATEWAY_VERSION" || -z "$GATEWAY_LOCK_VERSION" ]]; then
+    echo "Error: could not read project versions from pom.xml, gateway/pyproject.toml, and gateway/uv.lock" >&2
+    exit 1
+fi
+
 # ---------- 1. Single source of truth ----------
 printf '%s\n' "$NEW" > VERSION
 
 # ---------- 2. Cosmetic copies ----------
 # These do not drive the runtime version (the runtime reads the VERSION file);
 # they're just packaging metadata / doc examples, kept in sync for consistency.
-sed_inplace "s#<version>${OLD}</version>#<version>${NEW}</version>#" pom.xml
-sed_inplace "s#^version = \"${OLD}\"#version = \"${NEW}\"#" gateway/pyproject.toml
+POM_TMP="$(mktemp "${TMPDIR:-/tmp}/delamain-pom.XXXXXX")"
+awk -v new="$NEW" '
+    /^[[:space:]]*<parent>[[:space:]]*$/ { in_parent = 1; print; next }
+    /^[[:space:]]*<\/parent>[[:space:]]*$/ { in_parent = 0; print; next }
+    /<dependencies>/ { in_dependencies = 1 }
+    !in_dependencies && !in_parent && !replaced && /^[[:space:]]*<version>[^<]+<\/version>[[:space:]]*$/ {
+        sub(/<version>[^<]+<\/version>/, "<version>" new "</version>")
+        replaced = 1
+    }
+    { print }
+    END { if (!replaced) exit 1 }
+' pom.xml > "$POM_TMP"
+replace_with_temp "$POM_TMP" pom.xml
+
+GATEWAY_TMP="$(mktemp "${TMPDIR:-/tmp}/delamain-gateway-pyproject.XXXXXX")"
+awk -v new="$NEW" '
+    /^\[project\][[:space:]]*$/ { in_project = 1 }
+    in_project && !replaced && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"/ {
+        sub(/"[^"]+"/, "\"" new "\"")
+        replaced = 1
+    }
+    in_project && /^\[/ && $0 !~ /^\[project\][[:space:]]*$/ { in_project = 0 }
+    { print }
+    END { if (!replaced) exit 1 }
+' gateway/pyproject.toml > "$GATEWAY_TMP"
+replace_with_temp "$GATEWAY_TMP" gateway/pyproject.toml
+
+GATEWAY_LOCK_TMP="$(mktemp "${TMPDIR:-/tmp}/delamain-gateway-uv-lock.XXXXXX")"
+awk -v new="$NEW" '
+    /^\[\[package\]\]/ { in_gateway_package = 0 }
+    /^name = "delamain-gateway"$/ { in_gateway_package = 1 }
+    in_gateway_package && !replaced && /^version = "[^"]+"/ {
+        sub(/"[^"]+"/, "\"" new "\"")
+        replaced = 1
+    }
+    { print }
+    END { if (!replaced) exit 1 }
+' gateway/uv.lock > "$GATEWAY_LOCK_TMP"
+replace_with_temp "$GATEWAY_LOCK_TMP" gateway/uv.lock
+
 for DOC in README.md docs/prebaked-index.md; do
     [[ -f "$DOC" ]] && sed_inplace "s#${OLD}#${NEW}#g" "$DOC"
 done
+
+if [[ "$(tr -d '[:space:]' < VERSION)" != "$NEW" || \
+      "$(read_pom_project_version)" != "$NEW" || \
+      "$(read_gateway_project_version)" != "$NEW" || \
+      "$(read_gateway_lock_version)" != "$NEW" ]]; then
+    echo "Error: VERSION, pom.xml, gateway/pyproject.toml, and gateway/uv.lock must all equal $NEW after bump" >&2
+    exit 1
+fi
 
 # ---------- 3. Straggler detection (repo-wide grep for the old version string) ----------
 echo "--- Checking for leftover '$OLD' (should be empty) ---"

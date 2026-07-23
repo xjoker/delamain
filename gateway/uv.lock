@@ -370,7 +370,7 @@ wheels = [
 
 [[package]]
 name = "delamain-gateway"
-version = "20260722.5"
+version = "20260723.2"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },

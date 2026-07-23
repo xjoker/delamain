@@ -26,6 +26,22 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
+      - name: Install jadx-all 1.5.6 into local Maven repository
+        run: |
+          set -euo pipefail
+          readonly JADX_VERSION=1.5.6
+          readonly JADX_ZIP_SHA256=545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974
+          curl -fsSL "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" -o /tmp/jadx.zip
+          echo "${JADX_ZIP_SHA256}  /tmp/jadx.zip" | sha256sum --check --status
+          unzip -q /tmp/jadx.zip -d /tmp/jadx
+          JADX_ALL="$(find /tmp/jadx/lib -type f -name 'jadx-*-all.jar' -print -quit)"
+          test -n "${JADX_ALL}"
+          mvn -q install:install-file \
+            -Dfile="${JADX_ALL}" \
+            -DgroupId=io.github.skylot \
+            -DartifactId=jadx-all \
+            -Dversion="${JADX_VERSION}" \
+            -Dpackaging=jar
       - run: mvn test
 
   gateway:
