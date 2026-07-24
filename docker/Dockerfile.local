@@ -4,7 +4,7 @@
 #   mvn -q --batch-mode -DskipTests package
 #   cp ~/.m2/repository/io/github/skylot/jadx-all/1.5.6/jadx-all-1.5.6.jar .docker-build/
 #   docker build -f docker/Dockerfile.local -t delamain:local .
-FROM eclipse-temurin:21-jre-alpine
+FROM azul/zulu-openjdk-alpine:25-jre
 
 # Install Python + pip, install gateway deps, clean up in one layer
 RUN apk add --no-cache python3 py3-pip && \
