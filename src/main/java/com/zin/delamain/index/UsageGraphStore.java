@@ -5,6 +5,9 @@ import org.slf4j.LoggerFactory;
 
 import java.io.*;
 import java.nio.file.*;
+import java.util.zip.CRC32;
+import java.util.zip.CheckedInputStream;
+import java.util.zip.CheckedOutputStream;
 
 /**
  * Persists the {@link UsageGraphIndex} class-level reverse graph to disk so a cold restart
@@ -16,21 +19,30 @@ import java.nio.file.*;
  * <h2>File format</h2>
  * <pre>
  *   MAGIC   (4 bytes) = 0x4A414447  "JADG"
- *   VERSION (4 bytes) = 1
+ *   VERSION (4 bytes) = 1 (legacy, no trailer) or 2 (current, CRC-guarded)
  *   N       (4 bytes) = number of classes (adjacency rows, id-ordered 0..N-1)
  *   foreach row:
  *     refCount (4 bytes)
  *     refIds   (refCount × 4 bytes, ascending source-class ids)
+ *   [v2 only] CRC32 (8 bytes) = CRC32 of every byte above (MAGIC..last row), stored as a long
  * </pre>
  * Row order IS the class-id order, so the array is stored densely without keys; ids resolve
  * against {@link UsageGraphIndex#assignIds} rebuilt from the same sorted class list.
+ *
+ * <p><b>Integrity.</b> v2 appends a whole-body CRC32 trailer, computed while the body is being
+ * written/read (via {@link CheckedOutputStream}/{@link CheckedInputStream}) so verification never
+ * costs a second pass over the file. v1 files (no trailer) are grandfathered in unchanged: they
+ * load exactly as before, with no CRC check, so an existing on-disk index is never forced through
+ * a cold rebuild just to pick up this change.</p>
  */
 public class UsageGraphStore {
 
     private static final Logger logger = LoggerFactory.getLogger(UsageGraphStore.class);
 
     private static final int MAGIC = 0x4A414447; // "JADG"
-    private static final int VERSION = 1;
+    private static final int VERSION_1_LEGACY_NO_CRC = 1;
+    private static final int VERSION_2_CRC = 2;
+    private static final int VERSION = VERSION_2_CRC; // version written by save()
 
     private final Path indexDir;
 
@@ -48,8 +60,9 @@ public class UsageGraphStore {
         Path finalPath = getGraphPath(inputHash);
         Path tmpPath = finalPath.resolveSibling(inputHash + ".graph.tmp");
 
-        try (DataOutputStream dos = new DataOutputStream(
-                new BufferedOutputStream(Files.newOutputStream(tmpPath), 1 << 20))) {
+        try (BufferedOutputStream bos = new BufferedOutputStream(Files.newOutputStream(tmpPath), 1 << 20)) {
+            CheckedOutputStream cos = new CheckedOutputStream(bos, new CRC32());
+            DataOutputStream dos = new DataOutputStream(cos);
             dos.writeInt(MAGIC);
             dos.writeInt(VERSION);
             dos.writeInt(adjacency.length);
@@ -61,6 +74,11 @@ public class UsageGraphStore {
                 dos.writeInt(row.length);
                 for (int v : row) dos.writeInt(v);
             }
+            dos.flush();
+            long crc = cos.getChecksum().getValue();
+            // Trailer is written directly to the underlying stream, bypassing the checked stream,
+            // so it covers MAGIC..last-row only (not itself).
+            new DataOutputStream(bos).writeLong(crc);
         }
         Files.move(tmpPath, finalPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         logger.info("[UsageGraphStore] Saved usage graph ({} classes) to {}", adjacency.length, finalPath.getFileName());
@@ -68,7 +86,7 @@ public class UsageGraphStore {
 
     /**
      * @return the adjacency array, or {@code null} if missing / wrong header / corrupt /
-     *         class-count mismatch with {@code expectedClasses}.
+     *         class-count mismatch with {@code expectedClasses} / CRC mismatch (v2 only).
      */
     public int[][] tryLoad(String inputHash, int expectedClasses) throws IOException {
         Path path = getGraphPath(inputHash);
@@ -76,8 +94,9 @@ public class UsageGraphStore {
             logger.debug("[UsageGraphStore] No graph file for hash {}", inputHash.substring(0, 8));
             return null;
         }
-        try (DataInputStream dis = new DataInputStream(
-                new BufferedInputStream(Files.newInputStream(path), 1 << 20))) {
+        try (BufferedInputStream bis = new BufferedInputStream(Files.newInputStream(path), 1 << 20)) {
+            CheckedInputStream cis = new CheckedInputStream(bis, new CRC32());
+            DataInputStream dis = new DataInputStream(cis);
             int magic = dis.readInt();
             if (magic != MAGIC) {
                 logger.warn("[UsageGraphStore] Bad magic in {}; will rebuild", path.getFileName());
@@ -85,7 +104,7 @@ public class UsageGraphStore {
                 return null;
             }
             int version = dis.readInt();
-            if (version != VERSION) {
+            if (version != VERSION_1_LEGACY_NO_CRC && version != VERSION_2_CRC) {
                 logger.info("[UsageGraphStore] Version mismatch ({} vs {}); will rebuild", version, VERSION);
                 Files.deleteIfExists(path);
                 return null;
@@ -103,6 +122,18 @@ public class UsageGraphStore {
                 int[] row = new int[len];
                 for (int j = 0; j < len; j++) row[j] = dis.readInt();
                 adj[i] = row;
+            }
+            if (version == VERSION_2_CRC) {
+                long computed = cis.getChecksum().getValue();
+                // Trailer was written directly to the underlying stream (bypassing the checked
+                // stream) so it must be read the same way here.
+                long stored = new DataInputStream(bis).readLong();
+                if (stored != computed) {
+                    logger.warn("[UsageGraphStore] CRC mismatch in {} (stored={}, computed={}); will rebuild",
+                            path.getFileName(), stored, computed);
+                    Files.deleteIfExists(path);
+                    return null;
+                }
             }
             logger.info("[UsageGraphStore] Loaded usage graph ({} classes) from {} (fast-path)", n, path.getFileName());
             return adj;
