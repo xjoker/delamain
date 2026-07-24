@@ -18,8 +18,10 @@ from src.routing import request_router
 @pytest.fixture(autouse=True)
 def reset_release_contract_state():
     InstanceRegistry.clear_all()
+    request_router.reset_identity_cache()
     yield
     InstanceRegistry.clear_all()
+    request_router.reset_identity_cache()
 
 
 def test_gateway_rejects_missing_mcp_auth_token(monkeypatch, capsys):
@@ -59,13 +61,17 @@ def test_empty_token_list_builds_no_provider():
 
 
 # ---------------------------------------------------------------------------
-# (b) Single-backend passthrough: get_from_jadx must route to the one
-# configured JADX backend regardless of the (now vestigial) instance_id arg.
+# (b) Single-backend passthrough: get_from_jadx routes to the one configured
+# JADX backend when instance_id resolves to it (its own name, "jadx", or the
+# identity of whatever is currently loaded) — and now REJECTS an instance_id
+# that resolves to neither, instead of silently proxying to the backend
+# anyway (the RCA this replaces: "whatever-is-ignored" used to pass through
+# unquestioned).
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_get_from_jadx_routes_to_the_single_configured_backend(monkeypatch):
-    InstanceRegistry.configure(host="127.0.0.1", port=8650, token="java-token")
+    InstanceRegistry.configure(host="127.0.0.1", port=8650, token="java-token", name="jadx")
 
     calls = []
 
@@ -86,10 +92,47 @@ async def test_get_from_jadx_routes_to_the_single_configured_backend(monkeypatch
 
     monkeypatch.setattr(request_router, "get_http_client", fake_get_http_client)
 
-    result = await request_router.get_from_jadx("file-info", instance_id="whatever-is-ignored")
+    result = await request_router.get_from_jadx("file-info", instance_id="jadx")
 
     assert result == {"ok": True}
     assert calls == [("http://127.0.0.1:8650/file-info", {"Authorization": "Bearer java-token"})]
+
+
+@pytest.mark.asyncio
+async def test_get_from_jadx_rejects_an_unresolvable_instance_id(monkeypatch):
+    """An instance_id that names neither the backend nor its currently loaded
+    APK/JAR must be rejected with INSTANCE_NOT_FOUND, not silently routed to
+    the single configured backend."""
+    InstanceRegistry.configure(host="127.0.0.1", port=8650, token="java-token", name="jadx")
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        async def get(self, url, params=None, headers=None, timeout=None):
+            return FakeResponse({
+                "loaded": True,
+                "file_name": "9290803.apk",
+                "version_name": "1.0.0",
+            })
+
+    async def fake_get_http_client():
+        return FakeClient()
+
+    monkeypatch.setattr(request_router, "get_http_client", fake_get_http_client)
+
+    result = await request_router.get_from_jadx("file-info", instance_id="xhs-9281803.apk")
+
+    assert result["error_code"] == "INSTANCE_NOT_FOUND"
+    assert result["ok"] is False
+    assert "9290803.apk" in result["message"]
 
 
 @pytest.mark.asyncio

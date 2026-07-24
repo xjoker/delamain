@@ -14,7 +14,7 @@ of spinning up a new JADX worker.
 from typing import Optional
 
 from ..registry.instance_registry import InstanceRegistry
-from ..routing.request_router import get_from_jadx
+from ..routing.request_router import get_from_jadx, resolve_instance
 from ..logging_config import get_logger
 
 logger = get_logger("workflow_tools")
@@ -22,23 +22,29 @@ logger = get_logger("workflow_tools")
 _NO_FILE_SIGNALS = ("no file", "no apk", "not loaded", "")
 
 
-def _instance_has_no_file(apk_info: dict) -> bool:
-    if not apk_info:
+def _instance_has_no_file(file_info: dict) -> bool:
+    """Whether the backend currently has nothing loaded.
+
+    Sourced from /file-info (the identity authority — see ApkIdentity.java),
+    not the legacy /apk-info shape, which never carried file_name/apk_package
+    and made this always look empty even when /file-info showed a file
+    loaded (the split-brain this fixes).
+    """
+    if not file_info:
         return True
-    pkg = apk_info.get("apk_package", "").lower().strip()
-    fname = apk_info.get("file_name", "").lower().strip()
-    status = apk_info.get("status", "").lower().strip()
-    if pkg in _NO_FILE_SIGNALS or status in ("no_file", "no file", "empty"):
-        return True
-    if not pkg and not fname:
-        return True
-    return False
+    loaded = file_info.get("loaded")
+    if isinstance(loaded, bool):
+        return not loaded
+    # Fallback for a response without an explicit `loaded` flag.
+    pkg = str(file_info.get("apk_package") or "").lower().strip()
+    fname = str(file_info.get("file_name") or "").lower().strip()
+    return pkg in _NO_FILE_SIGNALS and fname in _NO_FILE_SIGNALS
 
 
-async def _fetch_apk_info(instance) -> dict:
-    result = await get_from_jadx("apk-info", instance_id=instance.name)
+async def _fetch_file_info(instance) -> dict:
+    result = await get_from_jadx("file-info", instance_id=instance.name)
     if not result or result.get("error"):
-        logger.debug(f"_fetch_apk_info({instance.name}): {result.get('message') if result else 'no result'}")
+        logger.debug(f"_fetch_file_info({instance.name}): {result.get('message') if result else 'no result'}")
         return {}
     return result
 
@@ -90,6 +96,10 @@ async def analyze_apk(
                 f"strategy must be one of: auto, replace, new_instance, append — got '{strategy}'"
             ],
         }
+
+    validation_error = await resolve_instance(instance_id)
+    if validation_error is not None:
+        return validation_error
 
     target = InstanceRegistry.get_default()
 
@@ -155,8 +165,8 @@ async def analyze_apk(
             "next_steps": _NO_INSTANCE_NEXT_STEPS,
         }
 
-    apk_info = await _fetch_apk_info(target)
-    if _instance_has_no_file(apk_info):
+    file_info = await _fetch_file_info(target)
+    if _instance_has_no_file(file_info):
         result = await _load_file_on_instance(target, path, mode="replace")
         if "error" in result:
             return {
@@ -176,7 +186,7 @@ async def analyze_apk(
             "next_steps": ["File is loading. Poll get_decompile_status until cached_percentage stabilises."],
         }
 
-    loaded_name = apk_info.get("file_name") or apk_info.get("apk_package") or "unknown"
+    loaded_name = file_info.get("file_name") or file_info.get("apk_package") or "unknown"
     return {
         "status": "ambiguous",
         "instance": _instance_summary(target),
@@ -193,21 +203,25 @@ async def analyze_apk(
 
 
 async def list_loaded_files(instance_id: Optional[str] = None) -> dict:
+    validation_error = await resolve_instance(instance_id)
+    if validation_error is not None:
+        return validation_error
+
     target = InstanceRegistry.get_default()
     if not target:
         return {"instances": [], "count": 0, "free_count": 0}
 
-    apk_info = await _fetch_apk_info(target)
+    file_info = await _fetch_file_info(target)
     decompile_status = await _fetch_decompile_status(target)
 
-    loaded_file = apk_info.get("file_name") or apk_info.get("apk_package") or None
-    if loaded_file and _instance_has_no_file(apk_info):
-        loaded_file = None
+    available = _instance_has_no_file(file_info)
+    identity = file_info.get("apk_identity") or {}
+    loaded_file = None if available else (
+        file_info.get("file_name") or identity.get("file_name") or file_info.get("apk_package") or None
+    )
 
     progress = decompile_status.get("cached_percentage") or decompile_status.get("percentage") or 0.0
     decompile_progress = round(float(progress) / 100.0, 2) if isinstance(progress, (int, float)) else 0.0
-
-    available = _instance_has_no_file(apk_info)
 
     result = {
         "name": target.name,
@@ -216,6 +230,13 @@ async def list_loaded_files(instance_id: Optional[str] = None) -> dict:
         "loaded_file": loaded_file,
         "decompile_progress": decompile_progress,
         "available": available,
+        "version_name": file_info.get("version_name") or identity.get("version_name"),
+        "version_code": (
+            file_info.get("version_code")
+            if file_info.get("version_code") is not None
+            else identity.get("version_code")
+        ),
+        "input_hash": identity.get("input_hash") or file_info.get("input_hash"),
     }
     return {
         "instances": [result],
@@ -260,7 +281,8 @@ def register_workflow_tools(mcp):
         Args:
             instance_id: Unused — this gateway has a single fixed JADX backend.
         Returns:
-            dict: {instances: [{name, loaded_file, decompile_progress, available}], count, free_count}
+            dict: {instances: [{name, loaded_file, decompile_progress, available,
+                   version_name, version_code, input_hash}], count, free_count}
         """
         return await list_loaded_files(instance_id=instance_id)
 

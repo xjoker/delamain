@@ -6,7 +6,8 @@ Routes MCP tool requests to the single configured JADX backend.
 
 import asyncio
 import logging
-from typing import Optional
+import time
+from typing import Any, Optional
 
 import httpx
 
@@ -76,6 +77,84 @@ async def close_http_client() -> None:
         await client.aclose()
 
 
+# instance_id validity: an identity round trip (one /file-info call) is only
+# needed when instance_id doesn't already match the backend's own name — see
+# resolve_instance(). Cached briefly so a burst of calls with the same
+# instance_id doesn't hit the backend once per call.
+_IDENTITY_CACHE_TTL_SECONDS = 5.0
+_identity_cache: dict[str, Any] = {"ts": 0.0, "data": None}
+
+
+def reset_identity_cache() -> None:
+    """Clear the cached current-file identity (tests; also safe after a reload)."""
+    _identity_cache["ts"] = 0.0
+    _identity_cache["data"] = None
+
+
+async def _fetch_current_identity() -> Optional[dict]:
+    now = time.monotonic()
+    if _identity_cache["data"] is not None and now - _identity_cache["ts"] < _IDENTITY_CACHE_TTL_SECONDS:
+        return _identity_cache["data"]
+
+    result = await get_from_jadx("file-info")
+    if not result or result.get("error"):
+        return None
+
+    _identity_cache["ts"] = now
+    _identity_cache["data"] = result
+    return result
+
+
+async def resolve_instance(instance_id: Optional[str]) -> Optional[dict]:
+    """Validate ``instance_id`` against the single configured backend.
+
+    Returns ``None`` when the instance_id is valid (including the
+    backward-compatible ``None``/omitted case — zero extra round trips), or a
+    router-level error dict (INSTANCE_NOT_FOUND) when it names something that
+    is neither the backend itself nor the identity of whatever is currently
+    loaded on it. This is the fix for the RCA where an unknown instance_id
+    (e.g. a stale APK filename) was silently routed to the current backend
+    instead of being rejected.
+    """
+    if instance_id is None or instance_id == "jadx":
+        return None
+
+    inst = InstanceRegistry.get_default()
+    if inst is None:
+        # No backend configured at all — let the NO_INSTANCE branch in
+        # get_from_jadx report that; don't mask it with a different code.
+        return None
+    if instance_id == inst.name:
+        return None
+
+    identity = await _fetch_current_identity()
+    if identity is None:
+        return _routing_error(
+            "INSTANCE_NOT_FOUND",
+            f"Instance '{instance_id}' not found (unable to verify the currently loaded APK/JAR).",
+        )
+
+    # Identity fields live at the top level of /file-info AND inside its nested
+    # apk_identity object (input_hash is only in the nested one) — merge both so
+    # an instance_id given as any of file_name / input_hash / apk_package matches.
+    nested = identity.get("apk_identity") or {}
+    candidates = {
+        str(value)
+        for source in (identity, nested)
+        for key in ("file_name", "input_hash", "apk_package")
+        if (value := source.get(key))
+    }
+    if instance_id in candidates:
+        return None
+
+    file_name = identity.get("file_name") or "unknown"
+    version_name = identity.get("version_name") or "unknown"
+    return _routing_error(
+        "INSTANCE_NOT_FOUND",
+        f"Instance '{instance_id}' not found. Currently loaded: {file_name} ({version_name}).",
+    )
+
+
 async def get_from_jadx(
     endpoint: str,
     params: Optional[dict] = None,
@@ -86,14 +165,20 @@ async def get_from_jadx(
 ) -> dict:
     """Route a request to the single configured JADX backend.
 
-    ``instance_id`` is accepted only for call-site compatibility with the ~30
-    tool modules that still pass it — this gateway proxies to exactly one
-    fixed backend (see InstanceRegistry.configure()), so it is not used to
-    select among instances.
+    ``instance_id``, when provided, must resolve to either the backend's own
+    name ("jadx") or the identity of whatever APK/JAR it currently has
+    loaded (file_name / input_hash / apk_package) — see resolve_instance().
+    An unresolvable instance_id is rejected with INSTANCE_NOT_FOUND rather
+    than silently proceeding against the single fixed backend.
     """
     inst = InstanceRegistry.get_default()
     if inst is None:
         return _routing_error("NO_INSTANCE", "No JADX backend configured")
+
+    if instance_id is not None:
+        validation_error = await resolve_instance(instance_id)
+        if validation_error is not None:
+            return validation_error
 
     url = f"{inst.url}/{endpoint.lstrip('/')}"
     headers = {}
@@ -112,7 +197,13 @@ async def get_from_jadx(
                                         params=params or {}, headers=headers,
                                         timeout=httpx.Timeout(actual_timeout))
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        if endpoint.lstrip("/").startswith("load-file"):
+            # A (re)load changes which APK is current — drop the cached identity
+            # so instance_id validation re-reads the backend instead of trusting
+            # a pre-reload file_name for up to the TTL window.
+            reset_identity_cache()
+        return data
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
         # Connection-level failures (backend down, wrong port, refused, etc.)
         # — log the real host:port/exception for operators, but never echo

@@ -561,6 +561,16 @@ def with_busy_check(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaita
         bound = signature.bind_partial(*args, **kwargs)
         requested_instance = bound.arguments.get("instance_id")
 
+        if requested_instance is not None:
+            # Reject an unresolvable instance_id up front — before acquiring a
+            # lane lock — instead of silently tracking it under the single
+            # backend's name (see request_router.resolve_instance()).
+            from .routing.request_router import resolve_instance
+
+            validation_error = await resolve_instance(requested_instance)
+            if validation_error is not None:
+                return validation_error
+
         instance_name = InstanceBusyTracker._resolve_instance_name(requested_instance)
 
         if instance_name is None:

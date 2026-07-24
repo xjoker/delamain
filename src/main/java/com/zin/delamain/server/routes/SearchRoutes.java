@@ -1501,6 +1501,9 @@ public class SearchRoutes {
         // reflect reality rather than restate the caller's (possibly stale/absent) input.
         String effectiveMode = result.getMatchMode() != null ? result.getMatchMode() : matchMode.name().toLowerCase();
         response.put("match_mode", effectiveMode);
+        // apk_identity reflects whichever file is currently loaded at response time, not the
+        // (possibly stale/async-polled) request's own state — see ApkIdentity for the contract.
+        response.put("apk_identity", com.zin.delamain.core.ApkIdentity.build(wrapper));
         return response;
     }
 

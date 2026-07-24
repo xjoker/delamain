@@ -100,12 +100,26 @@ class WarmupManagerColdShardBuildTest {
         assertTrue(json.contains("\"shard_count\""), "manifest must contain shard_count: " + json);
         assertTrue(json.contains("\"built_at_epoch_ms\""), "manifest must contain built_at_epoch_ms: " + json);
 
+        // --- req4: the manifest must record the APK identity (package/version) so a later
+        // FAST_RESTORE can cross-check it against the loaded APK and reject a 64 KB-prefix hash
+        // collision that would otherwise serve a different APK's index. ---
+        assertTrue(json.contains("\"apk_package\""), "manifest must contain apk_package: " + json);
+        assertTrue(json.contains("\"version_name\""), "manifest must contain version_name: " + json);
+        assertTrue(json.contains("\"version_code\""), "manifest must contain version_code: " + json);
+        Map<String, Object> loadedIdentity = com.zin.delamain.core.ApkIdentity.build(wrapper);
+        assertEquals(loadedIdentity.get("apk_package"),
+                com.google.gson.JsonParser.parseString(json).getAsJsonObject()
+                        .get("apk_package").getAsString(),
+                "manifest apk_package must match the loaded APK's package");
+
         // --- W8: /index-stats index_prebaked section reads the manifest above ---
         GeneralRoutes routes = new GeneralRoutes(wrapper);
         Map<String, Object> prebaked = routes.readPrebakedManifest();
         assertEquals(Boolean.TRUE, prebaked.get("complete"),
                 "index_prebaked.complete must be true once manifest exists and matches loaded APK: " + prebaked);
         assertEquals(hash, prebaked.get("input_hash"));
+        assertEquals(loadedIdentity.get("apk_package"), prebaked.get("apk_package"),
+                "readPrebakedManifest must echo the stored apk_package: " + prebaked);
         Object shardCount = prebaked.get("shard_count");
         assertTrue(shardCount instanceof Number && ((Number) shardCount).intValue() > 0,
                 "manifest shard_count must be > 0: " + prebaked);

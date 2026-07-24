@@ -220,6 +220,27 @@ public class WarmupManager {
         return currentInputHash;
     }
 
+    /**
+     * Invalidates the published APK identity at the start of a file reload/replace (req5).
+     *
+     * <p>Closes the window where {@code apk_identity.input_hash} (via
+     * {@link com.zin.delamain.core.ApkIdentity}) would still report the OLD APK's hash after the new
+     * APK has been marked LOADED but before its warmup has recomputed and republished the identity.
+     * After this call {@link #getCurrentInputHash()} returns {@code null} (pending) — never a stale
+     * hash — and {@link #codeStore()} returns {@code null} so source reads fall through to the live
+     * path instead of serving the previous APK's decompiled source, until the next warmup sets both.</p>
+     *
+     * <p>Called from {@code FileManagementRoutes#handleLoadFile} the moment a reload is reserved,
+     * before the async reload thread runs. It is a single pair of volatile publishes and needs no
+     * lock: the old warmup — which the reload's pre-close quiesce hook cancels under the write lock —
+     * only ever writes the identity once at its own start (see {@code runWarmup}) and never rewrites
+     * it after cancellation, so it cannot race this reset back to a stale value.</p>
+     */
+    public static void resetIdentityForReload() {
+        currentInputHash = null;
+        codeStore = null;
+    }
+
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
@@ -499,8 +520,16 @@ public class WarmupManager {
 
             boolean graphRestored = (hash != null) && tryRestoreUsageGraph(hash, sorted.size());
             boolean codeReady = (codeStore != null) && codeStore.isComplete();
+            // req4: even with the usage graph + CodeStore present for this input-hash, cross-check
+            // the on-disk prebaked manifest's stored APK identity (package/version) against the
+            // loaded APK before trusting the restored index. This defends against a 64 KB-prefix
+            // hash collision (same computeInputHash prefix, genuinely different APK) serving the
+            // wrong index. Absent / old-format / unreadable manifests still allow the restore by
+            // input-hash match alone (see prebakedManifestIdentityMatches) so existing production
+            // index volumes never regress into a multi-minute cold rebuild.
+            boolean identityOk = (hash == null) || prebakedManifestIdentityMatches(hash, wrapper);
 
-            if (graphRestored && codeReady && !cancelRequested.get()) {
+            if (graphRestored && codeReady && identityOk && !cancelRequested.get()) {
                 // FAST RESTART: every static artifact is on disk. Skip the multi-minute Phase-1
                 // decompile entirely — source is served from CodeStore, xref from the graph,
                 // and metadata search from the name indices built below. Per-class live decompile
@@ -979,7 +1008,7 @@ public class WarmupManager {
                     ContentShardIndex.loadCatalog(dir, hash);
                     logger.info("[JAI] Background shard build done: {} shards, {} covered classes, {}s",
                         shardsWritten.size(), covered, (System.currentTimeMillis() - t0) / 1000);
-                    writePrebakedManifest(dir, hash, sorted.size(), shardsWritten.size(), covered);
+                    writePrebakedManifest(dir, hash, sorted.size(), shardsWritten.size(), covered, wrapper);
                 }
             } catch (Exception e) {
                 logger.warn("[JAI] Background shard build failed: {}", e.getMessage());
@@ -1001,11 +1030,21 @@ public class WarmupManager {
      * Best-effort: any failure is logged and does not affect warmup.
      */
     private static void writePrebakedManifest(java.nio.file.Path dir, String hash, int totalClasses,
-                                               int shardCount, int shardCoveredClasses) {
+                                               int shardCount, int shardCoveredClasses,
+                                               HeadlessJadxWrapper wrapper) {
         try {
             Map<String, Object> manifest = new java.util.LinkedHashMap<>();
             manifest.put("tool_version", AppVersion.get());
             manifest.put("input_hash", hash);
+            // req4: record the loaded APK's identity so a later FAST_RESTORE can cross-check it and
+            // reject a 64 KB-prefix input-hash collision that would otherwise serve a different
+            // APK's index. Best-effort and null-safe (ApkIdentity degrades manifest-parse failures
+            // to null); older volumes written before this feature simply omit these fields, which
+            // the restore gate treats as "no identity metadata — allow by input-hash match".
+            Map<String, Object> identity = com.zin.delamain.core.ApkIdentity.build(wrapper);
+            manifest.put("apk_package", identity.get("apk_package"));
+            manifest.put("version_name", identity.get("version_name"));
+            manifest.put("version_code", identity.get("version_code"));
             manifest.put("total_classes", totalClasses);
             manifest.put("shard_count", shardCount);
             manifest.put("shard_covered_classes", shardCoveredClasses);
@@ -1019,6 +1058,104 @@ public class WarmupManager {
         } catch (Exception e) {
             logger.warn("[JAI] Prebaked-index manifest write failed (non-fatal): {}", e.getMessage());
         }
+    }
+
+    /**
+     * FAST_RESTORE identity guard (req4): reads the on-disk {@code <hash>.manifest.json} and checks
+     * whether its stored APK identity permits trusting the restored index for the loaded APK.
+     *
+     * <p>Returns {@code true} (allow FAST_RESTORE) when the manifest is absent, unreadable, or of an
+     * old format without identity metadata — existing production index volumes have no
+     * apk_package/version fields and MUST NOT be forced into a multi-minute cold rebuild. Returns
+     * {@code false} only when the manifest carries identity metadata that conflicts with the loaded
+     * APK (WARN logged), i.e. the stored index belongs to a different APK that merely shares the
+     * 64 KB-prefix input hash.</p>
+     */
+    private static boolean prebakedManifestIdentityMatches(String hash, HeadlessJadxWrapper wrapper) {
+        java.nio.file.Path manifestPath = indexCacheDir().resolve(hash + ".manifest.json");
+        if (!java.nio.file.Files.isRegularFile(manifestPath)) {
+            return true; // no manifest to cross-check; input-hash match remains the lookup key
+        }
+        Map<String, Object> manifest;
+        try {
+            String json = java.nio.file.Files.readString(manifestPath);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> parsed = MANIFEST_GSON.fromJson(json, Map.class);
+            manifest = parsed;
+        } catch (Exception e) {
+            logger.warn("[JAI] FAST_RESTORE: could not read prebaked manifest {} for identity "
+                + "cross-check ({}) — allowing restore by input-hash match", manifestPath, e.getMessage());
+            return true;
+        }
+        if (manifest == null) return true;
+
+        String shortHash = hash.substring(0, Math.min(8, hash.length()));
+        Object pkg = manifest.get("apk_package");
+        Object vName = manifest.get("version_name");
+        Object vCode = manifest.get("version_code");
+        if (pkg == null && vName == null && vCode == null) {
+            logger.warn("[JAI] FAST_RESTORE: prebaked manifest {}... has no identity metadata "
+                + "(pre-identity index volume) — allowing restore by input-hash match only", shortHash);
+            return true;
+        }
+
+        Map<String, Object> cur = com.zin.delamain.core.ApkIdentity.build(wrapper);
+        String curPkg = (String) cur.get("apk_package");
+        String curVName = (String) cur.get("version_name");
+        Integer curVCode = (cur.get("version_code") instanceof Integer) ? (Integer) cur.get("version_code") : null;
+
+        boolean allow = prebakedIdentityAllowsRestore(manifest, curPkg, curVName, curVCode);
+        if (!allow) {
+            logger.warn("[JAI] FAST_RESTORE REJECTED: prebaked manifest identity mismatch for input-hash "
+                + "{}... — manifest(package={}, version_name={}, version_code={}) vs loaded(package={}, "
+                + "version_name={}, version_code={}); input-hash matched but the stored index belongs to a "
+                + "different APK (64 KB-prefix collision) — falling back to full cold rebuild",
+                shortHash, pkg, vName, vCode, curPkg, curVName, curVCode);
+        }
+        return allow;
+    }
+
+    /**
+     * Pure FAST_RESTORE identity gate (package-private for direct unit testing). Given a parsed
+     * prebaked manifest and the loaded APK's identity, decides whether the on-disk index volume may
+     * be trusted for FAST_RESTORE.
+     *
+     * <p>Backward compatibility is the hard constraint: a {@code null} manifest, or one without any
+     * apk_package/version_* fields (pre-identity production volumes), returns {@code true} — restore
+     * allowed on input-hash match alone, never a forced cold rebuild. Only a manifest that DOES carry
+     * identity metadata AND conflicts with the loaded APK returns {@code false}.</p>
+     *
+     * <p>A conflict requires BOTH sides of a field to be present and to differ: if either the stored
+     * or the current value is null we cannot prove a mismatch and do not reject (a flaky current-side
+     * manifest parse must never trigger a false cold rebuild). A genuine 64 KB-prefix collision is
+     * still caught because two truly different APKs both parse to different, non-null packages.</p>
+     */
+    static boolean prebakedIdentityAllowsRestore(Map<String, Object> manifest,
+            String curPackage, String curVersionName, Integer curVersionCode) {
+        if (manifest == null) return true;
+        Object pkg = manifest.get("apk_package");
+        Object vName = manifest.get("version_name");
+        Object vCode = manifest.get("version_code");
+        if (pkg == null && vName == null && vCode == null) {
+            return true; // old-format manifest: no identity metadata to cross-check
+        }
+        boolean conflict = identityFieldConflicts(pkg, curPackage)
+                || identityFieldConflicts(vName, curVersionName)
+                || identityFieldConflicts(vCode, curVersionCode);
+        return !conflict;
+    }
+
+    /**
+     * True only when both values are present (non-null) and differ. Numbers compare by
+     * {@code longValue()} so a Gson-parsed {@code Double} (e.g. version_code 1.0) equals the live
+     * {@code Integer} (1); everything else compares by string form.
+     */
+    private static boolean identityFieldConflicts(Object stored, Object current) {
+        if (stored == null || current == null) return false;
+        if (stored instanceof Number && current instanceof Number) {
+            return ((Number) stored).longValue() != ((Number) current).longValue();
+        }
+        return !String.valueOf(stored).equals(String.valueOf(current));
     }
 
     /** Loads the usage graph from disk into {@link UsageGraphIndex} (ids already assigned). */

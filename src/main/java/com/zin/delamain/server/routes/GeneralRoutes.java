@@ -3,6 +3,7 @@ package com.zin.delamain.server.routes;
 import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
 import com.google.gson.reflect.TypeToken;
+import com.zin.delamain.core.ApkIdentity;
 import com.zin.delamain.core.HeadlessJadxWrapper;
 import com.zin.delamain.index.CodeContentIndex;
 import com.zin.delamain.index.UsageGraphIndex;
@@ -74,6 +75,11 @@ public class GeneralRoutes {
     public void handleIndexStats(Context ctx) {
         try {
             Map<String, Object> response = new HashMap<>();
+
+            // --- APK identity echo — states which APK the index numbers below actually belong to,
+            // so one /index-stats call confirms identity (package/version/input_hash) and index
+            // health together. Null-safe via ApkIdentity ({loaded:false} when nothing is loaded). ---
+            response.put("apk_identity", ApkIdentity.build(wrapper));
 
             // --- Name indices (ClassCacheManager) ---
             response.put("name_indices", ClassCacheManager.getNameIndexStats());

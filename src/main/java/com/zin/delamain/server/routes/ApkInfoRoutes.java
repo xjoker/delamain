@@ -185,6 +185,8 @@ public class ApkInfoRoutes {
             features.put("spi_services", "jar".equals(fileType));
             result.put("features", features);
 
+            result.put("apk_identity", com.zin.delamain.core.ApkIdentity.build(wrapper));
+
             result.put("status", "success");
             ctx.json(result);
 

@@ -334,11 +334,14 @@ public class DelamainServer {
 
         // GET /apk-info — basic info about loaded file(s)
         app.get("/apk-info", ctx -> {
+            Map<String, Object> identity = com.zin.delamain.core.ApkIdentity.build(wrapper);
+
             if (!wrapper.isLoaded()) {
-                ctx.json(Map.of(
-                        "load_state", wrapper.getLoadState().name().toLowerCase(),
-                        "message", "No APK/JAR has been loaded. Use /load-file to load one."
-                ));
+                Map<String, Object> resp = new HashMap<>();
+                resp.put("load_state", wrapper.getLoadState().name().toLowerCase());
+                resp.put("message", "No APK/JAR has been loaded. Use /load-file to load one.");
+                resp.put("apk_identity", identity);
+                ctx.json(resp);
                 return;
             }
 
@@ -355,6 +358,15 @@ public class DelamainServer {
             }
             resp.put("input_files", files);
 
+            // Additive fields aligning /apk-info with /file-info's field names (root cause of the
+            // gateway split-brain: /apk-info used to lack file_name/apk_package/version entirely).
+            resp.put("file_name", identity.get("file_name"));
+            Object apkPackage = identity.get("apk_package");
+            resp.put("apk_package", apkPackage != null ? apkPackage : resp.get("package_name"));
+            resp.put("version_name", identity.get("version_name"));
+            resp.put("version_code", identity.get("version_code"));
+            resp.put("apk_identity", identity);
+
             ctx.json(resp);
         });
 
@@ -362,6 +374,8 @@ public class DelamainServer {
         // buildRuntimeDiagnostics) so gateway callers can honor the documented
         // search_lock.locked backoff contract (mcp_server.py MCP_INSTRUCTIONS, class_tools.py).
         app.get("/decompile-status", ctx -> {
+            Map<String, Object> identity = com.zin.delamain.core.ApkIdentity.build(wrapper);
+
             if (!wrapper.isLoaded()) {
                 Map<String, Object> response = new HashMap<>();
                 response.put("status", wrapper.getLoadState().name().toLowerCase());
@@ -372,6 +386,7 @@ public class DelamainServer {
                 }
                 response.put("search_lock", com.zin.delamain.utils.JadxSearchLock.getStatus());
                 response.put("runtime_diagnostics", buildRuntimeDiagnostics());
+                response.put("apk_identity", identity);
                 ctx.json(response);
                 return;
             }
@@ -386,6 +401,7 @@ public class DelamainServer {
             resp.put("total_classes", total);
             resp.put("search_lock", com.zin.delamain.utils.JadxSearchLock.getStatus());
             resp.put("runtime_diagnostics", buildRuntimeDiagnostics());
+            resp.put("apk_identity", identity);
 
             Map<String, Object> mem = new HashMap<>();
             mem.put("max_mb", max / (1024 * 1024));

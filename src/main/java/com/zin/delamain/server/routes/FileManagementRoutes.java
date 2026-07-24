@@ -142,6 +142,13 @@ public class FileManagementRoutes {
                 return;
             }
 
+            // req5: invalidate the published APK identity the moment the reload is reserved, before
+            // the async reload thread flips the load state to LOADED. Otherwise apk_identity would
+            // report the OLD APK's input_hash for the NEW APK during the window between LOADED and
+            // the follow-up warmup recomputing the hash. After this, getCurrentInputHash() returns
+            // null (pending) — never a stale hash — until the new warmup republishes it.
+            com.zin.delamain.index.WarmupManager.resetIdentityForReload();
+
             // Headless reload: dispatch asynchronously to avoid blocking the HTTP thread
             final String finalMode = mode;
             final Path finalCanonical = canonical;
