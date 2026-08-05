@@ -14,10 +14,13 @@ that params are passed through correctly.
 NOTE: The B'' simplification cut the gateway down to single-machine +
 single-instance + single event loop; request_router's httpx client likewise
 collapsed from per-loop buckets to a single module-level singleton
-(src/routing/request_router.py). The fixture calls close_http_client() before
-each test to make sure a client tied to a previously-closed loop doesn't get
-reused by the next test's new loop; this is purely test-isolation hygiene and
-no longer corresponds to any per-loop fix.
+(src/routing/request_router.py). pytest-asyncio gives each test its own event
+loop, but the singleton client outlives any single test. The fixture closes
+it in its OWN teardown (after yield), while the loop that created/used it is
+still open — closing it in the NEXT test's setup would hand an already-closed
+loop's client to .aclose(), which raises "Event loop is closed". Closing
+after yield leaves the singleton None, so the next test's first request
+lazily creates a fresh client bound to its own loop (see get_http_client()).
 """
 
 import os
@@ -45,8 +48,8 @@ async def live_instance():
     InstanceRegistry.configure(
         name=INSTANCE_NAME, host=LIVE_HOST, port=LIVE_PORT, token=LIVE_TOKEN,
     )
-    await request_router.close_http_client()
     yield
+    await request_router.close_http_client()
     InstanceRegistry.clear_all()
 
 

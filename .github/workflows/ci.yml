@@ -83,23 +83,17 @@ jobs:
     # NOT wired into push/pull_request: this actually boots the Java backend against
     # a real sample APK (test-harness/real/UnCrackable-Level2.apk) and a real gateway
     # process, then runs gateway/tests/integration + the repo-root tests/ against them
-    # end-to-end. Verified locally to genuinely exercise the full stack, but as of the
-    # first real run it also surfaces pre-existing test/product drift unrelated to this
-    # job's own plumbing:
-    #   - tests/test_gateway_e2e.py::test_initialize expects the MCP "instructions" text
-    #     to contain "CODE SEARCH HARD LIMITS", which gateway/src/mcp_server.py's
-    #     MCP_INSTRUCTIONS no longer contains.
-    #   - tests/test_gateway_e2e.py::test_get_all_classes_pagination hardcodes
-    #     total > 1000, which no small sample APK can ever satisfy.
-    #   - gateway/tests/integration/test_new_tools_live.py's autouse live_instance
-    #     fixture intermittently hits "RuntimeError: Event loop is closed" on teardown
-    #     under pytest-asyncio's per-test event loop (2 of 4 tests on this run).
-    # None of those are this job's own plumbing bug, and fixing them is out of this
-    # change's scope (test files). Until they're fixed this job is expected to be red,
-    # which is why it is nightly/manual-only rather than a required PR gate — a job
-    # that is known to fail must not sit in the merge-blocking path, or it just
-    # trains reviewers to ignore red. Revisit promoting it to push/pull_request once
-    # the above are fixed and it has a run of clean nightly results.
+    # end-to-end. Its first real run surfaced three defects that had survived only
+    # because nothing ever executed these files (a stale instructions assertion, a
+    # pagination assertion written against an APK that was never committed, and an
+    # event loop closed during the wrong test's teardown); all three are fixed and
+    # both suites now pass locally against this sample.
+    #
+    # Still nightly/manual rather than a required PR gate: it builds the JAR, boots a
+    # backend and waits out warmup, so it is far slower than the unit jobs, and it has
+    # no track record yet. Promote it to push/pull_request once a stretch of nightly
+    # runs comes back consistently green — a merge-blocking job that flakes trains
+    # reviewers to ignore red, which costs more than the coverage is worth.
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@v7

@@ -34,7 +34,11 @@ class TestMCPProtocol:
                 assert result.get("serverInfo", {}).get("name")
                 instructions = result.get("instructions", "")
                 assert "DECISION GUIDE" in instructions
-                assert "CODE SEARCH HARD LIMITS" in instructions
+                # The full hard-limit list now lives in get_index_stats' docstring;
+                # MCP_INSTRUCTIONS keeps only the pointer + a one-line reminder of
+                # what's never indexed, so assert on that reminder rather than the
+                # old inline heading text.
+                assert "hex/UUID/base64" in instructions
                 return
         pytest.fail("No SSE data in initialize response")
 
@@ -102,9 +106,39 @@ class TestClassAnalysis:
         assert d.get("methods") is not None or d.get("count") is not None
 
     def test_get_all_classes_pagination(self, gateway_client):
-        d = mcp_call(gateway_client, "get_all_classes", {"offset": 0, "count": 5})
-        assert not d.get("error")
-        assert d.get("pagination", {}).get("total", 0) > 1000
+        # Assert pagination semantics, not an absolute class count — the sample
+        # APK (UnCrackable-Level2, 638 classes) is far smaller than any real
+        # production target, so a hardcoded ">1000" is dataset-size-dependent
+        # and will always fail here regardless of correctness.
+        page1 = mcp_call(gateway_client, "get_all_classes", {"offset": 0, "count": 5})
+        assert not page1.get("error")
+        p1 = page1.get("pagination", {})
+        total = p1.get("total", 0)
+        assert total > 5  # sample APK must have more classes than one page
+        assert p1.get("offset") == 0
+        assert p1.get("count") == len(page1.get("items", []))
+        assert p1.get("has_more") is True
+        assert p1.get("next_offset") == 5
+
+        page2 = mcp_call(gateway_client, "get_all_classes", {"offset": 5, "count": 5})
+        assert not page2.get("error")
+        p2 = page2.get("pagination", {})
+        assert p2.get("offset") == 5
+        assert p2.get("total") == total  # total is stable across pages
+
+        # No overlap between consecutive pages.
+        names1 = {c["raw_name"] for c in page1.get("items", [])}
+        names2 = {c["raw_name"] for c in page2.get("items", [])}
+        assert names1.isdisjoint(names2)
+
+        # Fetching a page that runs past the end reflects has_more=False and
+        # returns exactly the remaining items.
+        last_page = mcp_call(gateway_client, "get_all_classes", {"offset": total - 3, "count": 10})
+        assert not last_page.get("error")
+        p_last = last_page.get("pagination", {})
+        assert p_last.get("has_more") is False
+        assert p_last.get("count") == 3
+        assert len(last_page.get("items", [])) == 3
 
     def test_list_packages(self, gateway_client):
         d = mcp_call(gateway_client, "list_packages", {})
