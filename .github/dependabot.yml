@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Covers all 9+ third-party Actions pinned to a commit SHA in ci.yml/release.yml
+  # (including dtolnay/rust-toolchain@stable, which pins a branch HEAD rather than
+  # a stable tag and so drifts silently upstream without this).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Java backend — pom.xml lives at the repo root.
+  - package-ecosystem: "maven"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Python gateway — pyproject.toml/uv.lock live under gateway/.
+  - package-ecosystem: "uv"
+    directory: "/gateway"
+    schedule:
+      interval: "weekly"
+
+  # Rust CLI — Cargo.toml/Cargo.lock live under tools/delamain-cli/.
+  - package-ecosystem: "cargo"
+    directory: "/tools/delamain-cli"
+    schedule:
+      interval: "weekly"

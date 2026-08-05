@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch: {}
+  # Nightly-only trigger for the `integration` job below — see that job's
+  # comment for why it is not wired into push/pull_request.
+  schedule:
+    - cron: '0 3 * * *'
 
 # Cancel any in-progress run for the same branch/PR when a new commit lands.
 concurrency:
@@ -72,6 +76,155 @@ jobs:
       - run: uv run pytest --collect-only -q tests/integration
         working-directory: gateway
       - run: uv run --project gateway pytest --collect-only -q tests/
+
+  integration:
+    name: Integration tests (live Java backend + gateway)
+    runs-on: ubuntu-latest
+    # NOT wired into push/pull_request: this actually boots the Java backend against
+    # a real sample APK (test-harness/real/UnCrackable-Level2.apk) and a real gateway
+    # process, then runs gateway/tests/integration + the repo-root tests/ against them
+    # end-to-end. Verified locally to genuinely exercise the full stack, but as of the
+    # first real run it also surfaces pre-existing test/product drift unrelated to this
+    # job's own plumbing:
+    #   - tests/test_gateway_e2e.py::test_initialize expects the MCP "instructions" text
+    #     to contain "CODE SEARCH HARD LIMITS", which gateway/src/mcp_server.py's
+    #     MCP_INSTRUCTIONS no longer contains.
+    #   - tests/test_gateway_e2e.py::test_get_all_classes_pagination hardcodes
+    #     total > 1000, which no small sample APK can ever satisfy.
+    #   - gateway/tests/integration/test_new_tools_live.py's autouse live_instance
+    #     fixture intermittently hits "RuntimeError: Event loop is closed" on teardown
+    #     under pytest-asyncio's per-test event loop (2 of 4 tests on this run).
+    # None of those are this job's own plumbing bug, and fixing them is out of this
+    # change's scope (test files). Until they're fixed this job is expected to be red,
+    # which is why it is nightly/manual-only rather than a required PR gate — a job
+    # that is known to fail must not sit in the merge-blocking path, or it just
+    # trains reviewers to ignore red. Revisit promoting it to push/pull_request once
+    # the above are fixed and it has a run of clean nightly results.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '25'
+          cache: maven
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: gateway/uv.lock
+
+      - name: Install jadx-all 1.5.6 into local Maven repository
+        run: |
+          set -euo pipefail
+          readonly JADX_VERSION=1.5.6
+          readonly JADX_ZIP_SHA256=545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974
+          curl -fsSL "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" -o /tmp/jadx.zip
+          echo "${JADX_ZIP_SHA256}  /tmp/jadx.zip" | sha256sum --check --status
+          unzip -q /tmp/jadx.zip -d /tmp/jadx
+          JADX_ALL="$(find /tmp/jadx/lib -type f -name 'jadx-*-all.jar' -print -quit)"
+          test -n "${JADX_ALL}"
+          mvn -q install:install-file \
+            -Dfile="${JADX_ALL}" \
+            -DgroupId=io.github.skylot \
+            -DartifactId=jadx-all \
+            -Dversion="${JADX_VERSION}" \
+            -Dpackaging=jar
+          echo "JADX_ALL_JAR=${HOME}/.m2/repository/io/github/skylot/jadx-all/${JADX_VERSION}/jadx-all-${JADX_VERSION}.jar" >> "$GITHUB_ENV"
+
+      - name: Build fat JAR (jadx-all excluded, provided via -cp at runtime)
+        run: mvn -q -DskipTests clean package
+
+      - run: uv sync --locked --all-extras --dev
+        working-directory: gateway
+
+      - name: Start Java backend on UnCrackable-Level2.apk
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/delamain-output" "$RUNNER_TEMP/delamain-index"
+          nohup java -cp "target/delamain.jar:${JADX_ALL_JAR}" com.zin.delamain.Main \
+            --port 28650 --auth-token test-token \
+            --apk test-harness/real/UnCrackable-Level2.apk \
+            --output-dir "$RUNNER_TEMP/delamain-output" \
+            --index-dir "$RUNNER_TEMP/delamain-index" \
+            > "$RUNNER_TEMP/java-backend.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/java-backend.pid"
+
+      - name: Wait for Java backend health + warmup
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if curl -fsS -H "Authorization: Bearer test-token" http://127.0.0.1:28650/health \
+                | grep -q '"apk_loaded":true'; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS -H "Authorization: Bearer test-token" http://127.0.0.1:28650/health
+          for _ in $(seq 1 60); do
+            if curl -fsS -H "Authorization: Bearer test-token" http://127.0.0.1:28650/warmup-status \
+                | grep -q '"phase":"DONE"'; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS -H "Authorization: Bearer test-token" http://127.0.0.1:28650/warmup-status
+
+      - name: Start gateway
+        working-directory: gateway
+        run: |
+          set -euo pipefail
+          DELAMAIN_AUTH_TOKEN=test-token DELAMAIN_AUTH_TOKENS=mcp-test-token \
+            nohup uv run python main.py --jadx localhost:28650 --port 8651 \
+            > "$RUNNER_TEMP/gateway.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/gateway.pid"
+
+      - name: Wait for gateway health
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8651/health | grep -q '"status":"healthy"'; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8651/health
+
+      - name: Run gateway/tests/integration against the live Java backend
+        working-directory: gateway
+        env:
+          JADX_LIVE_HOST: 127.0.0.1
+          JADX_LIVE_PORT: '28650'
+          JADX_LIVE_TOKEN: test-token
+        run: uv run pytest tests/integration -q
+
+      - name: Run repo-root tests/ against the live backend + gateway
+        env:
+          JADX_JAVA_URL: http://localhost:28650
+          GATEWAY_URL: http://localhost:8651
+          JADX_AUTH_TOKEN: test-token
+          MCP_AUTH_TOKEN: mcp-test-token
+          # UnCrackable-Level2's real classes/methods — the suite's built-in
+          # com.example.app.* defaults don't exist in any real APK.
+          TEST_MAIN_CLASS: sg.vantagepoint.uncrackable2.MainActivity
+          TEST_SIMPLE_CLASS: sg.vantagepoint.uncrackable2.CodeCheck
+          TEST_METHOD: onCreate
+          TEST_PACKAGE: sg.vantagepoint.uncrackable2
+        run: uv run --project gateway pytest tests/ -q
+
+      - name: Show backend/gateway logs on failure
+        if: failure()
+        run: |
+          echo "::group::java-backend.log"; cat "$RUNNER_TEMP/java-backend.log" || true; echo "::endgroup::"
+          echo "::group::gateway.log"; cat "$RUNNER_TEMP/gateway.log" || true; echo "::endgroup::"
+
+      - name: Stop backend + gateway
+        if: always()
+        run: |
+          [ -f "$RUNNER_TEMP/gateway.pid" ] && kill "$(cat "$RUNNER_TEMP/gateway.pid")" 2>/dev/null || true
+          [ -f "$RUNNER_TEMP/java-backend.pid" ] && kill "$(cat "$RUNNER_TEMP/java-backend.pid")" 2>/dev/null || true
 
   image:
     name: Build fused Docker image (amd64, no push)
