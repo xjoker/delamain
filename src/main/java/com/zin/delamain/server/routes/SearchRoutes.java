@@ -9,6 +9,7 @@ import com.zin.delamain.index.shard.TermLookupResult;
 import com.zin.delamain.server.AuthConfig;
 import com.zin.delamain.utils.ClassCacheManager;
 import com.zin.delamain.utils.CodeSearchCoordinator;
+import com.zin.delamain.utils.DeadlineRegex;
 import com.zin.delamain.utils.JadxApiAdapter;
 import com.zin.delamain.utils.JadxSearchLock;
 import com.zin.delamain.utils.PaginationUtils;
@@ -129,6 +130,14 @@ public class SearchRoutes {
             return t;
         });
 
+    // F9: match_mode=regex compiles a user-supplied pattern. A crafted pattern (e.g.
+    // (a+)+$) matched against a non-matching string can backtrack catastrophically inside a
+    // single Matcher.find() call — that call has no interruption point of its own, so the
+    // per-class/per-batch deadline checks scattered around this file (which only run BETWEEN
+    // classes) cannot stop it once it starts. Guarded by the shared
+    // com.zin.delamain.utils.DeadlineRegex (formerly duplicated identically here and in
+    // AnalysisRoutes.java).
+
     public enum SearchLocation {
         CLASS_NAME, METHOD_NAME, FIELD_NAME, CODE, COMMENT
     }
@@ -210,6 +219,11 @@ public class SearchRoutes {
         // substring while the response still echoed match_mode=regex (dishonest result).
         Pattern regexPattern = null;
         if (matchMode == MatchMode.REGEX) {
+            if (searchTerm.length() > DeadlineRegex.MAX_USER_REGEX_LENGTH) {
+                ctx.status(400).json(Map.of("error",
+                    "Regex pattern too long (max " + DeadlineRegex.MAX_USER_REGEX_LENGTH + " chars)."));
+                return;
+            }
             try {
                 regexPattern = Pattern.compile(searchTerm, Pattern.CASE_INSENSITIVE);
             } catch (java.util.regex.PatternSyntaxException e) {
@@ -285,6 +299,11 @@ public class SearchRoutes {
 
         Pattern regexPattern = null;
         if (matchMode == MatchMode.REGEX) {
+            if (searchTerm.length() > DeadlineRegex.MAX_USER_REGEX_LENGTH) {
+                ctx.status(400).json(Map.of("error",
+                    "Regex pattern too long (max " + DeadlineRegex.MAX_USER_REGEX_LENGTH + " chars)."));
+                return;
+            }
             try {
                 regexPattern = Pattern.compile(searchTerm, Pattern.CASE_INSENSITIVE);
             } catch (java.util.regex.PatternSyntaxException e) {
@@ -1260,7 +1279,7 @@ public class SearchRoutes {
         switch (mode) {
             case EXACT:    return candidate.equalsIgnoreCase(term);
             case PREFIX:   return candidate.toLowerCase().startsWith(term.toLowerCase());
-            case REGEX:    return compiledRegex != null && compiledRegex.matcher(candidate).find();
+            case REGEX:    return compiledRegex != null && DeadlineRegex.matchesWithDeadline(compiledRegex, candidate);
             case SUBSTRING:
             default:       return candidate.toLowerCase().contains(term.toLowerCase());
         }
@@ -1413,7 +1432,7 @@ public class SearchRoutes {
             if (normalizedCode == null) return false;
             if (locations.contains(SearchLocation.CODE)) {
                 boolean codeMatched = (matchMode == MatchMode.REGEX && compiledRegex != null)
-                    ? compiledRegex.matcher(normalizedCode).find()
+                    ? DeadlineRegex.matchesWithDeadline(compiledRegex, normalizedCode)
                     : normalizedCode.contains(term);
                 if (codeMatched) return true;
             }

@@ -36,14 +36,30 @@ public final class JadxSearchLock {
     static {
         // maybeSoftInterrupt() only fires when a NEW request calls tryAcquire() — a holder that
         // hangs with nobody else contending the lock would never get reclaimed. This background
-        // poll enforces LOCK_TIMEOUT_SECONDS unconditionally by calling forceRelease(), which was
-        // previously defined but never invoked from anywhere (dead code).
+        // poll enforces LOCK_TIMEOUT_SECONDS unconditionally.
+        //
+        // This used to call forceRelease() here, which unlocks via StampedLock#tryUnlockWrite() —
+        // an API that does not check which thread actually holds the lock. Stealing the lock out
+        // from under a holder that is still running (e.g. RenameStorage.renameClass mutating a
+        // JADX ClassNode; that code does not check Thread.interrupted(), so an interrupt alone
+        // does not stop it) let a second thread acquire the write lock and mutate the same node
+        // concurrently with the still-running original holder: a data race, not a recovery. See
+        // checkAndInterruptStaleHolder().
         WATCHDOG.scheduleWithFixedDelay(
-            JadxSearchLock::checkAndForceReleaseIfStale, WATCHDOG_POLL_SECONDS, WATCHDOG_POLL_SECONDS,
+            JadxSearchLock::checkAndInterruptStaleHolder, WATCHDOG_POLL_SECONDS, WATCHDOG_POLL_SECONDS,
             TimeUnit.SECONDS);
     }
 
-    private static void checkAndForceReleaseIfStale() {
+    /**
+     * Fires every {@code WATCHDOG_POLL_SECONDS} once a write lock has been held past {@code
+     * LOCK_TIMEOUT_SECONDS}. Interrupts the holder (best-effort cooperative signal) and logs at
+     * ERROR every poll interval so a stuck holder stays loud in production — but it never touches
+     * the lock itself. The holder remains the sole writer until it calls {@link #release()} on its
+     * own; a write lock wedged forever behind a holder that ignores its interrupt is a visible,
+     * alertable availability problem, which is a strictly better failure mode than the silent data
+     * race the old forceRelease() call risked.
+     */
+    static void checkAndInterruptStaleHolder() {
         try {
             long acquireTime = lockAcquireTime.get();
             if (acquireTime == 0 || !STAMPED_LOCK.isWriteLocked()) {
@@ -53,8 +69,15 @@ public final class JadxSearchLock {
             if (heldSeconds > LOCK_TIMEOUT_SECONDS) {
                 Thread staleThread = holdingThread.get();
                 String holder = staleThread != null ? staleThread.getName() : "unknown";
-                forceRelease("watchdog: write lock held " + heldSeconds + "s (timeout "
-                    + LOCK_TIMEOUT_SECONDS + "s), holder=[" + holder + "]");
+                logger.error("[JAI] Write lock held {}s past the {}s timeout, holder=[{}]. NOT "
+                    + "force-releasing it — stealing the lock while the holder may still be "
+                    + "running would race with it. Interrupting the holder as a best-effort signal; "
+                    + "if this repeats every {}s the holder is ignoring interrupts and needs a real "
+                    + "fix, not a stolen lock.",
+                    heldSeconds, LOCK_TIMEOUT_SECONDS, holder, WATCHDOG_POLL_SECONDS);
+                if (staleThread != null) {
+                    staleThread.interrupt();
+                }
             }
         } catch (Exception e) {
             logger.error("[JAI] JadxSearchLock watchdog check failed", e);
@@ -101,11 +124,26 @@ public final class JadxSearchLock {
             try {
                 STAMPED_LOCK.unlockWrite(stamp);
             } catch (IllegalMonitorStateException e) {
-                logger.debug("release(): stamp no longer valid (already force-released)");
+                // This means the lock's mutual exclusion was already broken before this call: the
+                // stamp this thread acquired is no longer valid, i.e. something else already
+                // released or re-acquired the write lock out from under it (only forceRelease() can
+                // do that, and it is no longer called automatically — see checkAndInterruptStaleHolder()).
+                // A broken mutual-exclusion invariant must be visible, not swallowed at debug.
+                logger.error("[JAI] release(): write lock stamp no longer valid — mutual exclusion "
+                    + "was broken before this release() call (most likely a forceRelease() elsewhere "
+                    + "while this thread still held the lock). This must be investigated.");
             }
         }
     }
 
+    /**
+     * Unconditionally releases the write lock via {@link StampedLock#tryUnlockWrite()}, which does
+     * NOT check which thread currently holds it. No longer called automatically by the watchdog
+     * (see {@link #checkAndInterruptStaleHolder()}) — stealing the lock from a holder that may
+     * still be running races with it. Kept as a manual/test-only escape hatch (e.g. test cleanup
+     * after a failed assertion leaves the static lock held); any caller must accept that using it
+     * while the current holder is still active breaks mutual exclusion.
+     */
     public static void forceRelease(String reason) {
         long heldSeconds = getLockHeldSeconds();
         logger.warn("[JAI] Force-releasing write lock (held {}s): {}", heldSeconds, reason);

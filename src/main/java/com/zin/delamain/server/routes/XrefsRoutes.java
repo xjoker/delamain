@@ -277,7 +277,19 @@ public class XrefsRoutes {
     private static final TicketRegistry<Map<String, Object>> XREF_TICKETS = new TicketRegistry<>(600);
     private static final int XREF_CACHE_WAIT_TIMEOUT_SECONDS = 60;
     private static final int MAX_BATCH_SIZE = 10;
+    // Async batch budget: proportional to target count (each may fall back to a full live
+    // decompile), capped so a MAX_BATCH_SIZE request still cannot occupy an xrefExecutor worker
+    // (a fixed 2-thread pool) forever. See the /submit-xref batch branch above for why this
+    // path — unlike the fast-path/sync endpoints — does not need to fit one HTTP response, but
+    // still cannot be Deadline.none().
+    private static final long ASYNC_BATCH_PER_TARGET_BUDGET_MILLIS = LIVE_DEADLINE_MILLIS;
+    private static final long ASYNC_BATCH_DEADLINE_CEILING_MILLIS = 5 * 60 * 1000L;
     private final ExecutorService xrefExecutor;
+
+    private static long asyncBatchDeadlineMillis(int targetCount) {
+        return Math.min(ASYNC_BATCH_DEADLINE_CEILING_MILLIS,
+            Math.max(1, targetCount) * ASYNC_BATCH_PER_TARGET_BUDGET_MILLIS);
+    }
 
     public XrefsRoutes(HeadlessJadxWrapper wrapper, PaginationUtils paginationUtils) {
         this(wrapper, paginationUtils, newXrefExecutor());
@@ -1045,9 +1057,15 @@ public class XrefsRoutes {
                     throw new IllegalStateException("Timed out waiting for the decompile lock");
                 }
                 try {
-                    // No deadline on the async ticket path — see the class-target case in
-                    // computeSingleXref for why.
-                    Map<String, Object> result = computeBatchXrefs(targets, Deadline.none());
+                    // Not on a request thread, so this does not need to fit inside one HTTP
+                    // response the way the sync/fast-path deadlines do — but it is not unbounded
+                    // either: xrefExecutor is a fixed 2-thread pool (see the class javadoc), and
+                    // every target here may fall back to a full live decompile with no bound of
+                    // its own. An unbudgeted batch of MAX_BATCH_SIZE targets can occupy both
+                    // workers indefinitely and starve every other /submit-xref caller behind it.
+                    // Budget proportionally to the target count (capped) and let the ticket come
+                    // back partial instead.
+                    Map<String, Object> result = computeBatchXrefs(targets, Deadline.in(asyncBatchDeadlineMillis(targets.length)));
                     result.put("kind", "batch");
                     return result;
                 } finally {
@@ -1085,9 +1103,15 @@ public class XrefsRoutes {
         // Fast-path short-circuit: if the target's precomputed index is ready, compute inline
         // (bounded, no caller decompile) and return status=done immediately — no reason to make
         // the caller round-trip through a poll for a lookup that's already effectively instant.
+        // This branch runs on the calling Javalin request thread (isXrefFastPathLikely is only a
+        // *prediction* — coversAllReferrers can still force the live-decompile fallback inside
+        // computeSingleXref, see computeClassXrefs), so it must carry the same bounded live-path
+        // deadline as the sync endpoints, not Deadline.none(). Deadline.none() is only safe for the
+        // submitAsync callback below, which runs on the xrefExecutor background pool.
         if (isXrefFastPathLikely(type, includeSnippet) && JadxSearchLock.tryAcquireRead()) {
             try {
-                Map<String, Object> result = computeSingleXref(type, className, memberName, includeSnippet, contextLines);
+                Map<String, Object> result = computeSingleXref(
+                    type, className, memberName, includeSnippet, contextLines, Deadline.in(LIVE_DEADLINE_MILLIS));
                 String ticket = XREF_TICKETS.register(CompletableFuture.completedFuture(result));
                 ctx.json(Map.of("ticket", ticket, "status", "done", "retry_after_seconds", 0));
                 return;
@@ -1103,7 +1127,10 @@ public class XrefsRoutes {
                 throw new IllegalStateException("Timed out waiting for the decompile lock");
             }
             try {
-                return computeSingleXref(type, className, memberName, includeSnippet, contextLines);
+                // No deadline here: this runs on the xrefExecutor background pool, not a request
+                // thread, and holds the read lock only for the duration of this background task —
+                // it does not block an HTTP response the way the fast-path branch above would.
+                return computeSingleXref(type, className, memberName, includeSnippet, contextLines, Deadline.none());
             } finally {
                 JadxSearchLock.releaseRead();
             }
@@ -1280,9 +1307,16 @@ public class XrefsRoutes {
      * decompile read lock is already held by the caller (mirrors computeClassXrefs /
      * computeMethodXrefs above). Throws {@link XrefLookupException} when the class/method/field
      * can't be resolved, which {@link #handleXrefStatus} surfaces as a 404 poll result.
+     *
+     * <p>{@code deadline} is caller-supplied rather than hardcoded: {@link #handleSubmitXref}'s
+     * inline fast-path branch runs this on the request thread and must pass a bounded
+     * {@code Deadline.in(LIVE_DEADLINE_MILLIS)} (its "fast path" prediction can still fall through
+     * to a full live decompile inside {@link #computeClassXrefs}); only the background-pool
+     * ticket path may pass {@code Deadline.none()}.</p>
      */
-    private Map<String, Object> computeSingleXref(
-            String type, String className, String memberName, boolean includeSnippet, int contextLines) {
+    Map<String, Object> computeSingleXref(
+            String type, String className, String memberName, boolean includeSnippet, int contextLines,
+            Deadline deadline) {
         JavaClass targetClass = findClassByNameCore(className);
         if (targetClass == null) {
             throw new XrefLookupException("Class " + className + " not found.");
@@ -1290,13 +1324,9 @@ public class XrefsRoutes {
 
         Map<String, Object> payload = new HashMap<>();
         payload.put("kind", "single");
-        Deadline deadline = Deadline.none();
 
         switch (type) {
             case "class": {
-                // No deadline on the async ticket path — it is not on a request thread and holds
-                // no read lock across HTTP responses, so the production-incident constraint the
-                // live-path deadline exists for does not apply here.
                 XrefComputeResult computed = computeClassXrefs(targetClass, includeSnippet, contextLines, deadline);
                 if (includeSnippet) {
                     attachSnippets(snippetWindow(computed.references, 0, ASYNC_SNIPPET_CAP), contextLines);

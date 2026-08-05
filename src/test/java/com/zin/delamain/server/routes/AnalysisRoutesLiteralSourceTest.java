@@ -1,5 +1,7 @@
 package com.zin.delamain.server.routes;
 
+import com.zin.delamain.utils.DeadlineRegex;
+
 import jadx.api.JadxArgs;
 import jadx.api.JadxDecompiler;
 import jadx.api.JavaClass;
@@ -9,6 +11,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -68,5 +71,26 @@ class AnalysisRoutesLiteralSourceTest {
 
         assertFalse((Boolean) metadata.get("partial_results"));
         assertEquals("FULL SCAN: all 10 classes scanned.", metadata.get("coverage_note"));
+    }
+
+    /**
+     * F5 (5) regression: search-string-literals?regex=true matches a user pattern against each
+     * extracted string literal via Matcher.find(), which has no interruption point of its own —
+     * see SearchRoutesRegexDeadlineTest for the full rationale. F9: the guard now lives in the
+     * shared {@link DeadlineRegex} (formerly duplicated identically on this class and SearchRoutes).
+     */
+    @Test
+    void matchesWithDeadline_boundsACatastrophicallyBacktrackingRegex() {
+        Pattern evil = Pattern.compile("(a+)+$");
+        String longNonMatching = "a".repeat(40) + "!";
+
+        long startNanos = System.nanoTime();
+        boolean matched = DeadlineRegex.matchesWithDeadline(evil, longNonMatching);
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+
+        assertFalse(matched);
+        assertTrue(elapsedMs < 5000,
+            "a catastrophically backtracking regex must be bounded, not run unbounded — took "
+                + elapsedMs + "ms");
     }
 }

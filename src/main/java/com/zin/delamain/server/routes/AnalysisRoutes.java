@@ -6,8 +6,10 @@ import com.zin.delamain.index.WarmupManager;
 import com.zin.delamain.server.AuthConfig;
 import com.zin.delamain.utils.ClassCacheManager;
 import com.zin.delamain.utils.JadxApiAdapter;
+import com.zin.delamain.utils.DeadlineRegex;
 import com.zin.delamain.utils.JadxSearchLock;
 import com.zin.delamain.utils.ManifestInfoService;
+import com.zin.delamain.utils.SafeXml;
 
 import io.javalin.Javalin;
 import io.javalin.http.Context;
@@ -28,9 +30,7 @@ import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 import org.xml.sax.InputSource;
 
-import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.StringReader;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
@@ -51,6 +51,12 @@ public class AnalysisRoutes {
     );
     static int LITERAL_SCAN_MAX_CLASSES = DEFAULT_LITERAL_SCAN_MAX_CLASSES;
     static int LITERAL_SCAN_TIMEOUT_SECONDS = DEFAULT_LITERAL_SCAN_TIMEOUT_SECONDS;
+
+    // F9: user-supplied regex (search-string-literals?regex=true) is matched via Matcher.find()
+    // with no interruption point, so a catastrophically backtracking pattern can pin this thread
+    // regardless of the class-loop deadline (LITERAL_SCAN_TIMEOUT_SECONDS) around it. Guarded by
+    // the shared com.zin.delamain.utils.DeadlineRegex (formerly duplicated identically here and in
+    // SearchRoutes.java).
 
     /** Known DANGEROUS-level Android permissions. */
     private static final Set<String> DANGEROUS_PERMISSIONS = new HashSet<>(Arrays.asList(
@@ -447,6 +453,11 @@ public class AnalysisRoutes {
             Pattern userRegex = null;
             String userSubstring = null;
             if (useRegex) {
+                if (pattern.length() > DeadlineRegex.MAX_USER_REGEX_LENGTH) {
+                    ctx.status(400).json(Map.of("error",
+                        "Regex pattern too long (max " + DeadlineRegex.MAX_USER_REGEX_LENGTH + " chars)."));
+                    return;
+                }
                 try {
                     userRegex = Pattern.compile(pattern);
                 } catch (Exception e) {
@@ -528,7 +539,7 @@ public class AnalysisRoutes {
                     String literal = litMatcher.group(1);
                     boolean matches;
                     if (useRegex) {
-                        matches = userRegex.matcher(literal).find();
+                        matches = DeadlineRegex.matchesWithDeadline(userRegex, literal);
                     } else {
                         matches = literal.toLowerCase(Locale.ROOT).contains(userSubstring);
                     }
@@ -908,16 +919,7 @@ public class AnalysisRoutes {
 
     private Document parseXml(String xmlContent) {
         try {
-            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-            factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
-            factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
-            factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
-            factory.setNamespaceAware(true);
-            factory.setXIncludeAware(false);
-            factory.setExpandEntityReferences(false);
-            DocumentBuilder builder = factory.newDocumentBuilder();
+            DocumentBuilder builder = SafeXml.newSecureDocumentBuilder();
             try (StringReader reader = new StringReader(xmlContent)) {
                 return builder.parse(new InputSource(reader));
             }

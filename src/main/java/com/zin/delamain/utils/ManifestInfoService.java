@@ -13,9 +13,7 @@ import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 import org.xml.sax.InputSource;
 
-import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -200,17 +198,7 @@ public final class ManifestInfoService {
     }
 
     private Document parseXml(String xmlContent) throws Exception {
-        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-        factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-        factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
-        factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
-        factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
-        factory.setNamespaceAware(true);
-        factory.setXIncludeAware(false);
-        factory.setExpandEntityReferences(false);
-
-        DocumentBuilder builder = factory.newDocumentBuilder();
+        DocumentBuilder builder = SafeXml.newSecureDocumentBuilder();
         try (StringReader reader = new StringReader(xmlContent)) {
             InputSource source = new InputSource(reader);
             return builder.parse(source);

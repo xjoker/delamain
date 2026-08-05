@@ -17,7 +17,6 @@ import org.w3c.dom.Element;
 import org.xml.sax.InputSource;
 
 import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.InputStream;
 import java.io.StringReader;
 import java.util.ArrayList;
@@ -33,6 +32,7 @@ import com.zin.delamain.utils.ManifestInfoService;
 import com.zin.delamain.utils.NotApplicableResponse;
 import com.zin.delamain.utils.PaginationUtils;
 import com.zin.delamain.utils.PaginationUtils.PaginationException;
+import com.zin.delamain.utils.SafeXml;
 import com.zin.delamain.utils.SmartChunker;
 
 public class ResourceRoutes {
@@ -1139,13 +1139,22 @@ public class ResourceRoutes {
         }
     }
 
-    private Map<String, String> parseStringsXml(String xmlContent) {
+    /**
+     * F9: hardened via the shared {@code com.zin.delamain.utils.SafeXml} factory (formerly
+     * duplicated identically here, in {@code ManifestInfoService.parseXml} and in {@code
+     * AnalysisRoutes.parseXml}). {@code load-external-dtd=false} alone only blocks an
+     * externally-referenced DTD subset — a crafted strings.xml can still declare its own INTERNAL
+     * DTD subset with {@code <!ENTITY x SYSTEM "file:///...">}, which is governed by
+     * {@code external-general-entities}/{@code external-parameter-entities}, not that feature.
+     * {@code disallow-doctype-decl=true} is the strictest of the four and alone would already
+     * reject any DOCTYPE (including this attack's entity declaration); kept alongside the others
+     * as belt-and-suspenders.
+     */
+    Map<String, String> parseStringsXml(String xmlContent) {
         Map<String, String> strings = new HashMap<>();
         if (xmlContent == null || xmlContent.isEmpty()) return strings;
         try {
-            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
-            DocumentBuilder builder = factory.newDocumentBuilder();
+            DocumentBuilder builder = SafeXml.newSecureDocumentBuilder();
             Document doc = builder.parse(new InputSource(new StringReader(xmlContent)));
             var stringNodes = doc.getElementsByTagName("string");
             for (int i = 0; i < stringNodes.getLength(); i++) {
