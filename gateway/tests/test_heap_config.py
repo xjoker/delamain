@@ -11,7 +11,6 @@ These tests pin the arithmetic and the JAVA_OPTS override contract; they are pur
 over injected paths/values, so no container or JVM is needed.
 """
 
-import pytest
 
 from src import heap_config
 

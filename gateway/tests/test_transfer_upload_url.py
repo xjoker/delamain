@@ -5,7 +5,6 @@ Covers src.tools.transfer_tools.resolve_upload_base priority:
   env (JADX_TRANSFER_PUBLIC_URL) > toml ([server] transfer_public_url) > instance host:port.
 """
 
-import pytest
 
 from src.tools.transfer_tools import resolve_upload_base
 
