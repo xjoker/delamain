@@ -12,8 +12,10 @@ actually runs on. Two wrong answers we explicitly reject:
 
 So: read the container's own memory limit, subtract a reserve for the Python gateway + OS +
 JVM non-heap (metaspace, code cache, thread stacks, and the mmap'd shard index, which wants
-page cache and lives OUTSIDE the heap), and cap the result — past ~10 GB extra heap does not
-make jadx faster, it just gives G1 more room to hoard RSS.
+page cache and lives OUTSIDE the heap), and cap the result — the cap is a last-resort guard against a misdetected/uncontained host
+limit ballooning the heap (see DEFAULT_MAX_MB), not a claim that more heap never helps: a
+255 599-class / 1 085 389-method APK has been measured needing ~20 GB just to get through
+Phase-1 (see WarmupManager.estimateRequiredHeapMB in the Java backend).
 
 Run as ``python3 -m src.heap_config`` (from /app/gateway); it prints the flags to prepend to
 JAVA_OPTS, or nothing at all when the operator already decided or detection failed.
@@ -27,8 +29,17 @@ DEFAULT_PERCENT = int(os.environ.get("DELAMAIN_HEAP_PERCENT", "60"))
 # Never leave the rest of the container less than this (gateway ~300 MB + JVM non-heap +
 # page cache for the mmap'd shard index + OS).
 DEFAULT_RESERVE_MB = int(os.environ.get("DELAMAIN_HEAP_RESERVE_MB", "1024"))
-# Above this the heap stops buying throughput and starts costing resident memory.
-DEFAULT_MAX_MB = int(os.environ.get("DELAMAIN_HEAP_MAX_MB", "10240"))
+# Last-resort absolute ceiling — NOT "more heap never helps past here". Its job is to bound a
+# misdetected/uncontained host limit (10.0.5.31 incident: MaxRAMPercentage=60 against an 82 GB
+# HOST, with no container quota set, gave a 49 GB heap that G1 committed and never released).
+# Raised 2026-08 from the original 10 240 MB after real capacity data showed that ceiling was
+# silently starving cold warmup on large APKs: a 255 599-class / 1 085 389-method sample needed
+# ~20 GB just to get through Phase-1 (see WarmupManager.estimateRequiredHeapMB), and any
+# container above ~17 GB used to flatline at the old 10 240 MB regardless of how much memory it
+# actually had. 32 768 MB keeps ~1.5x headroom over that measured need while staying far below
+# the pathological host-fallback number, so a genuinely uncontained deployment still cannot
+# reproduce the 49 GB incident.
+DEFAULT_MAX_MB = int(os.environ.get("DELAMAIN_HEAP_MAX_MB", "32768"))
 # Below this jadx cannot load a mid-size APK at all; better to try and OOM loudly than to
 # start with a heap that guarantees failure.
 DEFAULT_MIN_MB = int(os.environ.get("DELAMAIN_HEAP_MIN_MB", "512"))

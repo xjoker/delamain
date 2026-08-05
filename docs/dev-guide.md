@@ -238,3 +238,8 @@ curl -X POST -H "Authorization: Bearer $DELAMAIN_AUTH_TOKEN" http://localhost:86
 watch -n 5 'curl -s -H "Authorization: Bearer $DELAMAIN_AUTH_TOKEN" \
   http://localhost:8650/cache/warmup-status | python3 -m json.tool'
 ```
+
+If the loaded APK's class count is estimated to need more heap than `-Xmx` currently allows, the
+response carries a `capacity_warning: {classes, estimated_required_mb, available_mb}` field (and
+a matching WARN in the server log) — warmup still runs, just slower than a right-sized heap would
+allow. See `WarmupManager.estimateRequiredHeapMB` / `checkCapacity` for the derivation.

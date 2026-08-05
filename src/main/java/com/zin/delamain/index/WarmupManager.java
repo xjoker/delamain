@@ -132,6 +132,88 @@ public class WarmupManager {
     }
 
     /**
+     * Additional heap consumed per class actively decompiled during Phase-1, beyond the base
+     * class-tree cost in {@link #estimateBaseHeapMB}. Derived from a production sample (2026-08,
+     * 174 MB APK): jadx reports 255 599 classes / 1 085 389 methods; the loaded-but-undecompiled
+     * class tree measured 3 846 MB (~15.4 KB/class — consistent with the ~19-20 KB/class this
+     * class already uses for {@code estimateBaseHeapMB}). Phase-1 then ran on a 240 298-class
+     * warmup target and, still 18% short of completion (82% done, ~197 044 classes actually
+     * decompiled), had already pushed resident heap to 14 612 MB on a 16 384 MB ceiling — and a
+     * full GC at that point recovered essentially nothing (freed_mb = -475, i.e. everything was
+     * live, not garbage). That gives an observed incremental cost of
+     * (14 612 − 3 846) MB / 197 044 classes ≈ 56 KB/class for the decompile-and-retain phase.
+     *
+     * <p>We deliberately round this UP to 64 KB/class rather than using the raw ~56 KB figure.
+     * This coefficient only drives a WARNING (see {@link #estimateRequiredHeapMB} /
+     * {@link #checkCapacity}), never a refusal to run — so the two failure directions are
+     * asymmetric: undercounting means an operator gets no warning and only discovers the
+     * shortfall after an hour of silently decaying throughput (exactly the incident this
+     * constant exists to make visible); overcounting only costs an unnecessary nudge to raise
+     * {@code DELAMAIN_HEAP_MAX_MB} or container memory. Given that asymmetry we bias toward
+     * warning early rather than warning precisely.</p>
+     *
+     * <p>This is a heuristic, not a guarantee: obfuscation density, method count per class, and
+     * jadx's internal caches vary APK to APK (this sample's 1 085 389 methods / 255 599 classes
+     * ≈ 4.25 methods/class is one data point, not a universal constant). Isolated probing of
+     * jadx's own tuning knobs (deobfuscation off, debug-info/comments/resources off, SIMPLE
+     * decompile mode) showed at most an 8% memory reduction on this same sample — this cost is
+     * structural to holding a quarter-million-class tree in heap, not something config flags can
+     * tune away, which is why this is a capacity WARNING rather than an attempt to auto-tune
+     * jadx's own args (see {@link com.zin.delamain.core.HeadlessJadxWrapper}, out of scope here).</p>
+     */
+    static final long PER_CLASS_DECOMPILE_KB = 64L;
+
+    /**
+     * Rough estimate of the total heap (MB) a full warmup needs for {@code classCount} classes:
+     * the base class-tree cost plus the Phase-1 decompile-and-retain growth, both derived from
+     * the production sample documented on {@link #PER_CLASS_DECOMPILE_KB}. Used only to decide
+     * whether {@link #checkCapacity} logs a warning — never to block or refuse a load.
+     */
+    static long estimateRequiredHeapMB(int classCount) {
+        return estimateBaseHeapMB(classCount) + (long) classCount * PER_CLASS_DECOMPILE_KB / 1024L;
+    }
+
+    /**
+     * Compares the estimated heap {@code classCount} will need against {@code maxHeapBytes} and
+     * returns a structured warning (for {@link #getStatus()} / {@code /warmup-status}) when the
+     * estimate exceeds what is available, or {@code null} when it fits. This is advisory only —
+     * the caller must still start warmup; a small/slow machine is a legitimate choice, it just
+     * deserves to know why it will be slow instead of looking stuck. Package-private for direct
+     * testing (see {@code WarmupCapacityWarningTest}).
+     */
+    static Map<String, Object> checkCapacity(int classCount, long maxHeapBytes) {
+        long availableMB = maxHeapBytes / (1024L * 1024L);
+        long requiredMB = estimateRequiredHeapMB(classCount);
+        if (requiredMB <= availableMB) {
+            return null;
+        }
+        logger.warn("[JAI] Capacity warning: {} classes estimated to need ~{}GB heap, current "
+                + "limit is ~{}GB — cold warmup will severely degrade in throughput as the live "
+                + "set fills the heap. Consider setting DELAMAIN_HEAP_MAX_MB or increasing "
+                + "container memory.",
+            classCount, String.format("%.1f", requiredMB / 1024.0), String.format("%.1f", availableMB / 1024.0));
+        Map<String, Object> warning = new java.util.LinkedHashMap<>();
+        warning.put("classes", classCount);
+        warning.put("estimated_required_mb", requiredMB);
+        warning.put("available_mb", availableMB);
+        return warning;
+    }
+
+    // Result of the most recent checkCapacity() call, made once per warmup start() from the
+    // class count known before Phase-1 begins. Null when the estimate fits under the current
+    // heap. Surfaced via getStatus() so gateway/AI callers can see it, not just the WARN log line.
+    private static volatile Map<String, Object> capacityWarning = null;
+
+    /**
+     * Runs {@link #checkCapacity} and updates the state {@link #getStatus()} reports. Extracted
+     * from {@link #start} (package-private) so it is directly testable without a real warmup —
+     * mirrors this class's existing extraction pattern for background-thread bodies.
+     */
+    static void updateCapacityWarning(int classCount, long maxHeapBytes) {
+        capacityWarning = checkCapacity(classCount, maxHeapBytes);
+    }
+
+    /**
      * Pure sizing function (package-private for direct testing — {@link WarmupWorkerSizingTest}
      * pins both the heap and the CPU dimension against real production numbers).
      *
@@ -302,6 +384,10 @@ public class WarmupManager {
                 );
             }
 
+            // Capacity check: known before Phase-1 starts, so a heap shortfall is reported up
+            // front instead of only showing up as an inexplicably slow/stuck warmup later.
+            updateCapacityWarning(allClasses.size(), Runtime.getRuntime().maxMemory());
+
             List<JavaClass> targets = new ArrayList<>();
             int skippedCount = 0;
             for (JavaClass cls : allClasses) {
@@ -395,6 +481,8 @@ public class WarmupManager {
         if (tsReason != null) status.put("trigram_skip_reason", tsReason);
         String upReason = usePlacesSkipReason.get();
         if (upReason != null) status.put("use_places_skip_reason", upReason);
+        Map<String, Object> capWarning = capacityWarning;
+        if (capWarning != null) status.put("capacity_warning", capWarning);
 
         // ---- Cold/hot-start observability: overall progress + ETA + per-capability readiness ----
         // The server serves the moment it is up; warmup opens capabilities progressively. This block

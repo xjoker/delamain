@@ -64,10 +64,34 @@ def test_heap_scales_with_a_small_container():
 
 
 def test_heap_is_capped_so_a_huge_host_does_not_produce_a_huge_heap():
-    """The production bug: 82 GB visible → must NOT yield a ~49 GB heap."""
+    """The production bug: 82 GB visible must still not reproduce the ~49 GB incident heap.
+
+    The absolute cap itself was raised (2026-08, see DEFAULT_MAX_MB) so large REAL containers
+    can clear it for large APKs — but it must still bind well below the naive 60% share, so a
+    misdetected/uncontained 82 GB host does not blow past a sane ceiling.
+    """
     heap = heap_config.compute_heap_mb(82 * 1024**3)
+    naive_percentage_share = 82 * 1024 * 60 // 100  # ~50 GB: what a bare 60% share would give
     assert heap == heap_config.DEFAULT_MAX_MB
-    assert heap < 12 * 1024
+    assert heap < naive_percentage_share
+
+
+def test_heap_scales_past_the_old_10240mb_ceiling_on_a_large_container():
+    """2026-08 incident: a 255 599-class / 1 085 389-method APK measured needing ~20 GB of heap
+    just to get through Phase-1 (see WarmupManager.estimateRequiredHeapMB) — the old flat
+    10 240 MB ceiling silently starved warmup on any container above ~17 GB. A 32 GiB container
+    must now get meaningfully more than that.
+    """
+    heap = heap_config.compute_heap_mb(32 * 1024**3)
+    assert heap > 10240
+    assert heap == 19660  # 32768 MB * 60% — percentage term binds, not the raised absolute cap
+
+
+def test_heap_scales_on_a_24gb_container_too():
+    # Real symptom from the task: a 24 GB container used to flatline at 10240 MB.
+    heap = heap_config.compute_heap_mb(24 * 1024**3)
+    assert heap > 10240
+    assert heap == 14745  # 24576 MB * 60%
 
 
 def test_reserve_wins_over_percentage_on_a_mid_size_container():
