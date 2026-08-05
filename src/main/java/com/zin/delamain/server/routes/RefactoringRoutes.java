@@ -83,7 +83,12 @@ public class RefactoringRoutes {
                 ClassCacheManager.invalidateCode(className);
                 ClassCacheManager.invalidateCode(cls.getFullName());
                 logger.info("Renamed class '{}' to '{}'", oldName, newName);
-                ctx.json(withStorageStatus(Map.of("result", "Renamed Class " + oldName + " to " + newName)));
+                // Rename only changes the JADX display alias, never the class's actual (bytecode)
+                // name, so raw_name is unchanged by this call -- echoed back so the caller keeps the
+                // only identifier Frida/Xposed can use through the rename workflow.
+                ctx.json(withStorageStatus(Map.of(
+                    "result", "Renamed Class " + oldName + " to " + newName,
+                    "raw_name", cls.getRawName())));
                 return;
             }
 
@@ -208,7 +213,12 @@ public class RefactoringRoutes {
                         ClassCacheManager.invalidateCode(className);
                         ClassCacheManager.invalidateCode(cls.getFullName());
                         logger.info("Renamed field '{}' to '{}'", oldName, newFieldName);
-                        ctx.json(withStorageStatus(Map.of("result", "Renamed field " + oldName + " to " + newFieldName)));
+                        // Rename only changes the JADX display alias, never the bytecode names, so
+                        // both raw names are unchanged -- echoed back for the Frida-safe identifiers.
+                        ctx.json(withStorageStatus(Map.of(
+                            "result", "Renamed field " + oldName + " to " + newFieldName,
+                            "raw_class_name", cls.getRawName(),
+                            "raw_field_name", field.getRawName())));
                         return;
                     }
                 }
@@ -629,7 +639,12 @@ public class RefactoringRoutes {
             ClassCacheManager.invalidateCode(className);
             ClassCacheManager.invalidateCode(cls.getFullName());
             logger.info("Renamed method '{}' to '{}'", oldName, newName);
-            ctx.json(withStorageStatus(Map.of("result", "Rename method " + oldName + " to " + newName)));
+            // Rename only changes the JADX display alias, never the bytecode names, so both raw
+            // names are unchanged -- echoed back so the caller keeps the Frida-safe identifiers.
+            ctx.json(withStorageStatus(Map.of(
+                "result", "Rename method " + oldName + " to " + newName,
+                "raw_class_name", cls.getRawName(),
+                "raw_method_name", JadxApiAdapter.getMethodRawName(method))));
         } catch (Exception e) {
             logger.error("Failed to rename method: {}", e.getMessage(), e);
             ctx.status(500).json(Map.of("error", "Failed to rename method: " + e.getMessage()));

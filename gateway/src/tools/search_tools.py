@@ -268,8 +268,10 @@ def register_search_tools(mcp):
                 'process(Ljava/lang/String;I)Z' (optional). Required when multiple
                 overloads exist.
         Returns:
-            dict: {class_name, method_name, raw_method_name, frida_overload,
+            dict: {class_name, raw_class_name, method_name, raw_method_name, frida_overload,
                    start_line, end_line, imports, source}
+            raw_class_name/raw_method_name are the ONLY names Frida/Xposed can target — use
+            those, never class_name/method_name, when building a hook.
             On multiple overloads without method_signature: returns HTTP 300 with
             available_descriptors list (same behaviour as get_method_by_name).
             start_line/end_line are -1 when line info is unavailable (class not
@@ -365,7 +367,10 @@ def register_search_tools(mcp):
             search_in: 'class,method,field' (default) | 'code' | 'comment' | any combination.
             match_mode: substring (default)|exact|prefix|regex. count: Max results (default 20).
         Returns:
-            dict: {classes: [...], total: int, has_more: bool}
+            dict: {classes: [{name, raw_name}], total: int, has_more: bool}. raw_name is the
+            ONLY name Frida/Xposed/any external tool can target — it is the class's real name as
+            compiled into the APK. name is deobfuscated for readability only; never pass it to a
+            hook generator or external tool.
         """
         return await search_classes_by_keyword(
             search_term, package, exclude, search_in, offset, count,
@@ -394,6 +399,9 @@ def register_search_tools(mcp):
         method_name: str,
     ) -> dict:
         """Get methods called by the specified method (pattern-based callee analysis).
+
+        Every callee entry (resolved and unresolved) carries raw_class_name/raw_method_name —
+        the ONLY names Frida/Xposed can target. class_name/method_name are for reading only.
 
         Args:
             class_name: Fully qualified class name. method_name: Method name.

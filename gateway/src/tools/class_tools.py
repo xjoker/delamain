@@ -275,9 +275,10 @@ def register_class_tools(mcp):
             offset: Index into class_names to resume from (0=first page; use next_offset from a
             prior response to continue). force: Bypass the pre-flight size guard.
         Returns:
-            dict: {classes: [{name, found, content|error}], total, returned, offset, found,
-            has_more, next_offset?} or BATCH_TOO_LARGE error with suggestions. _ai_instruction is
-            set when has_more=true, telling you the next offset to call.
+            dict: {classes: [{name, raw_name, found, content|error}], total, returned, offset,
+            found, has_more, next_offset?} or BATCH_TOO_LARGE error with suggestions.
+            raw_name is the ONLY name Frida/Xposed can target for a resolved class; name is for
+            reading only. _ai_instruction is set when has_more=true, telling you the next offset.
         """
         return await _batch_get_class_source(class_names, offset=offset, force=force)
 

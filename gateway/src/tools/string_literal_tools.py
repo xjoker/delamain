@@ -78,7 +78,9 @@ def register_string_literal_tools(mcp):
                              coverage of the target package (default False).
         Returns:
             dict: {
-                results: [{class_name: str, literal: str, line_number: int}],
+                results: [{class_name: str, raw_class_name: str, literal: str, line_number: int}],
+                # raw_class_name is the ONLY name Frida/Xposed can target; class_name is for
+                # reading only.
                 total: int, truncated: bool,
                 scanned_classes: int,  # classes actually searched
                 total_classes: int,    # total classes in APK

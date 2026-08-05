@@ -550,6 +550,7 @@ public class AnalysisRoutes {
 
                     Map<String, Object> entry = new LinkedHashMap<>();
                     entry.put("class_name", fullName);
+                    entry.put("raw_class_name", JadxApiAdapter.getClassRawName(cls));
                     entry.put("literal", literal);
                     entry.put("line_number", lineNum);
                     results.add(entry);
@@ -730,7 +731,7 @@ public class AnalysisRoutes {
             final String rootId = buildMethodId(cls.getFullName(), rootMethod);
 
             try {
-                Map<String, Object> rootNode = buildNodeEntry(cls.getFullName(), rootMethod);
+                Map<String, Object> rootNode = buildNodeEntry(cls, rootMethod);
                 nodes.put(rootId, rootNode);
 
                 Queue<Object[]> queue = new ArrayDeque<>();
@@ -764,7 +765,9 @@ public class AnalysisRoutes {
                             Map<String, Object> nodeEntry = new LinkedHashMap<>();
                             nodeEntry.put("id", toId);
                             nodeEntry.put("class", toClass);
+                            nodeEntry.put("raw_class", callee.getOrDefault("raw_class_name", toClass));
                             nodeEntry.put("method", toMethod);
+                            nodeEntry.put("raw_method", callee.getOrDefault("raw_method_name", toMethod));
                             nodeEntry.put("signature", callee.getOrDefault("short_id", ""));
                             nodes.put(toId, nodeEntry);
 
@@ -828,7 +831,8 @@ public class AnalysisRoutes {
         return clsName + "#" + (shortId != null ? shortId : name + "()");
     }
 
-    private Map<String, Object> buildNodeEntry(String clsName, JavaMethod method) {
+    private Map<String, Object> buildNodeEntry(JavaClass cls, JavaMethod method) {
+        String clsName = cls.getFullName();
         String name = method.getName();
         JadxApiAdapter.MethodInfoSnapshot info = JadxApiAdapter.getMethodInfo(method);
         String shortId = info != null ? info.getShortId() : null;
@@ -836,7 +840,9 @@ public class AnalysisRoutes {
         Map<String, Object> node = new LinkedHashMap<>();
         node.put("id", id);
         node.put("class", clsName);
+        node.put("raw_class", cls.getRawName());
         node.put("method", name);
+        node.put("raw_method", JadxApiAdapter.getMethodRawName(method));
         node.put("signature", shortId != null ? shortId : "");
         return node;
     }
@@ -874,7 +880,12 @@ public class AnalysisRoutes {
                 if (seen.add(key)) {
                     Map<String, Object> entry = new LinkedHashMap<>();
                     entry.put("class_name", calleeClass);
+                    // calledMethodInfo comes from the internal jadx-core layer, which is already raw
+                    // (pre-deobfuscation) -- explicit here so a caller doesn't have to know that
+                    // quirk to find the Frida-safe identifier.
+                    entry.put("raw_class_name", calleeClass);
                     entry.put("method_name", calleeMethod);
+                    entry.put("raw_method_name", calleeMethod);
                     entry.put("short_id", calledMethodInfo.getShortId());
                     out.add(entry);
                 }

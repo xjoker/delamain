@@ -100,8 +100,12 @@ def register_analysis_surface_tools(mcp):
             depth: Traversal depth 1-6 (default 3). Values above 6 are clamped to 6.
             format: "json" (default, nodes+edges dict) or "dot" (Graphviz DOT language string).
         Returns:
-            When format=json: {format, root, depth, nodes:[{id,class,method}], edges:[{from,to}], truncated}
-            When format=dot:  {format, dot:"digraph { ... }"}
+            When format=json: {format, root, depth,
+            nodes:[{id,class,raw_class,method,raw_method}], edges:[{from,to}], truncated}.
+            raw_class/raw_method are the ONLY names Frida/Xposed can target; class/method are
+            for reading only.
+            When format=dot:  {format, dot:"digraph { ... }"} (dot node ids are display names,
+            visualisation only — not meant to feed hook generation).
         """
         if not class_name or not class_name.strip():
             return format_error_response(

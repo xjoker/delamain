@@ -715,6 +715,7 @@ public class MethodRoutes {
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("class_name", cls.getFullName());
+        result.put("raw_class_name", cls.getRawName());
         result.put("method_name", method.getName());
         result.put("raw_method_name", JadxApiAdapter.getMethodRawName(method));
         result.put("frida_overload", fridaOverload);
@@ -962,6 +963,7 @@ public class MethodRoutes {
         Map<String, Object> info = new LinkedHashMap<>();
         if (calleeMethodInfo == null) {
             info.put("class_name", "");
+            info.put("raw_class_name", "");
             info.put("method_name", "");
             info.put("raw_method_name", "");
             info.put("full_name", "");
@@ -974,6 +976,10 @@ public class MethodRoutes {
         String aliasFullName = calleeMethodInfo.getAliasFullName();
         String clsName = calleeMethodInfo.getDeclaringClassName();
         info.put("class_name", clsName);
+        // declaringClassName comes from the internal MethodInfo/ClassInfo layer, which is already
+        // the raw (pre-deobfuscation) name (no alias-declaring-class-name is captured upstream) —
+        // added explicitly so a caller doesn't have to know that quirk to find the Frida-safe name.
+        info.put("raw_class_name", clsName);
         info.put("method_name", calleeMethodInfo.getAliasName() != null
             ? calleeMethodInfo.getAliasName()
             : calleeMethodInfo.getRawName());
@@ -988,7 +994,11 @@ public class MethodRoutes {
 
     private Map<String, Object> buildUnresolvedCalleeInfo(MethodInfo unresolvedMethod) {
         Map<String, Object> info = new LinkedHashMap<>();
-        info.put("class_name", unresolvedMethod.getDeclClass().getFullName());
+        String declClassName = unresolvedMethod.getDeclClass().getFullName();
+        info.put("class_name", declClassName);
+        // ClassInfo#getFullName() is already the raw (pre-deobfuscation) name -- explicit here so
+        // a caller doesn't have to know that to find the Frida-safe identifier.
+        info.put("raw_class_name", declClassName);
         info.put("method_name", unresolvedMethod.getName());
         info.put("raw_method_name", unresolvedMethod.getName());
         info.put("full_name", unresolvedMethod.getFullName());

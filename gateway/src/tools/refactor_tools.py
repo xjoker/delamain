@@ -177,12 +177,18 @@ def register_refactor_tools(mcp):
     ) -> dict:
         """Unified rename for classes, methods, fields, and packages. Triggers 30s cache cooldown.
 
+        This only changes the JADX display alias, never the class/method/field's actual
+        (bytecode) name — the response echoes raw_name/raw_class_name+raw_method_name/
+        raw_class_name+raw_field_name (per target_type) so you keep the one identifier
+        Frida/Xposed can still target after the rename.
+
         Args:
             target_type: class|method|field|package. old_name: Current name. new_name: New name.
             class_name: Required for method/field. method_signature: JVM descriptor for overloads.
             dry_run: Preview without renaming.
         Returns:
-            dict: {success: bool, message: str} or dry_run: {target_exists: bool, target_info: {...}}
+            dict: {result: str, raw_name|raw_class_name+raw_method_name|raw_class_name+
+            raw_field_name} on success, or dry_run: {target_exists: bool, target_info: {...}}
         """
         target_type_lower = target_type.lower()
 

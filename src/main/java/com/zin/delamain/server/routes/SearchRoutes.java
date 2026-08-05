@@ -1501,9 +1501,17 @@ public class SearchRoutes {
         CodeSearchCoordinator.SearchResult result, int offset, int count, MatchMode matchMode
     ) {
         List<String> matches = result.getMatches();
-        List<String> paginatedResults = new ArrayList<>();
+        List<Map<String, Object>> paginatedResults = new ArrayList<>();
         for (int i = offset; i < Math.min(offset + count, matches.size()); i++) {
-            paginatedResults.add(matches.get(i));
+            String fullName = matches.get(i);
+            Map<String, Object> entry = new HashMap<>();
+            entry.put("name", fullName);
+            // Frida/Xposed can only target the original (pre-deobfuscation) class name — see
+            // JadxApiAdapter's raw-name contract. Resolved here (rather than carried on
+            // CodeSearchCoordinator.SearchResult, which stays display-name-only for its existing
+            // unit test surface) so only this response-serialisation layer changes.
+            entry.put("raw_name", resolveRawClassName(fullName));
+            paginatedResults.add(entry);
         }
 
         Map<String, Object> response = new HashMap<>();
@@ -1524,6 +1532,36 @@ public class SearchRoutes {
         // (possibly stale/async-polled) request's own state — see ApkIdentity for the contract.
         response.put("apk_identity", com.zin.delamain.core.ApkIdentity.build(wrapper));
         return response;
+    }
+
+    /**
+     * Resolves the raw (pre-deobfuscation) name for a matched class's display full name, for the
+     * Frida/Xposed-safety contract on search responses. Mirrors {@code ClassRoutes.findClassByName}:
+     * cache lookup first, falling back to an O(N) scan only over the classes actually being
+     * returned on this page (bounded by {@code count}, never the whole corpus).
+     */
+    private String resolveRawClassName(String fullName) {
+        try {
+            ClassCacheManager.CacheStatus status = ClassCacheManager.getStatus();
+            if (status == ClassCacheManager.CacheStatus.NOT_INITIALIZED) {
+                ClassCacheManager.initCache(wrapper);
+                status = ClassCacheManager.getStatus();
+            }
+            if (status == ClassCacheManager.CacheStatus.READY) {
+                JavaClass cached = ClassCacheManager.findClass(ClassCacheManager.getCache(), fullName);
+                if (cached != null) {
+                    return JadxApiAdapter.getClassRawName(cached);
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("Failed to resolve raw name for '{}': {}", fullName, e.getMessage());
+        }
+        for (JavaClass cls : wrapper.getClassesWithInners()) {
+            if (fullName.equals(cls.getFullName())) {
+                return JadxApiAdapter.getClassRawName(cls);
+            }
+        }
+        return null;
     }
 
     /**

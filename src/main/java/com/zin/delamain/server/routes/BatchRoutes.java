@@ -166,6 +166,13 @@ public class BatchRoutes {
                 String trimmedName = className.trim();
                 Map<String, Object> classResult = new HashMap<>();
                 classResult.put("name", trimmedName);
+                // Frida/Xposed can only target the original (pre-deobfuscation) class name; surface
+                // it whenever the requested name resolved to a real class (see JadxApiAdapter's
+                // raw-name contract).
+                JavaClass resolvedForRawName = resolvedClasses.get(trimmedName);
+                if (resolvedForRawName != null) {
+                    classResult.put("raw_name", JadxApiAdapter.getClassRawName(resolvedForRawName));
+                }
 
                 if (cachedResults.containsKey(trimmedName)) {
                     classResult.put("found", true);
