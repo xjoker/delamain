@@ -8,7 +8,7 @@ from a memory-constrained host.
 
 ```mermaid
 flowchart TD
-    A["AI client (MCP)"] -->|"MCP protocol (stdio locally,<br/>Streamable HTTP for the fused container)"| B
+    A["AI client (MCP)"] -->|"MCP protocol (Streamable HTTP)"| B
     B["Python gateway — FastMCP, port 8651<br/>(gateway/)"] -->|"proxies MCP calls + the two out-of-band<br/>transfer endpoints · HTTP, loopback only"| C
     C["Java backend — Javalin, port 8650<br/>(src/main/java/com/zin/delamain)"] -->|"direct calls, no plugin/GUI layer"| D
     D["jadx headless API<br/>(JadxDecompiler, via HeadlessJadxWrapper)"]

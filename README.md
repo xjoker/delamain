@@ -118,7 +118,7 @@ curl -s http://127.0.0.1:8651/health
 ```
 
 Point your MCP client at `http://<host>:8651/mcp` with the bearer token above.
-Then `load_file` an APK from the mounted directory (or push one via the
+Then `load_file_tool` an APK from the mounted directory (or push one via the
 [out-of-band upload flow](docs/file-upload.md)) and start analyzing.
 
 For building from source and the developer workflow, see

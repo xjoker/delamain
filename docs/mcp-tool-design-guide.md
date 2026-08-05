@@ -250,7 +250,7 @@ shrink the batch or read in chunks.
 verb_noun → get_class_source, search_classes_by_keyword
 submit_verb → submit_security_scan, submit_code_search (async submission)
 get_verb_result → get_task_result, get_code_search_result (polling)
-list_noun → list_packages, list_available_files
+list_noun → list_packages, list_available_files_tool
 ```
 
 Verb choice:

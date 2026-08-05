@@ -109,7 +109,7 @@ curl -s http://127.0.0.1:8651/health
 ```
 
 用上面的 bearer token 把你的 MCP 客户端指向 `http://<host>:8651/mcp`。然后
-对挂载目录下的一个 APK 执行 `load_file`（或通过
+对挂载目录下的一个 APK 执行 `load_file_tool`（或通过
 [带外上传流程](docs/file-upload.md)推送一个），即可开始分析。
 
 关于从源码构建以及开发者工作流，见 [`docs/dev-guide.md`](docs/dev-guide.md)。

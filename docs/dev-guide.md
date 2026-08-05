@@ -28,7 +28,7 @@ delamain/
 
 | Component | Version | Notes |
 |---|---|---|
-| Java | 21 | Maven build, Javalin runtime |
+| Java | 25 | Maven build, Javalin runtime |
 | Maven | 3.9+ | builds the JAR |
 | Python | 3.10+ | gateway |
 | uv | latest | Python dependency management |
@@ -52,7 +52,7 @@ mvn install:install-file \
 mvn -DskipTests clean package
 
 # Artifact
-ls target/delamain-*.jar
+ls target/delamain.jar
 ```
 
 ### Upgrading the jadx version
@@ -71,7 +71,7 @@ verify compatibility and commit manually after upgrading.
 ### Running locally
 
 ```bash
-java -jar target/delamain-*.jar \
+java -jar target/delamain.jar \
   --port 8650 \
   --auth-token "$DELAMAIN_AUTH_TOKEN"
 ```
@@ -84,10 +84,9 @@ java -jar target/delamain-*.jar \
 | `DELAMAIN_PORT` | 8650 | Java server listen port |
 | `JADX_FILE_ROOT` | — | Sandbox root for `load_file`/uploads; the fused Compose setup sets this to `/apks` |
 | `DELAMAIN_WARMUP_ON_START` | true | Auto-starts background warmup once the server is up |
-| `DELAMAIN_WARMUP_DECOMPILE_WORKERS` | 8 | Phase 1 parallel decompile worker count |
+| `DELAMAIN_WARMUP_DECOMPILE_WORKERS` | auto (derived from heap & CPU) | Phase 1 parallel decompile worker count |
 | `DELAMAIN_WARMUP_INDEX_WORKERS` | — | Phase 2 (trigram/shard build) worker count |
-| `DELAMAIN_CODE_INDEX_ENABLED` | true | Trigram index on/off |
-| `DELAMAIN_CODE_INDEX_MAX_TRIGRAMS` | 200000 | Trigram cap (OOM guard) |
+| `DELAMAIN_CODE_INDEX_MAX_TRIGRAMS` | 500000 | Trigram cap (OOM guard) |
 | `DELAMAIN_CODE_INDEX_EVICTION_ENABLED` | — | Heap-pressure eviction for the trigram index |
 | `DELAMAIN_INLINE_RESPONSE_MAX_BYTES` | — | Inline response size cap before a tool must fall back to batching/chunking |
 | `DELAMAIN_RELOAD_LOCK_TIMEOUT_SECONDS` | 60 | How long `/load-file` reload waits to acquire the analysis write lock before failing and rolling back to the previously loaded file |
@@ -203,8 +202,8 @@ docker compose up -d
 Call `list_available_files_tool` with an MCP client carrying
 `Authorization: Bearer $DELAMAIN_AUTH_TOKENS`, then call
 `load_file_tool(path="target.apk")`. The path must be relative to `/apks`
-inside the container; that mount is read-only and the service never writes
-into the APK directory.
+inside the container; that mount is read-write — out-of-band uploads land
+on disk there.
 
 ### Checking local Java server status
 
