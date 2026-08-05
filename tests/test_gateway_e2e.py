@@ -62,7 +62,6 @@ class TestMCPProtocol:
         resp = gateway_client.get("/health")
         assert resp.status_code == 200
         assert resp.json()["status"] == "healthy"
-        assert resp.json()["instances"] >= 1
 
 
 # ── Tool Call Chain: Pre-flight ───────────────────────────────────────────────

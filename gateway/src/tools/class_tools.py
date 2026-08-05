@@ -38,11 +38,11 @@ def _attach_referrer_hint(result: dict) -> None:
     result["_ai_instruction"] = f"{existing} {note}" if existing else note
 
 
-async def get_class_source(class_name: str, chunk: int = 0, instance_id: Optional[str] = None) -> dict:
+async def get_class_source(class_name: str, chunk: int = 0) -> dict:
     params = {"class_name": class_name}
     if chunk > 0:
         params["chunk"] = str(chunk)
-    result = await get_from_jadx("class-source", params, instance_id=instance_id)
+    result = await get_from_jadx("class-source", params)
     if chunk == 0 and "error" not in result:
         _attach_empty_source_hint(result)
         _attach_referrer_hint(result)
@@ -53,11 +53,11 @@ def _estimate_batch_size(class_names: list[str]) -> int:
     return len(class_names) * 5000
 
 
-async def _execute_batch_request(class_names: list[str], offset: int, instance_id: Optional[str]) -> dict:
+async def _execute_batch_request(class_names: list[str], offset: int) -> dict:
     params = {"class_names": ",".join(class_names)}
     if offset > 0:
         params["offset"] = str(offset)
-    result = await get_from_jadx("batch-class-source", params, instance_id=instance_id)
+    result = await get_from_jadx("batch-class-source", params)
     if result.get("has_more") and "next_offset" in result:
         next_offset = result["next_offset"]
         returned = result.get("returned", 0)
@@ -73,7 +73,6 @@ async def batch_get_class_source(
     class_names: list[str],
     offset: int = 0,
     force: bool = False,
-    instance_id: Optional[str] = None,
 ) -> dict:
     logger.info(f"batch_get_class_source: classes={class_names}, offset={offset}, force={force}")
     if len(class_names) > 20:
@@ -84,13 +83,13 @@ async def batch_get_class_source(
             "maximum": 20,
         }
     if offset > 0:
-        return await _execute_batch_request(class_names, offset, instance_id)
+        return await _execute_batch_request(class_names, offset)
     estimated_size = _estimate_batch_size(class_names)
     if estimated_size > 50000 and not force:
         class_infos = []
         for class_name in class_names:
             try:
-                info = await get_class_info(class_name, instance_id)
+                info = await get_class_info(class_name)
                 class_infos.append(info)
             except Exception:
                 class_infos.append({"class_name": class_name, "error": "Failed to get info"})
@@ -107,7 +106,7 @@ async def batch_get_class_source(
                 "option4": f"Add force=True to proceed anyway: batch_get_class_source(class_names={class_names[:2]}, force=True)",
             },
         }
-    result = await _execute_batch_request(class_names, offset, instance_id)
+    result = await _execute_batch_request(class_names, offset)
     if estimated_size > 20000:
         result["_performance_warning"] = {
             "estimated_size_kb": round(estimated_size / 1024, 1),
@@ -117,53 +116,53 @@ async def batch_get_class_source(
     return result
 
 
-async def get_all_classes(offset: int = 0, count: int = 0, instance_id: Optional[str] = None) -> dict:
+async def get_all_classes(offset: int = 0, count: int = 0) -> dict:
     return await PaginationUtils.get_paginated_data(
         endpoint="all-classes",
         offset=offset,
         count=count,
         data_extractor=lambda parsed: parsed.get("classes", []),
-        fetch_function=lambda ep, params={}: get_from_jadx(ep, params, instance_id=instance_id),
+        fetch_function=lambda ep, params={}: get_from_jadx(ep, params),
     )
 
 
-async def get_methods_of_class(class_name: str, instance_id: Optional[str] = None) -> dict:
-    return await get_from_jadx("methods-of-class", {"class_name": class_name}, instance_id=instance_id)
+async def get_methods_of_class(class_name: str) -> dict:
+    return await get_from_jadx("methods-of-class", {"class_name": class_name})
 
 
-async def get_fields_of_class(class_name: str, instance_id: Optional[str] = None) -> dict:
-    return await get_from_jadx("fields-of-class", {"class_name": class_name}, instance_id=instance_id)
+async def get_fields_of_class(class_name: str) -> dict:
+    return await get_from_jadx("fields-of-class", {"class_name": class_name})
 
 
-async def get_smali_of_class(class_name: str, chunk: int = 0, instance_id: Optional[str] = None) -> dict:
-    logger.info(f"get_smali_of_class: class={class_name}, chunk={chunk}, instance={instance_id}")
+async def get_smali_of_class(class_name: str, chunk: int = 0) -> dict:
+    logger.info(f"get_smali_of_class: class={class_name}, chunk={chunk}")
     params = {"class_name": class_name}
     if chunk > 0:
         params["chunk"] = str(chunk)
-    result = await get_from_jadx("smali-of-class", params, instance_id=instance_id)
+    result = await get_from_jadx("smali-of-class", params)
     if "error" in result:
         logger.warning(f"get_smali_of_class error: {result.get('error')}")
     return result
 
 
-async def get_main_activity_class(chunk: int = 0, instance_id: Optional[str] = None) -> dict:
+async def get_main_activity_class(chunk: int = 0) -> dict:
     params = {}
     if chunk > 0:
         params["chunk"] = str(chunk)
-    return await get_from_jadx("main-activity", params, instance_id=instance_id)
+    return await get_from_jadx("main-activity", params)
 
 
-async def get_class_info(class_name: str, instance_id: Optional[str] = None) -> dict:
-    logger.info(f"get_class_info: class={class_name}, instance={instance_id}")
-    result = await get_from_jadx("class-info", {"class_name": class_name}, instance_id=instance_id)
+async def get_class_info(class_name: str) -> dict:
+    logger.info(f"get_class_info: class={class_name}")
+    result = await get_from_jadx("class-info", {"class_name": class_name})
     if "error" in result:
         logger.warning(f"get_class_info error: {result.get('error')}")
     return result
 
 
-async def get_decompile_status(instance_id: Optional[str] = None) -> dict:
-    logger.info(f"get_decompile_status: instance={instance_id}")
-    result = await get_from_jadx("decompile-status", instance_id=instance_id)
+async def get_decompile_status() -> dict:
+    logger.info("get_decompile_status")
+    result = await get_from_jadx("decompile-status")
     if "error" in result:
         logger.warning(f"get_decompile_status error: {result.get('error')}")
     elif result.get("status") == "loading":
@@ -177,22 +176,21 @@ async def get_decompile_status(instance_id: Optional[str] = None) -> dict:
     return result
 
 
-async def list_packages(instance_id: Optional[str] = None) -> dict:
-    return await get_from_jadx("package-tree", instance_id=instance_id)
+async def list_packages() -> dict:
+    return await get_from_jadx("package-tree")
 
 
 async def get_code_metadata(
     class_name: str,
     position: Optional[int] = None,
     max: Optional[int] = None,
-    instance_id: Optional[str] = None,
 ) -> dict:
     params = {"class_name": class_name}
     if position is not None:
         params["position"] = str(position)
     if max is not None:
         params["max"] = str(max)
-    return await get_from_jadx("code-metadata", params, instance_id=instance_id)
+    return await get_from_jadx("code-metadata", params)
 
 
 # Module-level references to avoid shadowing inside register
@@ -214,20 +212,19 @@ def register_class_tools(mcp):
 
     @mcp.tool()
     @with_busy_check
-    async def get_all_classes(offset: int = 0, count: int = 0, instance_id: Optional[str] = None) -> dict:
+    async def get_all_classes(offset: int = 0, count: int = 0) -> dict:
         """List all classes in the project with pagination support.
 
         Args:
             offset: Pagination start index. count: Max results (0=all).
-            instance_id: Target JADX instance name.
         Returns:
             dict: {classes: [str, ...], total: int}
         """
-        return await _get_all_classes(offset, count, instance_id=instance_id)
+        return await _get_all_classes(offset, count)
 
     @mcp.tool()
     @with_busy_check
-    async def get_class_source(class_name: str, chunk: int = 0, instance_id: Optional[str] = None) -> dict:
+    async def get_class_source(class_name: str, chunk: int = 0) -> dict:
         """Fetch decompiled Java source of a class. Large classes are auto-chunked (>8KB).
 
         The first chunk (chunk=0) may carry a decompile_quality flag: "ok" (normal),
@@ -252,13 +249,12 @@ def register_class_tools(mcp):
 
         Args:
             class_name: Fully qualified class name. chunk: 0=first, N=continue chunked response.
-            instance_id: Target JADX instance name.
         Returns:
             dict: {response: str, _chunking: {...}, decompile_quality?: str, hint?: str,
             source_status?: str, referrer_count?: int, _ai_instruction?: str} — call again with
             chunk=N if has_more=true.
         """
-        return await _get_class_source(class_name, chunk=chunk, instance_id=instance_id)
+        return await _get_class_source(class_name, chunk=chunk)
 
     @mcp.tool()
     @with_busy_check
@@ -266,7 +262,6 @@ def register_class_tools(mcp):
         class_names: list[str],
         offset: int = 0,
         force: bool = False,
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Fetch 2-20 class sources in one request with auto size-management. Use get_class_source for a single class.
 
@@ -278,79 +273,77 @@ def register_class_tools(mcp):
         Args:
             class_names: List of fully qualified class names (max 20, same list every call).
             offset: Index into class_names to resume from (0=first page; use next_offset from a
-            prior response to continue). force: Bypass the pre-flight size guard. instance_id:
-            Target JADX instance name.
+            prior response to continue). force: Bypass the pre-flight size guard.
         Returns:
             dict: {classes: [{name, found, content|error}], total, returned, offset, found,
             has_more, next_offset?} or BATCH_TOO_LARGE error with suggestions. _ai_instruction is
             set when has_more=true, telling you the next offset to call.
         """
-        return await _batch_get_class_source(class_names, offset=offset, force=force, instance_id=instance_id)
+        return await _batch_get_class_source(class_names, offset=offset, force=force)
 
     @mcp.tool()
     @with_busy_check
-    async def get_methods_of_class(class_name: str, instance_id: Optional[str] = None) -> dict:
+    async def get_methods_of_class(class_name: str) -> dict:
         """List all methods of a class with Frida-friendly metadata (is_static, overload_count, etc.).
 
         Args:
-            class_name: Fully qualified class name. instance_id: Target JADX instance name.
+            class_name: Fully qualified class name.
         Returns:
             dict: {methods: [{name, is_static, is_native, overload_count, return_type, ...}], count}
         """
-        return await _get_methods_of_class(class_name, instance_id=instance_id)
+        return await _get_methods_of_class(class_name)
 
     @mcp.tool()
     @with_busy_check
-    async def get_fields_of_class(class_name: str, instance_id: Optional[str] = None) -> dict:
+    async def get_fields_of_class(class_name: str) -> dict:
         """List all fields of a class with Frida-compatible type information (type_frida).
 
         Args:
-            class_name: Fully qualified class name. instance_id: Target JADX instance name.
+            class_name: Fully qualified class name.
         Returns:
             dict: {fields: [{name, type, type_frida, is_static, is_final, modifiers}], count}
         """
-        return await _get_fields_of_class(class_name, instance_id=instance_id)
+        return await _get_fields_of_class(class_name)
 
     @mcp.tool()
     @with_busy_check
-    async def get_smali_of_class(class_name: str, chunk: int = 0, instance_id: Optional[str] = None) -> dict:
+    async def get_smali_of_class(class_name: str, chunk: int = 0) -> dict:
         """Fetch Dalvik smali bytecode of a class. Auto-chunked for large output (>8KB).
 
         Args:
             class_name: Fully qualified class name (use $ for inner classes). chunk: 0=first, N=continue.
-            instance_id: Target JADX instance name.
         Returns:
             dict: {response: str, _chunking: {...}} — call again with chunk=N if has_more=true.
         """
-        return await _get_smali_of_class(class_name, chunk=chunk, instance_id=instance_id)
+        return await _get_smali_of_class(class_name, chunk=chunk)
 
     @mcp.tool()
     @with_busy_check
-    async def get_main_activity_class(chunk: int = 0, instance_id: Optional[str] = None) -> dict:
+    async def get_main_activity_class(chunk: int = 0) -> dict:
         """Fetch the app entry-point Activity class as defined in AndroidManifest.xml.
 
         Args:
-            chunk: 0=first, N=continue chunked response. instance_id: Target JADX instance name.
+            chunk: 0=first, N=continue chunked response.
         Returns:
             dict: {content: str, _chunking: {...}} — call again with chunk=N if has_more=true.
         """
-        return await _get_main_activity_class(chunk=chunk, instance_id=instance_id)
+        return await _get_main_activity_class(chunk=chunk)
 
     @mcp.tool()
     @with_busy_check
-    async def get_class_info(class_name: str, instance_id: Optional[str] = None) -> dict:
+    async def get_class_info(class_name: str) -> dict:
         """Get structured class metadata: inheritance, interfaces, method/field names, native methods.
 
         Args:
-            class_name: Fully qualified class name. instance_id: Target JADX instance name.
+            class_name: Fully qualified class name.
         Returns:
             dict: {class_name, package, super_class, interfaces, method_names, field_names, native_count}
         """
-        return await _get_class_info(class_name, instance_id=instance_id)
+        return await _get_class_info(class_name)
 
     @mcp.tool()
     @with_busy_check
-    async def get_decompile_status(instance_id: Optional[str] = None) -> dict:
+    async def get_decompile_status() -> dict:
         """Check live JADX runtime state: decompile progress, memory usage, and search lock.
 
         ALWAYS call this before resource-intensive operations (get_class_source, xrefs, code search).
@@ -359,24 +352,20 @@ def register_class_tools(mcp):
         - memory.usage_percentage > 85% → reduce batch sizes to ≤5, skip get_smali_of_class
         - search_lock.locked = true → wait 5s and retry (another operation holds the write lock)
 
-        Args:
-            instance_id: Target JADX instance name.
         Returns:
             dict: {cached_percentage, memory.usage_percentage, search_lock.locked, status}
         """
-        return await _get_decompile_status(instance_id=instance_id)
+        return await _get_decompile_status()
 
     @mcp.tool()
     @with_busy_check
-    async def list_packages(instance_id: Optional[str] = None) -> dict:
+    async def list_packages() -> dict:
         """List all packages in the APK/JAR sorted by class count with library-detection flags.
 
-        Args:
-            instance_id: Target JADX instance name.
         Returns:
             dict: {total_classes, total_packages, packages: [{name, class_count, is_likely_library}]}
         """
-        return await _list_packages(instance_id=instance_id)
+        return await _list_packages()
 
     @mcp.tool()
     @with_busy_check
@@ -384,7 +373,6 @@ def register_class_tools(mcp):
         class_name: str,
         position: Optional[int] = None,
         max: Optional[int] = None,
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Get precise symbol reference metadata for a class: which class/method/field is
         referenced at every source position. This is the basis for "go to definition" / "what
@@ -401,10 +389,10 @@ def register_class_tools(mcp):
         Args:
             class_name: Fully qualified class name. position: Char-offset to resolve a single
             symbol at. max: Cap on the reference list size (default 300, ignored when position
-            is set). instance_id: Target JADX instance name.
+            is set).
         Returns:
             dict: {has_metadata, reference_count, references: [{kind, raw_name, alias_name,
             position, line, ...}], truncated} or {has_metadata: false, hint} if not yet
             decompiled. With position: {at: {kind, raw_name, alias_name, resolved_by, ...}}.
         """
-        return await _get_code_metadata(class_name, position=position, max=max, instance_id=instance_id)
+        return await _get_code_metadata(class_name, position=position, max=max)

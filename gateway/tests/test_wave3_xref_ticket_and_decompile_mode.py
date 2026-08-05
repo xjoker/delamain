@@ -41,7 +41,7 @@ async def test_submit_xref_single_target_maps_params(monkeypatch):
     monkeypatch.setattr(xrefs_tools, "get_from_jadx", fake_get_from_jadx)
 
     await xrefs_tools.submit_xref(
-        target_type="class", class_name="com.example.Foo", instance_id="inst-1",
+        target_type="class", class_name="com.example.Foo",
     )
     endpoint, params, method = calls[-1]
     assert endpoint == "submit-xref"
@@ -50,7 +50,7 @@ async def test_submit_xref_single_target_maps_params(monkeypatch):
 
     await xrefs_tools.submit_xref(
         target_type="method", class_name="com.example.Foo", member_name="bar",
-        include_snippet=True, context_lines=5, instance_id="inst-1",
+        include_snippet=True, context_lines=5,
     )
     endpoint, params, method = calls[-1]
     assert params == {
@@ -72,7 +72,6 @@ async def test_submit_xref_batch_mode_ignores_single_target_params(monkeypatch):
     await xrefs_tools.submit_xref(
         targets=["class:com.example.Foo", "method:com.example.Bar:baz"],
         target_type="class", class_name="should-be-ignored",
-        instance_id="inst-1",
     )
     endpoint, params = calls[-1]
     assert endpoint == "submit-xref"
@@ -93,10 +92,10 @@ async def test_get_xref_result_maps_params(monkeypatch):
 
     monkeypatch.setattr(xrefs_tools, "get_from_jadx", fake_get_from_jadx)
 
-    await xrefs_tools.get_xref_result("abc123", instance_id="inst-1")
+    await xrefs_tools.get_xref_result("abc123")
     assert calls[-1] == ("xref-status", {"ticket": "abc123", "offset": 0, "count": 100})
 
-    await xrefs_tools.get_xref_result("abc123", offset=20, count=10, instance_id="inst-1")
+    await xrefs_tools.get_xref_result("abc123", offset=20, count=10)
     assert calls[-1] == ("xref-status", {"ticket": "abc123", "offset": 20, "count": 10})
 
 
@@ -114,11 +113,11 @@ async def test_decompile_with_mode_maps_params(monkeypatch):
 
     monkeypatch.setattr(decompile_tools, "get_from_jadx", fake_get_from_jadx)
 
-    await decompile_tools.decompile_with_mode("com.example.Foo", instance_id="inst-1")
+    await decompile_tools.decompile_with_mode("com.example.Foo")
     assert calls[-1] == ("decompile-with-mode", {"class_name": "com.example.Foo", "mode": "FALLBACK"})
 
     await decompile_tools.decompile_with_mode(
-        "com.example.Foo", mode="SIMPLE", comments_level="ERROR", chunk=2, instance_id="inst-1",
+        "com.example.Foo", mode="SIMPLE", comments_level="ERROR", chunk=2,
     )
     assert calls[-1] == ("decompile-with-mode", {
         "class_name": "com.example.Foo", "mode": "SIMPLE",
@@ -140,7 +139,7 @@ async def test_decompile_with_mode_result_preserves_ephemeral_and_note(monkeypat
 
     monkeypatch.setattr(decompile_tools, "get_from_jadx", fake_get_from_jadx)
 
-    result = await decompile_tools.decompile_with_mode("com.example.Foo", instance_id="inst-1")
+    result = await decompile_tools.decompile_with_mode("com.example.Foo")
     assert result["ephemeral"] is True
     assert "note" in result
     assert result["raw_class"] == "com.example.Foo"

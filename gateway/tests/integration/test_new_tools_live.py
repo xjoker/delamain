@@ -52,7 +52,7 @@ async def live_instance():
 
 @pytest.mark.asyncio
 async def test_get_code_metadata_list_and_position_resolve():
-    listing = await class_tools.get_code_metadata(KNOWN_CLASS, instance_id=INSTANCE_NAME)
+    listing = await class_tools.get_code_metadata(KNOWN_CLASS)
 
     assert listing.get("has_metadata") is True
     assert listing["reference_count"] > 0
@@ -63,7 +63,7 @@ async def test_get_code_metadata_list_and_position_resolve():
 
     position = first["position"]
     resolved = await class_tools.get_code_metadata(
-        KNOWN_CLASS, position=position, instance_id=INSTANCE_NAME
+        KNOWN_CLASS, position=position
     )
     assert "at" in resolved
     assert resolved["at"]["position"] == position
@@ -72,13 +72,13 @@ async def test_get_code_metadata_list_and_position_resolve():
 
 @pytest.mark.asyncio
 async def test_list_resources_by_type_summary_and_filter():
-    summary = await resource_tools.list_resources_by_type(instance_id=INSTANCE_NAME)
+    summary = await resource_tools.list_resources_by_type()
     assert summary["status"] == "summary"
     assert summary["total_files"] > 0
     assert "layout" in summary["type_distribution"]
 
     filtered = await resource_tools.list_resources_by_type(
-        resource_type="layout", limit=5, instance_id=INSTANCE_NAME
+        resource_type="layout", limit=5
     )
     assert filtered["status"] == "success"
     assert filtered["resource_type"] == "layout"
@@ -90,38 +90,38 @@ async def test_list_resources_by_type_summary_and_filter():
 @pytest.mark.asyncio
 async def test_get_decoded_resource_found_and_not_found():
     listing = await resource_tools.list_resources_by_type(
-        resource_type="layout", limit=1, instance_id=INSTANCE_NAME
+        resource_type="layout", limit=1
     )
     file_name = listing["files"][0]
 
-    found = await resource_tools.get_decoded_resource(file_name, instance_id=INSTANCE_NAME)
+    found = await resource_tools.get_decoded_resource(file_name)
     assert found["status"] == "success"
     assert found["file_name"] == file_name
     assert "<" in found["content"]  # decoded XML, not raw binary
 
     missing = await resource_tools.get_decoded_resource(
-        "res/layout/does_not_exist_xyz.xml", instance_id=INSTANCE_NAME
+        "res/layout/does_not_exist_xyz.xml"
     )
     assert missing["status"] == "not_found"
 
 
 @pytest.mark.asyncio
 async def test_resolve_resource_id_name_id_roundtrip_and_list_all():
-    by_name = await resource_tools.resolve_resource_id(name="ic_launcher", instance_id=INSTANCE_NAME)
+    by_name = await resource_tools.resolve_resource_id(name="ic_launcher")
     assert by_name["status"] == "success"
     assert by_name["query_type"] == "name_to_id"
     assert by_name["matches"], "expected at least one ic_launcher match"
 
     match = by_name["matches"][0]
     by_id = await resource_tools.resolve_resource_id(
-        resource_id=match["id_hex"], instance_id=INSTANCE_NAME
+        resource_id=match["id_hex"]
     )
     assert by_id["status"] == "success"
     assert by_id["query_type"] == "id_to_name"
     assert by_id["found"] is True
     assert by_id["key_name"] == match["key_name"]
 
-    all_page = await resource_tools.resolve_resource_id(limit=3, instance_id=INSTANCE_NAME)
+    all_page = await resource_tools.resolve_resource_id(limit=3)
     assert all_page["status"] == "success"
     assert all_page["query_type"] == "list_all"
     assert len(all_page["entries"]) == 3

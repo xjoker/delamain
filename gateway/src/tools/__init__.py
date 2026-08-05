@@ -1,9 +1,8 @@
 """Tools package.
 
-BACKLOG: diff_tools.compare_versions() was removed with the multi-instance
-registry (it needed two live JADX instances to diff against each other).
-Redo it for the single-instance gateway later (e.g. diff two saved
-analysis-session snapshots) if cross-version comparison is still wanted.
+BACKLOG: a compare_versions() tool to diff two saved analysis-session
+snapshots (cross-version comparison) would need to be built fresh — there is
+no equivalent today.
 """
 from fastmcp import FastMCP
 
@@ -17,8 +16,8 @@ from .digest_tools import register_digest_tools
 from .export_tools import register_export_tools
 from .file_management_tools import register_file_management_tools
 from .frida_tools import register_frida_tools
+from .guide_tools import register_guide_tools
 from .init_tools import register_init_tools
-from .instance_tools import register_instance_tools
 from .refactor_tools import register_refactor_tools
 from .resource_tools import register_resource_tools
 from .search_tools import register_search_tools
@@ -31,7 +30,7 @@ from .xrefs_tools import register_xrefs_tools
 
 
 def register_all_tools(mcp: FastMCP):
-    register_instance_tools(mcp)
+    register_guide_tools(mcp)
     register_analysis_surface_tools(mcp)
     register_annotation_tools(mcp)
     register_class_tools(mcp)

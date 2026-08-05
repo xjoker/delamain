@@ -2,8 +2,6 @@
 delamain Gateway - Internal Index Diagnostics Tools
 """
 
-from typing import Optional
-
 from ..logging_config import get_logger
 from ..routing.request_router import get_from_jadx
 from ..busy_tracker import with_busy_check
@@ -11,10 +9,10 @@ from ..busy_tracker import with_busy_check
 logger = get_logger("diagnostics_tools")
 
 
-async def get_index_stats(instance_id: Optional[str] = None) -> dict:
-    logger.debug("get_index_stats called, instance_id=%s", instance_id)
+async def get_index_stats() -> dict:
+    logger.debug("get_index_stats called")
     try:
-        result = await get_from_jadx("index-stats", instance_id=instance_id)
+        result = await get_from_jadx("index-stats")
         return result
     except Exception as exc:
         logger.warning("get_index_stats failed: %s", exc)
@@ -24,10 +22,10 @@ async def get_index_stats(instance_id: Optional[str] = None) -> dict:
 _get_index_stats = get_index_stats
 
 
-async def get_decompile_diag(class_name: str, instance_id: Optional[str] = None) -> dict:
-    logger.debug("get_decompile_diag called, class_name=%s, instance_id=%s", class_name, instance_id)
+async def get_decompile_diag(class_name: str) -> dict:
+    logger.debug("get_decompile_diag called, class_name=%s", class_name)
     try:
-        return await get_from_jadx("decompile-diag", {"class_name": class_name}, instance_id=instance_id)
+        return await get_from_jadx("decompile-diag", {"class_name": class_name})
     except Exception as exc:
         logger.warning("get_decompile_diag failed: %s", exc)
         return {"error": "JADX_ERROR", "message": str(exc)}
@@ -36,11 +34,11 @@ async def get_decompile_diag(class_name: str, instance_id: Optional[str] = None)
 _get_decompile_diag = get_decompile_diag
 
 
-async def get_memory_diagnostics(gc: bool = True, instance_id: Optional[str] = None) -> dict:
-    logger.debug("get_memory_diagnostics called, gc=%s, instance_id=%s", gc, instance_id)
+async def get_memory_diagnostics(gc: bool = True) -> dict:
+    logger.debug("get_memory_diagnostics called, gc=%s", gc)
     try:
         return await get_from_jadx(
-            "memory-diagnostics", {"gc": "true" if gc else "false"}, instance_id=instance_id)
+            "memory-diagnostics", {"gc": "true" if gc else "false"})
     except Exception as exc:
         logger.warning("get_memory_diagnostics failed: %s", exc)
         return {"error": "JADX_ERROR", "message": str(exc)}
@@ -54,7 +52,7 @@ def register_diagnostics_tools(mcp):
 
     @mcp.tool()
     @with_busy_check
-    async def get_index_stats(instance_id: Optional[str] = None) -> dict:
+    async def get_index_stats() -> dict:
         """Internal index health snapshot (name indices, shard index, trigram index, snapshot cache).
 
         Use this to decide whether code-search (search_in='code') is available, or whether to
@@ -87,8 +85,6 @@ def register_diagnostics_tools(mcp):
         it says "building"/"skipped", since that falls through to a live per-caller re-decompile
         and can be slow; prefer class-level xref first, or wait for precise_snippets == "ready".
 
-        Args:
-            instance_id: Target JADX instance; omit for default.
         Returns:
             dict: {name_indices: {class_name_buckets, method_name_buckets,
                                   field_name_buckets, raw_name_map_size, index_ready},
@@ -103,11 +99,11 @@ def register_diagnostics_tools(mcp):
                    snapshot_cache: {method_snapshot_classes, field_snapshot_classes},
                    code_cache: {class_index_size, delegates_to_jadx_icodecache}}
         """
-        return await _get_index_stats(instance_id=instance_id)
+        return await _get_index_stats()
 
     @mcp.tool()
     @with_busy_check
-    async def get_decompile_diag(class_name: str, instance_id: Optional[str] = None) -> dict:
+    async def get_decompile_diag(class_name: str) -> dict:
         """Authoritative decompilation-health diagnostic for one class — call this whenever
         get_class_source's output looks suspicious (truncated, garbled, oddly short, or the
         response carries decompile_quality != "ok").
@@ -135,13 +131,13 @@ def register_diagnostics_tools(mcp):
               against get_smali_of_class, or call decompile_with_mode to retry in another mode.
 
         Args:
-            class_name: Fully qualified class name. instance_id: Target JADX instance name.
+            class_name: Fully qualified class name.
         """
-        return await _get_decompile_diag(class_name, instance_id=instance_id)
+        return await _get_decompile_diag(class_name)
 
     @mcp.tool()
     @with_busy_check
-    async def get_memory_diagnostics(gc: bool = True, instance_id: Optional[str] = None) -> dict:
+    async def get_memory_diagnostics(gc: bool = True) -> dict:
         """Heap/RSS snapshot AFTER forcing a garbage collection — the honest memory figure.
 
         get_decompile_status().memory reports live heap usage, which includes garbage not yet
@@ -162,7 +158,6 @@ def register_diagnostics_tools(mcp):
         Args:
             gc: Collect before measuring (default true). Pass false for a pure observation —
                 cheaper, but the number then includes uncollected garbage.
-            instance_id: Target JADX instance; omit for default.
         Returns:
             dict: {gc: {ran, elapsed_ms},
                    heap: {max_mb, committed_mb, used_mb, usage_percentage,
@@ -171,7 +166,7 @@ def register_diagnostics_tools(mcp):
                    container: {memory_limit_mb},           # null when unlimited/unreadable
                    consumers: {trigram_count, trigram_indexed_classes, shard_index_built}}
         """
-        return await _get_memory_diagnostics(gc=gc, instance_id=instance_id)
+        return await _get_memory_diagnostics(gc=gc)
 
     logger.info(
         "Diagnostics tools registered: get_index_stats, get_decompile_diag, get_memory_diagnostics")

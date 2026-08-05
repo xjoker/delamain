@@ -17,7 +17,7 @@ from src.tools import diagnostics_tools
 async def test_proxies_to_the_backend_endpoint_with_gc_on_by_default(monkeypatch):
     seen = {}
 
-    async def fake_get(endpoint, params=None, instance_id=None):
+    async def fake_get(endpoint, params=None):
         seen["endpoint"] = endpoint
         seen["params"] = params
         return {"heap": {"used_mb": 4321}, "gc": {"ran": True}}
@@ -35,7 +35,7 @@ async def test_proxies_to_the_backend_endpoint_with_gc_on_by_default(monkeypatch
 async def test_gc_can_be_turned_off_for_a_pure_observation(monkeypatch):
     seen = {}
 
-    async def fake_get(endpoint, params=None, instance_id=None):
+    async def fake_get(endpoint, params=None):
         seen["params"] = params
         return {}
 
@@ -48,7 +48,7 @@ async def test_gc_can_be_turned_off_for_a_pure_observation(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_backend_failure_is_reported_not_raised(monkeypatch):
-    async def boom(endpoint, params=None, instance_id=None):
+    async def boom(endpoint, params=None):
         raise RuntimeError("connection refused")
 
     monkeypatch.setattr(diagnostics_tools, "get_from_jadx", boom)

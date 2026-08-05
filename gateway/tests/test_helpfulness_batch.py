@@ -133,7 +133,7 @@ async def test_get_smali_of_method_maps_params(monkeypatch):
     monkeypatch.setattr(search_tools, "get_from_jadx", fake_get_from_jadx)
 
     await search_tools.get_smali_of_method(
-        "com.example.Foo", "onCreate", method_signature="(Landroid/os/Bundle;)V", instance_id="inst-1",
+        "com.example.Foo", "onCreate", method_signature="(Landroid/os/Bundle;)V",
     )
     endpoint, params = calls[-1]
     assert endpoint == "smali-of-method"
@@ -186,7 +186,7 @@ async def test_get_native_surface_maps_to_endpoint(monkeypatch):
     assert module is not None, "get_native_surface must be defined in one of the tools modules"
     monkeypatch.setattr(module, "get_from_jadx", fake_get_from_jadx)
 
-    result = await module.get_native_surface(instance_id="inst-1")
+    result = await module.get_native_surface()
     endpoint, params = calls[-1]
     assert endpoint == "native-surface"
     assert result["native_method_count"] == 1

@@ -66,7 +66,7 @@ def resolve_upload_base(
     return None
 
 
-def _resolve_upload_base(instance_id: Optional[str]) -> Optional[str]:
+def _resolve_upload_base() -> Optional[str]:
     """Best-effort externally-reachable base URL for this gateway's transfer proxy."""
     env_value = os.getenv("JADX_TRANSFER_PUBLIC_URL")
 
@@ -79,7 +79,6 @@ def _resolve_upload_base(instance_id: Optional[str]) -> Optional[str]:
 async def _create_transfer_token_impl(
     filename: str,
     size_bytes: Optional[int],
-    instance_id: Optional[str],
 ) -> dict:
     json_body: dict = {"filename": filename}
     if size_bytes is not None:
@@ -87,7 +86,6 @@ async def _create_transfer_token_impl(
 
     result = await get_from_jadx(
         "create-transfer-token",
-        instance_id=instance_id,
         method="POST",
         json_body=json_body,
     )
@@ -95,7 +93,7 @@ async def _create_transfer_token_impl(
         return result
 
     upload_path = result.get("upload_path", "/transfer/upload")
-    base = _resolve_upload_base(instance_id)
+    base = _resolve_upload_base()
     token = result.get("token")
     if base:
         result["upload_url"] = f"{base}{upload_path}"
@@ -118,7 +116,6 @@ def register_transfer_tools(mcp):
     async def create_transfer_token(
         filename: str,
         size_bytes: Optional[int] = None,
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Create a one-time upload token so the user can PUT an APK/JAR/AAR/DEX file
         directly to the JADX sandbox, out of the AI context (bytes never pass through
@@ -146,7 +143,6 @@ def register_transfer_tools(mcp):
             filename: Destination file name — a plain basename, no path separators.
             size_bytes: Optional total size in bytes, used for an upfront cap check
                 (rejected with an error if it exceeds the server's configured max).
-            instance_id: Target JADX instance.
         Returns:
             dict: {token, filename, upload_path, status_path, expires_at_epoch_ms,
                    max_bytes, chunk_size_hint, upload_url} on success — or
@@ -154,7 +150,7 @@ def register_transfer_tools(mcp):
                    externally-reachable address is configured for this instance.
         """
         return await _create_transfer_token_impl(
-            filename=filename, size_bytes=size_bytes, instance_id=instance_id,
+            filename=filename, size_bytes=size_bytes,
         )
 
     logger.info("Transfer tools registered: create_transfer_token")

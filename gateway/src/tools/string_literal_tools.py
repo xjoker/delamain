@@ -2,8 +2,6 @@
 delamain Gateway - DEX String Literal Search Tools
 """
 
-from typing import Optional
-
 from ..logging_config import get_logger
 from ..routing.request_router import get_from_jadx
 from ..types import format_error_response
@@ -19,7 +17,6 @@ async def search_string_literals(
     class_filter: str = "",
     limit: int = 100,
     force_decompile: bool = False,
-    instance_id: Optional[str] = None,
 ) -> dict:
     params: dict = {
         "pattern": pattern,
@@ -32,7 +29,7 @@ async def search_string_literals(
     if force_decompile:
         params["force_decompile"] = "true"
 
-    return await get_from_jadx("search-string-literals", params, instance_id=instance_id)
+    return await get_from_jadx("search-string-literals", params)
 
 
 _search_string_literals = search_string_literals
@@ -50,7 +47,6 @@ def register_string_literal_tools(mcp):
         class_filter: str = "",
         limit: int = 100,
         force_decompile: bool = False,
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Search for string constants (URL, API key, SQL, etc.) embedded in DEX bytecode.
 
@@ -80,7 +76,6 @@ def register_string_literal_tools(mcp):
             force_decompile: When True, trigger decompilation of undecompiled classes in the
                              filtered set (requires class_filter). Slower but ensures complete
                              coverage of the target package (default False).
-            instance_id: Target JADX instance name.
         Returns:
             dict: {
                 results: [{class_name: str, literal: str, line_number: int}],
@@ -118,7 +113,6 @@ def register_string_literal_tools(mcp):
             class_filter=class_filter,
             limit=limit,
             force_decompile=force_decompile,
-            instance_id=instance_id,
         )
 
     logger.info("String literal tools registered: search_string_literals")

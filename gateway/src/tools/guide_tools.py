@@ -1,10 +1,8 @@
 """
 delamain Gateway - JADX Workflow Guide Tool
 
-Single-instance gateway: the instance-management tools this module used to
-expose (list/remove/set-default/health-check across multiple JADX instances)
-were removed along with the multi-instance registry. Only get_jadx_guide
-remains — it is the product's AI-onboarding guidance, not instance plumbing.
+Exposes get_jadx_guide, the product's AI-onboarding guidance for the JADX
+reverse-engineering workflow.
 """
 
 from typing import Optional
@@ -176,7 +174,7 @@ Full guide: get_jadx_guide(verbose=True)
 """
 
 
-def register_instance_tools(mcp):
+def register_guide_tools(mcp):
     """Register the JADX workflow guide tool with the MCP server."""
 
     @mcp.tool()

@@ -48,7 +48,6 @@ async def get_xrefs_to_class(
     count: int = 20,
     include_snippet: bool = False,
     context_lines: int = 3,
-    instance_id: Optional[str] = None,
 ) -> dict:
     additional_params: dict = {"class_name": class_name}
     if include_snippet:
@@ -61,7 +60,7 @@ async def get_xrefs_to_class(
         count=count,
         additional_params=additional_params,
         data_extractor=lambda parsed: parsed.get("references", []),
-        fetch_function=lambda ep, params={}: get_from_jadx(ep, params, instance_id=instance_id),
+        fetch_function=lambda ep, params={}: get_from_jadx(ep, params),
     )
     return _augment_xref_timeout(result, {"target_type": "class", "class_name": class_name})
 
@@ -73,7 +72,6 @@ async def get_xrefs_to_method(
     count: int = 20,
     include_snippet: bool = False,
     context_lines: int = 3,
-    instance_id: Optional[str] = None,
 ) -> dict:
     additional_params: dict = {"class_name": class_name, "method_name": method_name}
     if include_snippet:
@@ -86,7 +84,7 @@ async def get_xrefs_to_method(
         count=count,
         additional_params=additional_params,
         data_extractor=lambda parsed: parsed.get("references", []),
-        fetch_function=lambda ep, params={}: get_from_jadx(ep, params, instance_id=instance_id),
+        fetch_function=lambda ep, params={}: get_from_jadx(ep, params),
     )
     return _augment_xref_timeout(
         result,
@@ -99,7 +97,6 @@ async def get_xrefs_to_field(
     field_name: str,
     offset: int = 0,
     count: int = 20,
-    instance_id: Optional[str] = None,
 ) -> dict:
     result = await PaginationUtils.get_paginated_data(
         endpoint="xrefs-to-field",
@@ -107,7 +104,7 @@ async def get_xrefs_to_field(
         count=count,
         additional_params={"class_name": class_name, "field_name": field_name},
         data_extractor=lambda parsed: parsed.get("references", []),
-        fetch_function=lambda ep, params={}: get_from_jadx(ep, params, instance_id=instance_id),
+        fetch_function=lambda ep, params={}: get_from_jadx(ep, params),
     )
     return _augment_xref_timeout(
         result,
@@ -115,9 +112,9 @@ async def get_xrefs_to_field(
     )
 
 
-async def batch_get_xrefs(targets: list[str], instance_id: Optional[str] = None) -> dict:
+async def batch_get_xrefs(targets: list[str]) -> dict:
     targets_str = ",".join(targets)
-    result = await get_from_jadx("batch-xrefs", {"targets": targets_str}, instance_id=instance_id)
+    result = await get_from_jadx("batch-xrefs", {"targets": targets_str})
     return _augment_xref_timeout(result, {"targets": targets})
 
 
@@ -128,7 +125,6 @@ async def submit_xref(
     targets: Optional[list[str]] = None,
     include_snippet: bool = False,
     context_lines: int = 3,
-    instance_id: Optional[str] = None,
 ) -> dict:
     if targets:
         params: dict = {"targets": ",".join(targets)}
@@ -139,17 +135,16 @@ async def submit_xref(
         if include_snippet:
             params["include_snippet"] = "true"
             params["context_lines"] = str(context_lines)
-    return await get_from_jadx("submit-xref", params, method="POST", instance_id=instance_id, timeout=15)
+    return await get_from_jadx("submit-xref", params, method="POST", timeout=15)
 
 
 async def get_xref_result(
     ticket: str,
     offset: int = 0,
     count: int = 100,
-    instance_id: Optional[str] = None,
 ) -> dict:
     params = {"ticket": ticket, "offset": offset, "count": count}
-    return await get_from_jadx("xref-status", params, instance_id=instance_id, timeout=15)
+    return await get_from_jadx("xref-status", params, timeout=15)
 
 
 _get_xrefs_to_class = get_xrefs_to_class
@@ -173,7 +168,6 @@ def register_xrefs_tools(mcp):
         count: int = 20,
         include_snippet: bool = False,
         context_lines: int = 3,
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Find cross-references to a class, method, or field.
 
@@ -193,7 +187,6 @@ def register_xrefs_tools(mcp):
                 retrieval failed.
             context_lines: Lines of context before/after the reference in the snippet (default: 3).
                 Only used when include_snippet=True.
-            instance_id: Target JADX instance name.
         Returns:
             dict: {references: [{class, raw_class, method, raw_method, from_method, raw_from_method,
                 source_line[, decompiled_line, code_snippet, snippet]}], pagination: {total, offset,
@@ -230,7 +223,6 @@ def register_xrefs_tools(mcp):
             return await _get_xrefs_to_class(
                 class_name, offset, count,
                 include_snippet=include_snippet, context_lines=context_lines,
-                instance_id=instance_id,
             )
         elif target_type_lower == "method":
             if not member_name:
@@ -242,7 +234,6 @@ def register_xrefs_tools(mcp):
             return await _get_xrefs_to_method(
                 class_name, member_name, offset, count,
                 include_snippet=include_snippet, context_lines=context_lines,
-                instance_id=instance_id,
             )
         elif target_type_lower == "field":
             if not member_name:
@@ -252,7 +243,7 @@ def register_xrefs_tools(mcp):
                     {"hint": "Provide the field name via the member_name parameter"},
                 )
             return await _get_xrefs_to_field(
-                class_name, member_name, offset, count, instance_id=instance_id,
+                class_name, member_name, offset, count,
             )
         else:
             return format_error_response(
@@ -265,13 +256,11 @@ def register_xrefs_tools(mcp):
     @with_busy_check
     async def batch_get_xrefs_tool(
         targets: list[str],
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Fetch xrefs for multiple targets in one request (max 10). Format: "type:class[:member]".
 
         Args:
             targets: e.g. ["class:com.example.Foo", "method:com.example.Bar:myMethod"]. Max 10.
-            instance_id: Target JADX instance name.
         Returns:
             dict: {results: [{target, found, xrefs_count, xrefs: [{class, raw_class, method,
                 raw_method, from_method, raw_from_method, source_line[, decompiled_line,
@@ -287,7 +276,7 @@ def register_xrefs_tools(mcp):
                 and partial_reason on the response — follow its suggestion (warmup, fewer targets, or
                 submit_xref) rather than assuming the target has no more referrers.
         """
-        return await _batch_get_xrefs(targets, instance_id=instance_id)
+        return await _batch_get_xrefs(targets)
 
     @mcp.tool(name="submit_xref")
     async def submit_xref_tool(
@@ -297,7 +286,6 @@ def register_xrefs_tools(mcp):
         targets: Optional[list[str]] = None,
         include_snippet: bool = False,
         context_lines: int = 3,
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Submit a background xref resolution. Returns a ticket immediately — no 120s timeout risk.
 
@@ -327,7 +315,6 @@ def register_xrefs_tools(mcp):
                 rows beyond that cap have no 'snippet' field even though the reference itself is
                 still present in the result — absence there means "not decompiled", not "not found".
             context_lines: Snippet context lines (default 3, only used with include_snippet=True).
-            instance_id: Target JADX instance name.
         Returns:
             dict: {ticket, status: "submitted"|"done", retry_after_seconds}. Never contains the
                 references themselves, even when status="done" — always follow up with
@@ -337,7 +324,6 @@ def register_xrefs_tools(mcp):
         return await _submit_xref(
             target_type=target_type, class_name=class_name, member_name=member_name,
             targets=targets, include_snippet=include_snippet, context_lines=context_lines,
-            instance_id=instance_id,
         )
 
     @mcp.tool(name="get_xref_result")
@@ -346,14 +332,12 @@ def register_xrefs_tools(mcp):
         ticket: str,
         offset: int = 0,
         count: int = 100,
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Poll the result of an xref resolution submitted via submit_xref().
 
         Args:
             ticket: Ticket ID from submit_xref(). offset/count: Pagination over the reference list
                 (single-target mode only — batch results aren't paginated, same as batch_get_xrefs).
-            instance_id: Target JADX instance name.
         Returns:
             dict: status="running" (poll again, see retry_after_seconds) |
                   status="done" — single-target mode: {references: [...], pagination: {total, offset,
@@ -364,4 +348,4 @@ def register_xrefs_tools(mcp):
                   status="not_found" (ticket expired, or target class/method/field doesn't exist —
                   check message) | status="error" (check message)
         """
-        return await _get_xref_result(ticket, offset, count, instance_id=instance_id)
+        return await _get_xref_result(ticket, offset, count)

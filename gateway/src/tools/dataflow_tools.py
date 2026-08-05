@@ -134,7 +134,6 @@ async def trace_data_flow(
     source_class: str,
     source_method: str,
     max_depth: int = 3,
-    instance_id: Optional[str] = None,
 ) -> dict:
     """Trace the call graph forward from a method (callee direction) using BFS reachability."""
     max_depth = max(1, min(max_depth, _ABSOLUTE_MAX_DEPTH))
@@ -159,7 +158,7 @@ async def trace_data_flow(
             continue
         try:
             result = await get_from_jadx(
-                "method-callees", {"class_name": cls, "method_name": method}, instance_id=instance_id,
+                "method-callees", {"class_name": cls, "method_name": method},
             )
         except Exception as exc:
             logger.debug(f"method-callees failed for {cls}#{method}: {exc}")
@@ -222,7 +221,6 @@ async def find_callers_chain(
     target_class: str,
     target_method: str,
     max_depth: int = 3,
-    instance_id: Optional[str] = None,
 ) -> dict:
     """Trace the call graph backward from a method (caller direction) using xrefs BFS."""
     max_depth = max(1, min(max_depth, _ABSOLUTE_MAX_DEPTH))
@@ -247,7 +245,7 @@ async def find_callers_chain(
             continue
         try:
             result = await get_from_jadx(
-                "xrefs-to-method", {"class_name": cls, "method_name": method}, instance_id=instance_id,
+                "xrefs-to-method", {"class_name": cls, "method_name": method},
             )
         except Exception as exc:
             logger.debug(f"xrefs-to-method failed for {cls}#{method}: {exc}")
@@ -304,7 +302,6 @@ async def callers_chain_classes(
     target_class: str,
     max_depth: int = 3,
     max_nodes: int = 2000,
-    instance_id: Optional[str] = None,
 ) -> dict:
     """Instant class-level multi-hop reachability ("which classes can reach X") via the
     server-side precomputed usage graph — a pure BFS lookup, no decompilation. Use this for a
@@ -312,7 +309,6 @@ async def callers_chain_classes(
     return await get_from_jadx(
         "callers-chain",
         {"class_name": target_class, "depth": str(max_depth), "max_nodes": str(max_nodes)},
-        instance_id=instance_id,
     )
 
 
@@ -330,7 +326,6 @@ def register_dataflow_tools(mcp):
         source_class: str,
         source_method: str,
         max_depth: int = 3,
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Trace forward call-graph reachability via BFS and flag Android sinks (network, webview, command, storage, IPC, crypto).
 
@@ -338,14 +333,14 @@ def register_dataflow_tools(mcp):
 
         Args:
             source_class: Fully qualified class name. source_method: Starting method name.
-            max_depth: BFS depth 1-5 (default 3). instance_id: Target JADX instance name.
+            max_depth: BFS depth 1-5 (default 3).
         Returns:
             dict: {call_tree, sinks_found: [{method, full_class, sink_type, sink_severity, path}],
                    analysis_type, analysis_note, stats}
         """
         return await _trace_data_flow(
             source_class=source_class, source_method=source_method,
-            max_depth=max_depth, instance_id=instance_id,
+            max_depth=max_depth,
         )
 
     @mcp.tool()
@@ -356,7 +351,6 @@ def register_dataflow_tools(mcp):
         max_depth: int = 3,
         granularity: str = "class",
         max_nodes: int = 2000,
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Trace backward "who can reach this" call chains.
 
@@ -375,7 +369,6 @@ def register_dataflow_tools(mcp):
             max_depth: BFS depth 1-12 for class, 1-5 for method (default 3).
             granularity: 'class' | 'method'.
             max_nodes: class-mode safety cap on discovered classes (default 2000).
-            instance_id: Target JADX instance name.
         Returns:
             class: {target, layers:[{depth,count,classes}], total_callers, truncated, via}
             method: {caller_tree, sources_found, stats}
@@ -386,11 +379,11 @@ def register_dataflow_tools(mcp):
                     "MISSING_PARAM", "target_method is required when granularity='method'")
             return await _find_callers_chain(
                 target_class=target_class, target_method=target_method,
-                max_depth=max_depth, instance_id=instance_id,
+                max_depth=max_depth,
             )
         return await _callers_chain_classes(
             target_class=target_class, max_depth=max_depth,
-            max_nodes=max_nodes, instance_id=instance_id,
+            max_nodes=max_nodes,
         )
 
     logger.info("Dataflow tools registered: trace_data_flow, find_callers_chain")

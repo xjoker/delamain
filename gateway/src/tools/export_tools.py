@@ -4,7 +4,6 @@ delamain Gateway - Analysis Report Export Tools
 
 import json
 from datetime import datetime, timezone
-from typing import Optional
 
 from ..logging_config import get_logger
 from ..routing.request_router import get_from_jadx
@@ -20,7 +19,6 @@ def _build_markdown_report(
     annotations: list,
     bookmarks: list,
     tags: list,
-    instance_id: Optional[str],
     timestamp: str,
 ) -> str:
     package_name = file_info.get("package_name", file_info.get("name", "Unknown"))
@@ -32,8 +30,6 @@ def _build_markdown_report(
     lines.append("")
     lines.append(f"**File**: {file_name} ({file_type})  ")
     lines.append(f"**Generated**: {timestamp}  ")
-    if instance_id:
-        lines.append(f"**Instance**: {instance_id}")
     lines.append("")
 
     lines.append(f"## Annotations ({len(annotations)})")
@@ -88,12 +84,10 @@ def _build_json_report(
     annotations: list,
     bookmarks: list,
     tags: list,
-    instance_id: Optional[str],
     timestamp: str,
 ) -> str:
     report = {
         "file_info": file_info,
-        "instance_id": instance_id,
         "generated_at": timestamp,
         "annotations": annotations,
         "bookmarks": bookmarks,
@@ -107,7 +101,6 @@ def _build_sarif_report(
     annotations: list,
     bookmarks: list,
     tags: list,
-    instance_id: Optional[str],
     timestamp: str,
 ) -> str:
     results: list[dict] = []
@@ -185,7 +178,6 @@ async def export_analysis_report(
     include_annotations: bool = True,
     include_bookmarks: bool = True,
     include_tags: bool = True,
-    instance_id: Optional[str] = None,
 ) -> dict:
     logger.info(f"export_analysis_report: format={format}")
 
@@ -198,7 +190,7 @@ async def export_analysis_report(
 
     file_info: dict = {}
     try:
-        file_info = await get_from_jadx("file-info", instance_id=instance_id)
+        file_info = await get_from_jadx("file-info")
         if isinstance(file_info, str):
             file_info = {}
     except Exception as exc:
@@ -206,7 +198,7 @@ async def export_analysis_report(
 
     analysis_data: dict = {}
     try:
-        analysis_data = await get_from_jadx("analysis-notes", instance_id=instance_id)
+        analysis_data = await get_from_jadx("analysis-notes")
         if isinstance(analysis_data, str):
             analysis_data = {}
     except Exception as exc:
@@ -219,11 +211,11 @@ async def export_analysis_report(
     timestamp = datetime.now(timezone.utc).isoformat()
 
     if fmt == "markdown":
-        report = _build_markdown_report(file_info, annotations, bookmarks, tags, instance_id, timestamp)
+        report = _build_markdown_report(file_info, annotations, bookmarks, tags, timestamp)
     elif fmt == "json":
-        report = _build_json_report(file_info, annotations, bookmarks, tags, instance_id, timestamp)
+        report = _build_json_report(file_info, annotations, bookmarks, tags, timestamp)
     elif fmt == "sarif":
-        report = _build_sarif_report(file_info, annotations, bookmarks, tags, instance_id, timestamp)
+        report = _build_sarif_report(file_info, annotations, bookmarks, tags, timestamp)
     else:
         report = ""
 
@@ -259,13 +251,11 @@ def register_export_tools(mcp):
         include_annotations: bool = True,
         include_bookmarks: bool = True,
         include_tags: bool = True,
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Export annotations, bookmarks, and tags as a formatted report.
 
         Args:
             format: markdown|json|sarif. include_annotations/bookmarks/tags: Toggle sections.
-            instance_id: Target JADX instance name.
         Returns:
             dict: {format, report: str, stats: {annotations, bookmarks, tags}, generated_at}
         """
@@ -274,7 +264,6 @@ def register_export_tools(mcp):
             include_annotations=include_annotations,
             include_bookmarks=include_bookmarks,
             include_tags=include_tags,
-            instance_id=instance_id,
         )
 
     logger.info("Export tools registered: export_analysis_report")

@@ -1,10 +1,8 @@
 """
 JADX Backend Registry (single fixed backend)
 
-Simplified from a multi-instance/multi-user registry (867 lines, dynamic
-add/remove, owner-based access control, per-loop httpx client pools) down to
-a single fixed JADX Java backend holder. The gateway now proxies to exactly
-one backend, configured once at startup via `configure()`.
+Holds the single fixed JADX Java backend this gateway process proxies to,
+configured once at startup via `configure()`.
 
 Kept as a small class (rather than inlining into request_router) because
 several modules (busy_tracker, workflow_tools, transfer_tools, request_router)
@@ -47,10 +45,9 @@ class InstanceRegistry:
     """
     Holds the single fixed JADX backend for this gateway process.
 
-    Single machine + single instance + single event loop: no owner/access
-    control, no dynamic add/remove, no per-loop httpx client pools. The
-    module-level httpx.AsyncClient used to talk to this backend lives in
-    request_router.py.
+    Configured once at startup and read by request_router.py and
+    busy_tracker.py; there is exactly one backend, one event loop, and one
+    shared httpx.AsyncClient (the latter lives in request_router.py).
     """
 
     DEFAULT_HOST = DEFAULT_HOST

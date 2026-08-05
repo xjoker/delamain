@@ -5,8 +5,6 @@ Submit-then-poll wrappers for long-running operations (security scan, callgraph 
 Use submit_* to start the operation immediately; poll get_task_result(ticket) until done.
 """
 
-from typing import Optional
-
 from ..logging_config import get_logger
 from .security_tools import _run_security_scan
 from .analysis_surface_tools import _export_callgraph
@@ -22,18 +20,16 @@ def register_task_tools(mcp):
     async def submit_security_scan(
         scan_type: str = "full",
         package: str = "",
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Submit a security scan as a background task. Returns a ticket immediately.
 
         Args:
             scan_type: full|secrets|crypto|network|permissions.
             package: Optional package filter to narrow scope.
-            instance_id: Target JADX instance name.
         Returns:
             dict: {ticket, status:"submitted", retry_after_seconds:5}
         """
-        ticket = async_tasks.submit(_run_security_scan(scan_type, package, instance_id))
+        ticket = async_tasks.submit(_run_security_scan(scan_type, package))
         logger.info(f"submit_security_scan: ticket={ticket}, scan_type={scan_type}")
         return {"ticket": ticket, "status": "submitted", "retry_after_seconds": 5}
 
@@ -43,7 +39,6 @@ def register_task_tools(mcp):
         method_name: str,
         depth: int = 3,
         output_format: str = "json",
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Submit a call graph export as a background task. Returns a ticket immediately.
 
@@ -52,12 +47,11 @@ def register_task_tools(mcp):
             method_name: Method name to trace.
             depth: Traversal depth 1-6 (default 3).
             output_format: "json" or "dot".
-            instance_id: Target JADX instance name.
         Returns:
             dict: {ticket, status:"submitted", retry_after_seconds:5}
         """
         ticket = async_tasks.submit(
-            _export_callgraph(class_name, method_name, depth, output_format, instance_id)
+            _export_callgraph(class_name, method_name, depth, output_format)
         )
         logger.info(f"submit_callgraph: ticket={ticket}, class={class_name}, method={method_name}")
         return {"ticket": ticket, "status": "submitted", "retry_after_seconds": 5}

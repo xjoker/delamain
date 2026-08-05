@@ -4,7 +4,6 @@ delamain Gateway - Security Scan Tools
 
 import re
 import time
-from typing import Optional
 
 from ..logging_config import get_logger
 from ..routing.request_router import get_from_jadx, TIMEOUT_CODE_READ
@@ -176,7 +175,6 @@ def _extract_matches(search_result: dict) -> list[dict[str, str]]:
 async def _run_security_scan(
     scan_type: str = "full",
     package: str = "",
-    instance_id: Optional[str] = None,
 ) -> dict:
     start_time = time.monotonic()
     logger.info(f"run_security_scan: type={scan_type}, package={package!r}")
@@ -187,7 +185,7 @@ async def _run_security_scan(
             "message": f"Invalid scan_type '{scan_type}'. Valid values: {list(SCAN_TYPES.keys())}",
         }
 
-    decompile_status = await get_from_jadx("decompile-status", instance_id=instance_id)
+    decompile_status = await get_from_jadx("decompile-status")
     cached_percentage = 0.0
     if isinstance(decompile_status, dict):
         cached_percentage = decompile_status.get("cached_percentage", 0.0)
@@ -220,7 +218,7 @@ async def _run_security_scan(
             try:
                 req_timeout = TIMEOUT_CODE_READ if search_in == "code" else None
                 result = await get_from_jadx(
-                    "search-classes-by-keyword", params, instance_id=instance_id, timeout=req_timeout,
+                    "search-classes-by-keyword", params, timeout=req_timeout,
                 )
             except Exception:
                 logger.warning(
@@ -310,18 +308,16 @@ def register_security_tools(mcp):
     async def run_security_scan(
         scan_type: str = "full",
         package: str = "",
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Automated security scan for hardcoded secrets, weak crypto, insecure network, dangerous APIs.
 
         Args:
             scan_type: full|secrets|crypto|network|permissions. package: Scope filter.
-            instance_id: Target JADX instance name.
         Returns:
             dict: {summary: {total_findings, high_severity, medium_severity}, findings: [{rule_id, severity, matches}]}
         """
         return await _run_security_scan(
-            scan_type=scan_type, package=package, instance_id=instance_id,
+            scan_type=scan_type, package=package,
         )
 
     logger.info("Security tools registered: run_security_scan")

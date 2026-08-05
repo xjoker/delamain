@@ -3,7 +3,6 @@ delamain Gateway - APK/JAR Digest Tools
 """
 
 import re
-from typing import Optional
 
 from ..logging_config import get_logger
 from ..routing.request_router import get_from_jadx
@@ -220,10 +219,10 @@ def generate_analysis_tips(
     return tips
 
 
-async def _generate_apk_digest(instance_id: Optional[str] = None) -> dict:
+async def _generate_apk_digest() -> dict:
     logger.info("generate_apk_digest: starting digest generation")
 
-    file_info = await get_from_jadx("file-info", instance_id=instance_id)
+    file_info = await get_from_jadx("file-info")
     if "error" in file_info:
         return {
             "error": "DIGEST_FAILED",
@@ -238,7 +237,7 @@ async def _generate_apk_digest(instance_id: Optional[str] = None) -> dict:
     apk_meta: dict = {}
     if file_type in ("apk", "aar", "dex"):
         try:
-            apk_info_result = await get_from_jadx("apk-info", instance_id=instance_id)
+            apk_info_result = await get_from_jadx("apk-info")
             if isinstance(apk_info_result, dict) and "error" not in apk_info_result:
                 apk_meta = apk_info_result
         except Exception as exc:
@@ -246,7 +245,7 @@ async def _generate_apk_digest(instance_id: Optional[str] = None) -> dict:
 
     manifest_data: dict = {}
     if file_type in ("apk", "aar", "dex"):
-        manifest_result = await get_from_jadx("manifest", instance_id=instance_id)
+        manifest_result = await get_from_jadx("manifest")
         if isinstance(manifest_result, str):
             manifest_data = parse_manifest_components(manifest_result)
         elif isinstance(manifest_result, dict) and "content" in manifest_result:
@@ -254,18 +253,18 @@ async def _generate_apk_digest(instance_id: Optional[str] = None) -> dict:
         elif isinstance(manifest_result, dict) and "error" not in manifest_result:
             manifest_data = parse_manifest_components(str(manifest_result))
     elif file_type == "jar":
-        jar_manifest = await get_from_jadx("jar-manifest", instance_id=instance_id)
+        jar_manifest = await get_from_jadx("jar-manifest")
         if isinstance(jar_manifest, dict):
             manifest_data = {"jar_manifest": jar_manifest}
 
     class_count_result = await get_from_jadx(
-        "all-classes", {"offset": 0, "count": 1}, instance_id=instance_id
+        "all-classes", {"offset": 0, "count": 1}
     )
     total_classes = 0
     if isinstance(class_count_result, dict):
         total_classes = class_count_result.get("total", 0)
 
-    decompile_status = await get_from_jadx("decompile-status", instance_id=instance_id)
+    decompile_status = await get_from_jadx("decompile-status")
     cached_percentage = 0.0
     decompile_total = 0
     if isinstance(decompile_status, dict):
@@ -274,7 +273,7 @@ async def _generate_apk_digest(instance_id: Optional[str] = None) -> dict:
 
     sample_count = min(total_classes, 200)
     class_list_result = await get_from_jadx(
-        "all-classes", {"offset": 0, "count": sample_count}, instance_id=instance_id
+        "all-classes", {"offset": 0, "count": sample_count}
     )
     class_names: list[str] = []
     if isinstance(class_list_result, dict):
@@ -346,7 +345,7 @@ def register_digest_tools(mcp):
 
     @mcp.tool()
     @with_busy_check
-    async def generate_apk_digest(instance_id: Optional[str] = None) -> dict:
+    async def generate_apk_digest() -> dict:
         """Generate a pre-analysis digest: file info, manifest, SDK detection, obfuscation assessment, entry points.
 
         For APK/AAR/DEX files, also includes enhanced metadata when available:
@@ -354,12 +353,10 @@ def register_digest_tools(mcp):
         - native_libraries: [{path, abi, name}]
         - dex_count: int
 
-        Args:
-            instance_id: Target JADX instance name.
         Returns:
             dict: {file_type, package_name, class_stats, detected_sdks, obfuscation_level,
                    analysis_tips, signing_certificates (APK only), native_libraries (APK only)}
         """
-        return await _generate_apk_digest(instance_id=instance_id)
+        return await _generate_apk_digest()
 
     logger.info("Digest tools registered: generate_apk_digest")

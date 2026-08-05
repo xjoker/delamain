@@ -2,8 +2,6 @@
 delamain Gateway - Attack Surface & Call Graph Analysis Tools
 """
 
-from typing import Optional
-
 from ..logging_config import get_logger
 from ..routing.request_router import get_from_jadx
 from ..types import format_error_response
@@ -14,8 +12,8 @@ logger = get_logger("analysis_surface_tools")
 _MAX_CALLGRAPH_DEPTH = 6
 
 
-async def get_attack_surface(instance_id: Optional[str] = None) -> dict:
-    result = await get_from_jadx("attack-surface", instance_id=instance_id)
+async def get_attack_surface() -> dict:
+    result = await get_from_jadx("attack-surface")
     if isinstance(result, dict) and "error" not in result:
         total_exported = result.get("total_exported", 0)
         deeplinks = result.get("deeplink_summary", [])
@@ -39,7 +37,6 @@ async def export_callgraph(
     method_name: str,
     depth: int = 3,
     output_format: str = "json",
-    instance_id: Optional[str] = None,
 ) -> dict:
     effective_depth = max(1, min(depth, _MAX_CALLGRAPH_DEPTH))
     params: dict = {
@@ -48,11 +45,11 @@ async def export_callgraph(
         "depth": str(effective_depth),
         "format": output_format,
     }
-    return await get_from_jadx("export-callgraph", params, instance_id=instance_id)
+    return await get_from_jadx("export-callgraph", params)
 
 
-async def get_native_surface(instance_id: Optional[str] = None) -> dict:
-    return await get_from_jadx("native-surface", instance_id=instance_id)
+async def get_native_surface() -> dict:
+    return await get_from_jadx("native-surface")
 
 
 _get_attack_surface = get_attack_surface
@@ -65,14 +62,12 @@ def register_analysis_surface_tools(mcp):
 
     @mcp.tool()
     @with_busy_check
-    async def get_attack_surface(instance_id: Optional[str] = None) -> dict:
+    async def get_attack_surface() -> dict:
         """Analyze the Android attack surface: exported components, deep-links, and dangerous permissions.
 
         This is the recommended first tool for security-focused analysis.
         No warmup required — results are derived from the manifest and metadata.
 
-        Args:
-            instance_id: Target JADX instance name.
         Returns:
             dict: {
                 activities, services, receivers, providers (exported),
@@ -81,7 +76,7 @@ def register_analysis_surface_tools(mcp):
                 total_exported: int, summary: str
             }
         """
-        return await _get_attack_surface(instance_id=instance_id)
+        return await _get_attack_surface()
 
     @mcp.tool()
     @with_busy_check
@@ -90,7 +85,6 @@ def register_analysis_surface_tools(mcp):
         method_name: str,
         depth: int = 3,
         format: str = "json",
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Export the call graph for a method as structured JSON or Graphviz DOT.
 
@@ -105,7 +99,6 @@ def register_analysis_surface_tools(mcp):
             method_name: Method name to root the graph at (e.g. "onCreate").
             depth: Traversal depth 1-6 (default 3). Values above 6 are clamped to 6.
             format: "json" (default, nodes+edges dict) or "dot" (Graphviz DOT language string).
-            instance_id: Target JADX instance name.
         Returns:
             When format=json: {format, root, depth, nodes:[{id,class,method}], edges:[{from,to}], truncated}
             When format=dot:  {format, dot:"digraph { ... }"}
@@ -134,12 +127,11 @@ def register_analysis_surface_tools(mcp):
             method_name=method_name,
             depth=depth,
             output_format=format,
-            instance_id=instance_id,
         )
 
     @mcp.tool()
     @with_busy_check
-    async def get_native_surface(instance_id: Optional[str] = None) -> dict:
+    async def get_native_surface() -> dict:
         """Aggregate a native/JNI reverse-engineering handoff worklist: every declared native
         method (with a JNI mangled-name candidate) plus every System.loadLibrary/System.load
         target found in the APK. Use this to build the Ghidra/unidbg worklist instead of
@@ -149,13 +141,11 @@ def register_analysis_surface_tools(mcp):
         native may actually be exported under the long-form (signature-suffixed) symbol instead
         if the short form is ambiguous in the native library's export table.
 
-        Args:
-            instance_id: Target JADX instance name.
         Returns:
             dict: {native_methods: [{class_name, raw_class_name, method_name, raw_method_name,
             param_types_frida, jni_name_candidate}], native_method_count, loaded_libraries:
             [{name, found_in_class}], loaded_library_count, note}
         """
-        return await _get_native_surface(instance_id=instance_id)
+        return await _get_native_surface()
 
     logger.info("Analysis surface tools registered: get_attack_surface, export_callgraph, get_native_surface")

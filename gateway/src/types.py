@@ -16,14 +16,12 @@ class SuccessResult(TypedDict, total=False):
     success: bool  # Always True
     data: Any
     message: str
-    instance: str  # Target JADX instance name
 
 
 class ErrorResult(TypedDict, total=False):
     """Standard error response from MCP tools."""
     error: str  # Error code (e.g., "INSTANCE_BUSY")
     message: str  # Human-readable error message
-    instance: str  # Target JADX instance name (if known)
 
 
 # Union type for tool return values

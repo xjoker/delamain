@@ -48,10 +48,10 @@ async def test_get_code_metadata_maps_params_to_java_endpoint(monkeypatch):
 
     monkeypatch.setattr(class_tools, "get_from_jadx", fake_get_from_jadx)
 
-    await class_tools.get_code_metadata("com.example.Foo", instance_id="inst-1")
+    await class_tools.get_code_metadata("com.example.Foo")
     assert calls[-1] == ("code-metadata", {"class_name": "com.example.Foo"})
 
-    await class_tools.get_code_metadata("com.example.Foo", position=42, max=10, instance_id="inst-1")
+    await class_tools.get_code_metadata("com.example.Foo", position=42, max=10)
     assert calls[-1] == ("code-metadata", {"class_name": "com.example.Foo", "position": "42", "max": "10"})
 
 
@@ -69,10 +69,10 @@ async def test_list_resources_by_type_maps_params(monkeypatch):
 
     monkeypatch.setattr(resource_tools, "get_from_jadx", fake_get_from_jadx)
 
-    await resource_tools.list_resources_by_type(instance_id="inst-1")
+    await resource_tools.list_resources_by_type()
     assert calls[-1] == ("list-resources-by-type", {"offset": "0", "limit": "50"})
 
-    await resource_tools.list_resources_by_type(resource_type="layout", offset=10, limit=5, instance_id="inst-1")
+    await resource_tools.list_resources_by_type(resource_type="layout", offset=10, limit=5)
     assert calls[-1] == ("list-resources-by-type", {"offset": "10", "limit": "5", "type": "layout"})
 
 
@@ -86,10 +86,10 @@ async def test_get_decoded_resource_maps_params(monkeypatch):
 
     monkeypatch.setattr(resource_tools, "get_from_jadx", fake_get_from_jadx)
 
-    await resource_tools.get_decoded_resource("res/layout/a.xml", instance_id="inst-1")
+    await resource_tools.get_decoded_resource("res/layout/a.xml")
     assert calls[-1] == ("get-decoded-resource", {"file_name": "res/layout/a.xml"})
 
-    await resource_tools.get_decoded_resource("res/layout/a.xml", chunk=2, instance_id="inst-1")
+    await resource_tools.get_decoded_resource("res/layout/a.xml", chunk=2)
     assert calls[-1] == ("get-decoded-resource", {"file_name": "res/layout/a.xml", "chunk": "2"})
 
 
@@ -103,13 +103,13 @@ async def test_resolve_resource_id_maps_params(monkeypatch):
 
     monkeypatch.setattr(resource_tools, "get_from_jadx", fake_get_from_jadx)
 
-    await resource_tools.resolve_resource_id(instance_id="inst-1")
+    await resource_tools.resolve_resource_id()
     assert calls[-1] == ("resolve-resource-id", {"offset": "0", "limit": "100"})
 
-    await resource_tools.resolve_resource_id(resource_id="0x7f0a0000", instance_id="inst-1")
+    await resource_tools.resolve_resource_id(resource_id="0x7f0a0000")
     assert calls[-1] == ("resolve-resource-id", {"offset": "0", "limit": "100", "id": "0x7f0a0000"})
 
-    await resource_tools.resolve_resource_id(name="ic_launcher", offset=5, limit=20, instance_id="inst-1")
+    await resource_tools.resolve_resource_id(name="ic_launcher", offset=5, limit=20)
     assert calls[-1] == ("resolve-resource-id", {"offset": "5", "limit": "20", "name": "ic_launcher"})
 
 

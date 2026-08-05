@@ -15,26 +15,23 @@ async def list_available_files(
     subdir: Optional[str] = None,
     pattern: Optional[str] = None,
     recursive: bool = False,
-    instance_id: Optional[str] = None,
 ) -> dict:
     params: dict = {"recursive": "true" if recursive else "false"}
     if subdir:
         params["subdir"] = subdir
     if pattern:
         params["pattern"] = pattern
-    return await get_from_jadx("list-available-files", params, instance_id=instance_id)
+    return await get_from_jadx("list-available-files", params)
 
 
 async def load_file(
     path: str,
     mode: str = "replace",
-    instance_id: Optional[str] = None,
 ) -> dict:
     if mode not in ("replace", "append"):
         return {"error": f"mode must be 'replace' or 'append', got: {mode}"}
     return await get_from_jadx(
         "load-file",
-        instance_id=instance_id,
         method="POST",
         json_body={"path": path, "mode": mode},
     )
@@ -47,18 +44,17 @@ def register_file_management_tools(mcp):
         subdir: Optional[str] = None,
         pattern: Optional[str] = None,
         recursive: bool = False,
-        instance_id: Optional[str] = None,
     ) -> dict:
         """List APK/JAR/AAR/DEX files available in the JADX sandbox. Use before load_file.
 
         Args:
             subdir: Optional sub-path to scope listing. pattern: Glob like "*.apk" (default "*").
-            recursive: Recurse into subdirs. instance_id: Target JADX instance.
+            recursive: Recurse into subdirs.
         Returns:
             dict: {root, files: [{path, size_bytes, extension, loadable}], count}
         """
         return await list_available_files(
-            subdir=subdir, pattern=pattern, recursive=recursive, instance_id=instance_id,
+            subdir=subdir, pattern=pattern, recursive=recursive,
         )
 
     @mcp.tool()
@@ -66,7 +62,6 @@ def register_file_management_tools(mcp):
     async def load_file_tool(
         path: str,
         mode: str = "replace",
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Load an APK/JAR/AAR/DEX into JADX without touching the GUI. Returns immediately (202).
 
@@ -82,12 +77,11 @@ def register_file_management_tools(mcp):
 
         Args:
             path: Sandbox-relative path (e.g. "target.apk"). mode: replace|append.
-            instance_id: Target JADX instance.
         Returns:
             dict: {dispatched: bool, mode, path, ready: false, poll_with: "get_decompile_status",
                    auto_warmup: bool, warmup_status_endpoint,
                    warmup: {phase, eta_seconds, capabilities}, _ai_instruction}
         """
-        return await load_file(path=path, mode=mode, instance_id=instance_id)
+        return await load_file(path=path, mode=mode)
 
     logger.info("File management tools registered: list_available_files_tool, load_file_tool")

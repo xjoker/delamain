@@ -6,16 +6,15 @@ Two tools are exposed:
 - analyze_apk_tool(path, strategy) — smart file routing on the single JADX backend
 - list_loaded_files_tool()          — what the backend currently holds
 
-Single-instance gateway: strategy="new_instance" has no second backend to route
-to, so it returns the same "all_busy" shape as an exhausted auto-route instead
-of spinning up a new JADX worker.
+Single-instance gateway: strategy is one of auto|replace|append. There is only
+ever one backend, so there is no "route to a different instance" option —
+callers who want a fresh load use replace, and dependency JARs use append.
 """
 
-from typing import Optional
-
 from ..registry.instance_registry import InstanceRegistry
-from ..routing.request_router import get_from_jadx, resolve_instance
+from ..routing.request_router import get_from_jadx
 from ..logging_config import get_logger
+from ..types import ErrorCode
 
 logger = get_logger("workflow_tools")
 
@@ -42,7 +41,7 @@ def _instance_has_no_file(file_info: dict) -> bool:
 
 
 async def _fetch_file_info(instance) -> dict:
-    result = await get_from_jadx("file-info", instance_id=instance.name)
+    result = await get_from_jadx("file-info")
     if not result or result.get("error"):
         logger.debug(f"_fetch_file_info({instance.name}): {result.get('message') if result else 'no result'}")
         return {}
@@ -50,7 +49,7 @@ async def _fetch_file_info(instance) -> dict:
 
 
 async def _fetch_decompile_status(instance) -> dict:
-    result = await get_from_jadx("decompile-status", instance_id=instance.name)
+    result = await get_from_jadx("decompile-status")
     if not result or result.get("error"):
         logger.debug(f"_fetch_decompile_status({instance.name}): {result.get('message') if result else 'no result'}")
         return {}
@@ -60,7 +59,6 @@ async def _fetch_decompile_status(instance) -> dict:
 async def _load_file_on_instance(instance, path: str, mode: str = "replace") -> dict:
     result = await get_from_jadx(
         "load-file",
-        instance_id=instance.name,
         method="POST",
         json_body={"path": path, "mode": mode},
     )
@@ -83,9 +81,8 @@ _NO_INSTANCE_NEXT_STEPS = ["No JADX instance available. Configure one in Compose
 async def analyze_apk(
     path: str,
     strategy: str = "auto",
-    instance_id: Optional[str] = None,
 ) -> dict:
-    if strategy not in ("auto", "replace", "new_instance", "append"):
+    if strategy not in ("auto", "replace", "append"):
         return {
             "status": "error",
             "instance": None,
@@ -93,13 +90,9 @@ async def analyze_apk(
             "ready": False,
             "poll_with": None,
             "next_steps": [
-                f"strategy must be one of: auto, replace, new_instance, append — got '{strategy}'"
+                f"strategy must be one of: auto, replace, append — got '{strategy}'"
             ],
         }
-
-    validation_error = await resolve_instance(instance_id)
-    if validation_error is not None:
-        return validation_error
 
     target = InstanceRegistry.get_default()
 
@@ -137,21 +130,6 @@ async def analyze_apk(
             "ready": False,
             "poll_with": "get_decompile_status",
             "next_steps": [note],
-        }
-
-    if strategy == "new_instance":
-        return {
-            "status": "all_busy",
-            "instance": None,
-            "path": path,
-            "ready": False,
-            "poll_with": None,
-            "next_steps": [
-                "This gateway is wired to a single JADX backend — there is no second "
-                "instance to route to.",
-                "1. Call analyze_apk(path, strategy='replace') to overwrite the current file.",
-                "2. Call analyze_apk(path, strategy='append') to add it as a dependency instead.",
-            ],
         }
 
     # strategy="auto"
@@ -202,14 +180,10 @@ async def analyze_apk(
     }
 
 
-async def list_loaded_files(instance_id: Optional[str] = None) -> dict:
-    validation_error = await resolve_instance(instance_id)
-    if validation_error is not None:
-        return validation_error
-
+async def list_loaded_files() -> dict:
     target = InstanceRegistry.get_default()
     if not target:
-        return {"instances": [], "count": 0, "free_count": 0}
+        return {"error": ErrorCode.NO_INSTANCE, "message": "No JADX backend configured"}
 
     file_info = await _fetch_file_info(target)
     decompile_status = await _fetch_decompile_status(target)
@@ -223,7 +197,7 @@ async def list_loaded_files(instance_id: Optional[str] = None) -> dict:
     progress = decompile_status.get("cached_percentage") or decompile_status.get("percentage") or 0.0
     decompile_progress = round(float(progress) / 100.0, 2) if isinstance(progress, (int, float)) else 0.0
 
-    result = {
+    return {
         "name": target.name,
         "host": target.host,
         "port": target.port,
@@ -238,11 +212,6 @@ async def list_loaded_files(instance_id: Optional[str] = None) -> dict:
         ),
         "input_hash": identity.get("input_hash") or file_info.get("input_hash"),
     }
-    return {
-        "instances": [result],
-        "count": 1,
-        "free_count": 1 if available else 0,
-    }
 
 
 def register_workflow_tools(mcp):
@@ -252,38 +221,31 @@ def register_workflow_tools(mcp):
     async def analyze_apk_tool(
         path: str,
         strategy: str = "auto",
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Load an APK/JAR into the JADX backend with smart routing.
 
         strategy="auto" (default): load if the backend is free; return "ambiguous"
           when it already has a file loaded (human guidance needed).
         strategy="replace": load, replacing whatever is currently open.
-        strategy="new_instance": no-op in this single-backend gateway — returns
-          all_busy pointing at replace/append instead.
         strategy="append": append to current project (useful for dep JARs).
 
         Args:
-            path: Sandbox-relative file path (e.g. "target.apk"). strategy: auto|replace|new_instance|append.
-            instance_id: Unused — this gateway has a single fixed JADX backend.
+            path: Sandbox-relative file path (e.g. "target.apk"). strategy: auto|replace|append.
         Returns:
-            dict: {status: loaded|ambiguous|all_busy|error, instance, path, ready: false,
+            dict: {status: loaded|ambiguous|error, instance, path, ready: false,
                    poll_with, next_steps}
         """
-        return await analyze_apk(path=path, strategy=strategy, instance_id=instance_id)
+        return await analyze_apk(path=path, strategy=strategy)
 
     @mcp.tool()
-    async def list_loaded_files_tool(
-        instance_id: Optional[str] = None,
-    ) -> dict:
+    async def list_loaded_files_tool() -> dict:
         """Show what APK/JAR the JADX backend is currently analyzing and whether it is free.
 
-        Args:
-            instance_id: Unused — this gateway has a single fixed JADX backend.
         Returns:
-            dict: {instances: [{name, loaded_file, decompile_progress, available,
-                   version_name, version_code, input_hash}], count, free_count}
+            dict: {name, host, port, loaded_file, decompile_progress, available,
+                   version_name, version_code, input_hash} — or
+                  {error: "NO_INSTANCE", message} when no backend is configured.
         """
-        return await list_loaded_files(instance_id=instance_id)
+        return await list_loaded_files()
 
     logger.info("Workflow tools registered: analyze_apk_tool, list_loaded_files_tool")

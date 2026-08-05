@@ -101,7 +101,7 @@ the Java backend at `127.0.0.1:8650`. Structure:
 
 | Path | Responsibility |
 |---|---|
-| `src/tools/` | One MCP tool module per feature area (`class_tools`, `search_tools`, `xrefs_tools`, `resource_tools`, `string_literal_tools`, `refactor_tools`, `annotation_tools`, `analysis_surface_tools`, `dataflow_tools`, `security_tools`, `frida_tools`, `digest_tools`, `export_tools`, `workflow_tools`, `instance_tools`, `session_tools`, `task_tools`, `diagnostics_tools`, `decompile_tools`, `file_management_tools`, `init_tools`); `tools/__init__.py:register_all_tools()` wires them all into the `FastMCP` instance. |
+| `src/tools/` | One MCP tool module per feature area (`class_tools`, `search_tools`, `xrefs_tools`, `resource_tools`, `string_literal_tools`, `refactor_tools`, `annotation_tools`, `analysis_surface_tools`, `dataflow_tools`, `security_tools`, `frida_tools`, `digest_tools`, `export_tools`, `workflow_tools`, `guide_tools`, `session_tools`, `task_tools`, `diagnostics_tools`, `decompile_tools`, `file_management_tools`, `init_tools`); `tools/__init__.py:register_all_tools()` wires them all into the `FastMCP` instance. |
 | `src/config/` | TOML config loading (`config_loader.py`), env-over-TOML precedence |
 | `src/auth/` | MCP client bearer-token auth (`build_auth_provider`) — every listed token grants identical full access; there is no per-token role in this single-user gateway |
 | `src/registry/` | `InstanceRegistry` holding the single fixed JADX backend this gateway proxies to |

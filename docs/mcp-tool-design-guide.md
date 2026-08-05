@@ -45,12 +45,11 @@ parameter should be the fully qualified name...
 
 ```python
 @mcp.tool()
-async def get_class_source(class_name: str, instance_id: str = None) -> dict:
+async def get_class_source(class_name: str) -> dict:
     """Get decompiled Java source for a class.
 
     Args:
         class_name: Full class name (e.g. "com.example.MyClass") or simple name.
-        instance_id: Target JADX instance; omit for default.
     Returns:
         dict: {response: java_source_code}
     """
@@ -206,33 +205,14 @@ batch_get_class_source(class_names: list[str]) → dict
 
 ---
 
-## 7. `instance_id` is a vestigial parameter — do not add new routing logic on it
-
-Tools still accept `instance_id: Optional[str] = None` for call-site
-compatibility with the ~30 tool modules that pass it through, but the
-gateway is single-machine/single-instance/single-user: `get_from_jadx`
-always proxies to the one backend configured via `InstanceRegistry.configure()`
-and ignores the value (see `gateway/src/routing/request_router.py`). Don't
-write new code that assumes `instance_id` selects among multiple backends —
-there is exactly one.
-
-```python
-async def any_tool(param: str, instance_id: Optional[str] = None) -> dict:
-    return await get_from_jadx("endpoint",
-                               params={"param": param},
-                               instance_id=instance_id)
-```
-
----
-
-## 8. Handling load state
+## 7. Handling load state
 
 While a large APK is loading, any Java-layer endpoint may return HTTP 202
 `{"status": "loading"}`.
 
 ```python
 # The Python tool layer must handle the 202/loading state
-result = await get_from_jadx("decompile-status", instance_id=instance_id)
+result = await get_from_jadx("decompile-status")
 if result.get("status") == "loading":
     result["retry_after_seconds"] = 3
     result["suggestion"] = "JADX is still loading the file. Retry in 3 seconds."
@@ -244,7 +224,7 @@ instead of treating it as a failure.
 
 ---
 
-## 9. Handling large responses
+## 8. Handling large responses
 
 When a single response exceeds 32KB (`DELAMAIN_INLINE_RESPONSE_MAX_BYTES`),
 the Java layer returns a "too large" signal instead of the content. The
@@ -264,13 +244,13 @@ shrink the batch or read in chunks.
 
 ---
 
-## 10. Tool naming conventions
+## 9. Tool naming conventions
 
 ```
 verb_noun → get_class_source, search_classes_by_keyword
 submit_verb → submit_security_scan, submit_code_search (async submission)
 get_verb_result → get_task_result, get_code_search_result (polling)
-list_noun → list_packages, list_jadx_instances
+list_noun → list_packages, list_available_files
 ```
 
 Verb choice:
@@ -283,7 +263,7 @@ Verb choice:
 
 ---
 
-## 11. Anti-patterns (lessons learned the hard way)
+## 10. Anti-patterns (lessons learned the hard way)
 
 | Anti-pattern | Consequence | Correct approach |
 |---|---|---|

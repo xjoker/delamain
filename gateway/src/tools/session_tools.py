@@ -36,7 +36,6 @@ def _validate_session_name(name: str) -> Optional[str]:
 async def save_analysis_session(
     session_name: str,
     context: dict,
-    instance_id: Optional[str] = None,
 ) -> dict:
     logger.info(f"save_analysis_session: name={session_name}")
 
@@ -46,7 +45,7 @@ async def save_analysis_session(
 
     file_info: dict = {}
     try:
-        file_info = await get_from_jadx("file-info", instance_id=instance_id)
+        file_info = await get_from_jadx("file-info")
         if isinstance(file_info, str):
             file_info = {}
     except Exception as exc:
@@ -71,7 +70,6 @@ async def save_analysis_session(
             "session_name": session_name,
             "saved_at": now_iso,
             "previous_save_time": previous_save_time,
-            "instance_id": instance_id,
             "file_info": file_info,
         },
         "context": context,
@@ -170,18 +168,16 @@ def register_session_tools(mcp):
     async def save_analysis_session(
         session_name: str,
         context: dict,
-        instance_id: Optional[str] = None,
     ) -> dict:
         """Save AI analysis context to a local JSON file for later restoration.
 
         Args:
             session_name: Name (alphanumeric, hyphens, underscores; 1-100 chars).
             context: Dict with keys: analyzed_classes, findings, notes, current_focus, next_steps.
-            instance_id: Target JADX instance name.
         Returns:
             dict: {success, session_name, saved_at, file_path}
         """
-        return await _save_analysis_session(session_name, context, instance_id=instance_id)
+        return await _save_analysis_session(session_name, context)
 
     @mcp.tool()
     @with_busy_check

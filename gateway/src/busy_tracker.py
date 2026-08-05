@@ -1,5 +1,6 @@
 """
-Instance busy tracking and per-lane scheduling for MCP tool calls.
+Busy tracking and per-lane scheduling for MCP tool calls against the single
+configured JADX backend.
 
 Used as an optional decorator (no GUI state required).
 """
@@ -23,7 +24,6 @@ from .types import ErrorCode
 
 logger = get_logger("busy_tracker")
 
-DEFAULT_INSTANCE_TRACKING_KEY = "__default__"
 DEFAULT_CODE_READ_QUEUE_LIMIT = 8
 DEFAULT_CODE_READ_ACTIVE_LIMIT = 4
 DEFAULT_EXCLUSIVE_WAIT_SECONDS = 2.0
@@ -169,21 +169,23 @@ def get_operation_policy(operation_name: str, kwargs: dict[str, Any] | None = No
 
 
 class InstanceBusyTracker:
-    _states: dict[str, InstanceSchedulerState] = {}
+    """Per-lane scheduler for the single configured JADX backend.
+
+    Single fixed backend: one scheduler state for the whole process, no
+    per-instance bucketing.
+    """
+
+    _state: InstanceSchedulerState = InstanceSchedulerState()
     _timeout_seconds: int = 300
     _exclusive_wait_seconds: float = DEFAULT_EXCLUSIVE_WAIT_SECONDS
 
     @classmethod
     def force_release_all(cls) -> None:
-        cls._states = {}
+        cls._state = InstanceSchedulerState()
 
     @classmethod
-    def _get_state(cls, instance_name: str) -> InstanceSchedulerState:
-        state = cls._states.get(instance_name)
-        if state is None:
-            state = InstanceSchedulerState()
-            cls._states[instance_name] = state
-        return state
+    def _get_state(cls) -> InstanceSchedulerState:
+        return cls._state
 
     @classmethod
     def _serialize_active(cls, op: ActiveOperation) -> dict[str, Any]:
@@ -258,7 +260,6 @@ class InstanceBusyTracker:
         cls,
         *,
         state: InstanceSchedulerState,
-        instance_name: str,
         lane: str,
         operation_name: str,
         queue_limit: int,
@@ -285,8 +286,7 @@ class InstanceBusyTracker:
 
         return {
             "error": ErrorCode.INSTANCE_BUSY,
-            "message": f"Instance '{instance_name}' is busy with {current_operation}",
-            "instance": instance_name,
+            "message": f"JADX backend is busy with {current_operation}",
             "lane": lane,
             "current_operation": current_operation,
             "busy_since": busy_since,
@@ -300,32 +300,12 @@ class InstanceBusyTracker:
         }
 
     @classmethod
-    def _resolve_instance_name(cls, requested_instance: str | None = None) -> str | None:
-        """Resolve a tracking key for the single configured JADX backend.
-
-        Single-instance gateway: requested_instance is accepted for call-site
-        compatibility but there is only ever one backend, so any non-empty
-        request and the "no instance given" case both resolve to its name.
-        """
-        try:
-            from .registry.instance_registry import InstanceRegistry
-        except ImportError:
-            return requested_instance or DEFAULT_INSTANCE_TRACKING_KEY
-
-        instance = InstanceRegistry.get_default()
-        if instance:
-            return instance.name
-
-        return requested_instance or DEFAULT_INSTANCE_TRACKING_KEY
-
-    @classmethod
     async def try_acquire(
         cls,
-        instance_name: str,
         operation_name: str,
         kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        state = cls._get_state(instance_name)
+        state = cls._get_state()
         policy = get_operation_policy(operation_name, kwargs)
         token = uuid.uuid4().hex
 
@@ -378,7 +358,6 @@ class InstanceBusyTracker:
                 if len(state.code_read_queue) >= policy.queue_limit:
                     return cls._build_busy_result(
                         state=state,
-                        instance_name=instance_name,
                         lane=policy.lane,
                         operation_name=operation_name,
                         queue_limit=policy.queue_limit,
@@ -460,7 +439,6 @@ class InstanceBusyTracker:
 
             return cls._build_busy_result(
                 state=state,
-                instance_name=instance_name,
                 lane=policy.lane,
                 operation_name=operation_name,
                 queue_limit=policy.queue_limit,
@@ -469,13 +447,11 @@ class InstanceBusyTracker:
             )
 
     @classmethod
-    async def release(cls, instance_name: str, token: str | None) -> None:
+    async def release(cls, token: str | None) -> None:
         if not token:
             return
 
-        state = cls._states.get(instance_name)
-        if state is None:
-            return
+        state = cls._get_state()
 
         async with state.condition:
             removed = False
@@ -488,57 +464,35 @@ class InstanceBusyTracker:
                 state.condition.notify_all()
 
     @classmethod
-    def get_snapshot(cls, instance_name: str | None = None) -> dict[str, Any]:
-        def serialize_state(state: InstanceSchedulerState) -> dict[str, Any]:
-            metadata_active = [cls._serialize_active(op) for op in state.metadata_active.values()]
-            code_read_active = [cls._serialize_active(op) for op in state.code_read_active.values()]
-            exclusive_active = [cls._serialize_active(op) for op in state.exclusive_active.values()]
-            queue_entries = [
-                {
-                    "token": item.token,
-                    "operation": item.operation,
-                    "requested_at": item.requested_at,
-                    "age_seconds": round(max(0.0, time.monotonic() - item.requested_monotonic), 3),
-                }
-                for item in list(state.code_read_queue)
-            ]
-            return {
-                "metadata_inflight": len(metadata_active),
-                "code_read_inflight": len(code_read_active),
-                "exclusive_inflight": len(exclusive_active),
-                "queue_depth": len(queue_entries),
-                "queue_limit": DEFAULT_CODE_READ_QUEUE_LIMIT,
-                "active_limit": DEFAULT_CODE_READ_ACTIVE_LIMIT,
-                "active_operations": {
-                    "metadata": metadata_active,
-                    "code_read": code_read_active,
-                    "exclusive": exclusive_active,
-                },
-                "queued_operations": queue_entries,
-                "last_busy_reason": state.last_busy_reason or "",
-                "last_busy_at": state.last_busy_at,
+    def get_snapshot(cls) -> dict[str, Any]:
+        state = cls._get_state()
+        metadata_active = [cls._serialize_active(op) for op in state.metadata_active.values()]
+        code_read_active = [cls._serialize_active(op) for op in state.code_read_active.values()]
+        exclusive_active = [cls._serialize_active(op) for op in state.exclusive_active.values()]
+        queue_entries = [
+            {
+                "token": item.token,
+                "operation": item.operation,
+                "requested_at": item.requested_at,
+                "age_seconds": round(max(0.0, time.monotonic() - item.requested_monotonic), 3),
             }
-
-        if instance_name is not None:
-            state = cls._states.get(instance_name)
-            if state is None:
-                return {
-                    "metadata_inflight": 0,
-                    "code_read_inflight": 0,
-                    "exclusive_inflight": 0,
-                    "queue_depth": 0,
-                    "queue_limit": DEFAULT_CODE_READ_QUEUE_LIMIT,
-                    "active_limit": DEFAULT_CODE_READ_ACTIVE_LIMIT,
-                    "active_operations": {"metadata": [], "code_read": [], "exclusive": []},
-                    "queued_operations": [],
-                    "last_busy_reason": "",
-                    "last_busy_at": None,
-                }
-            return serialize_state(state)
-
+            for item in list(state.code_read_queue)
+        ]
         return {
-            name: serialize_state(state)
-            for name, state in cls._states.items()
+            "metadata_inflight": len(metadata_active),
+            "code_read_inflight": len(code_read_active),
+            "exclusive_inflight": len(exclusive_active),
+            "queue_depth": len(queue_entries),
+            "queue_limit": DEFAULT_CODE_READ_QUEUE_LIMIT,
+            "active_limit": DEFAULT_CODE_READ_ACTIVE_LIMIT,
+            "active_operations": {
+                "metadata": metadata_active,
+                "code_read": code_read_active,
+                "exclusive": exclusive_active,
+            },
+            "queued_operations": queue_entries,
+            "last_busy_reason": state.last_busy_reason or "",
+            "last_busy_at": state.last_busy_at,
         }
 
 
@@ -558,31 +512,12 @@ def with_busy_check(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaita
 
     @functools.wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        # bind_partial (not raw kwargs) so a policy-relevant parameter such as
+        # search_in is found by get_operation_policy() regardless of whether
+        # the caller passed it positionally or by keyword.
         bound = signature.bind_partial(*args, **kwargs)
-        requested_instance = bound.arguments.get("instance_id")
-
-        if requested_instance is not None:
-            # Reject an unresolvable instance_id up front — before acquiring a
-            # lane lock — instead of silently tracking it under the single
-            # backend's name (see request_router.resolve_instance()).
-            from .routing.request_router import resolve_instance
-
-            validation_error = await resolve_instance(requested_instance)
-            if validation_error is not None:
-                return validation_error
-
-        instance_name = InstanceBusyTracker._resolve_instance_name(requested_instance)
-
-        if instance_name is None:
-            return {
-                "error": ErrorCode.NO_INSTANCE,
-                "message": "No JADX instance configured. Pure pull mode requires an explicit instance registration.",
-            }
-
         acquisition = await InstanceBusyTracker.try_acquire(
-            instance_name,
-            operation_name,
-            kwargs=dict(bound.arguments),
+            operation_name, kwargs=dict(bound.arguments)
         )
         if not acquisition.get("success"):
             return acquisition
@@ -591,6 +526,6 @@ def with_busy_check(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaita
         try:
             return await func(*args, **kwargs)
         finally:
-            await InstanceBusyTracker.release(instance_name, token)
+            await InstanceBusyTracker.release(token)
 
     return wrapper

@@ -81,19 +81,19 @@ async def test_with_busy_check_strips_tool_suffix_for_metadata_lane():
     Before the fix, looking up the policy table with func.__name__ directly never
     found a match, so it always fell back to the default exclusive lock.
     """
-    InstanceRegistry.configure(host="127.0.0.1", port=8650, name="jadx-test")
+    InstanceRegistry.configure(host="127.0.0.1", port=8650, name="jadx")
     observed_lane = {}
 
     @with_busy_check
-    async def search_native_methods_tool(instance_id=None):
-        snapshot = InstanceBusyTracker.get_snapshot("jadx-test")
+    async def search_native_methods_tool():
+        snapshot = InstanceBusyTracker.get_snapshot()
         if snapshot["metadata_inflight"]:
             observed_lane["lane"] = LANE_METADATA
         elif snapshot["exclusive_inflight"]:
             observed_lane["lane"] = LANE_EXCLUSIVE
         return {"ok": True}
 
-    result = await search_native_methods_tool(instance_id="jadx-test")
+    result = await search_native_methods_tool()
     assert result == {"ok": True}
     assert observed_lane["lane"] == LANE_METADATA
 
@@ -102,19 +102,19 @@ async def test_with_busy_check_strips_tool_suffix_for_metadata_lane():
 async def test_with_busy_check_strips_tool_suffix_for_code_read_lane():
     """get_method_by_name belongs to the code_read lane (non-exclusive, allows
     concurrency up to active_limit)."""
-    InstanceRegistry.configure(host="127.0.0.1", port=8650, name="jadx-test")
+    InstanceRegistry.configure(host="127.0.0.1", port=8650, name="jadx")
     observed_lane = {}
 
     @with_busy_check
-    async def get_method_by_name_tool(instance_id=None):
-        snapshot = InstanceBusyTracker.get_snapshot("jadx-test")
+    async def get_method_by_name_tool():
+        snapshot = InstanceBusyTracker.get_snapshot()
         if snapshot["code_read_inflight"]:
             observed_lane["lane"] = LANE_CODE_READ
         elif snapshot["exclusive_inflight"]:
             observed_lane["lane"] = LANE_EXCLUSIVE
         return {"ok": True}
 
-    result = await get_method_by_name_tool(instance_id="jadx-test")
+    result = await get_method_by_name_tool()
     assert result == {"ok": True}
     assert observed_lane["lane"] == LANE_CODE_READ
 
@@ -123,18 +123,18 @@ async def test_with_busy_check_strips_tool_suffix_for_code_read_lane():
 async def test_with_busy_check_batch_get_xrefs_hits_metadata_lane():
     """In xrefs_tools.py, batch_get_xrefs_tool is registered as batch_get_xrefs
     (metadata policy)."""
-    InstanceRegistry.configure(host="127.0.0.1", port=8650, name="jadx-test")
+    InstanceRegistry.configure(host="127.0.0.1", port=8650, name="jadx")
     observed_lane = {}
 
     @with_busy_check
-    async def batch_get_xrefs_tool(instance_id=None):
-        snapshot = InstanceBusyTracker.get_snapshot("jadx-test")
+    async def batch_get_xrefs_tool():
+        snapshot = InstanceBusyTracker.get_snapshot()
         observed_lane["lane"] = (
             LANE_METADATA if snapshot["metadata_inflight"] else LANE_EXCLUSIVE
         )
         return {"ok": True}
 
-    await batch_get_xrefs_tool(instance_id="jadx-test")
+    await batch_get_xrefs_tool()
     assert observed_lane["lane"] == LANE_METADATA
 
 
@@ -142,18 +142,18 @@ async def test_with_busy_check_batch_get_xrefs_hits_metadata_lane():
 async def test_with_busy_check_unmapped_name_still_falls_back_to_exclusive():
     """An operation name not in any policy set (e.g. rename) should still fall
     back to the exclusive lock, behavior unchanged."""
-    InstanceRegistry.configure(host="127.0.0.1", port=8650, name="jadx-test")
+    InstanceRegistry.configure(host="127.0.0.1", port=8650, name="jadx")
     observed_lane = {}
 
     @with_busy_check
-    async def rename_tool(instance_id=None):
-        snapshot = InstanceBusyTracker.get_snapshot("jadx-test")
+    async def rename_tool():
+        snapshot = InstanceBusyTracker.get_snapshot()
         observed_lane["lane"] = (
             LANE_EXCLUSIVE if snapshot["exclusive_inflight"] else "other"
         )
         return {"ok": True}
 
-    await rename_tool(instance_id="jadx-test")
+    await rename_tool()
     assert observed_lane["lane"] == LANE_EXCLUSIVE
 
 

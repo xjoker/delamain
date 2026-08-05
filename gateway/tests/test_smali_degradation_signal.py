@@ -36,7 +36,7 @@ async def test_get_decompile_diag_maps_params_to_java_endpoint(monkeypatch):
 
     monkeypatch.setattr(diagnostics_tools, "get_from_jadx", fake_get_from_jadx)
 
-    await diagnostics_tools.get_decompile_diag("com.example.Foo", instance_id="inst-1")
+    await diagnostics_tools.get_decompile_diag("com.example.Foo")
     assert calls[-1] == ("decompile-diag", {"class_name": "com.example.Foo"})
 
 

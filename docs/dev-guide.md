@@ -144,14 +144,14 @@ from src.tools import xxx_tools
 async def test_some_tool_calls_correct_endpoint(monkeypatch):
     captured = {}
 
-    async def fake_get_from_jadx(endpoint, params=None, instance_id=None,
+    async def fake_get_from_jadx(endpoint, params=None,
                                   timeout=None, method="GET", json_body=None):
         captured.update(endpoint=endpoint, params=params, method=method)
         return {"result": "ok"}
 
     monkeypatch.setattr(xxx_tools, "get_from_jadx", fake_get_from_jadx)
 
-    result = await xxx_tools.some_tool("input_value", instance_id="inst1")
+    result = await xxx_tools.some_tool("input_value")
 
     assert captured["endpoint"] == "expected-endpoint"
     assert captured["params"]["key"] == "input_value"
