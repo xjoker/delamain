@@ -99,9 +99,11 @@ async def smart_decompile(
 
     decompile_status_after = {}
     try:
-        decompile_status_after = await get_from_jadx("decompile-status")
+        # /decompile-status never returns "percentage" — Phase-1 decompile progress lives on
+        # /warmup-status instead (percentage/processed/total).
+        decompile_status_after = await get_from_jadx("warmup-status")
     except Exception as exc:
-        logger.warning(f"Failed to fetch decompile-status: {exc}")
+        logger.warning(f"Failed to fetch warmup-status: {exc}")
         decompile_status_after = {"error": str(exc)}
 
     tips: list[str] = []
@@ -161,24 +163,39 @@ async def get_decompile_priority_list(
     logger.info(f"get_decompile_priority_list: goal='{analysis_goal}', package='{package}'")
 
     try:
-        all_classes_resp = await get_from_jadx("all-classes")
+        # /all-classes defaults to DEFAULT_PAGE_SIZE=100 when no count is given (see
+        # PaginationUtils.java); pass MAX_PAGE_SIZE explicitly so this doesn't silently
+        # cover only the first 100 classes.
+        all_classes_resp = await get_from_jadx("all-classes", {"count": 10000})
     except Exception as exc:
         return {"error": "JADX_ERROR", "message": f"Failed to fetch classes: {exc}"}
 
-    all_classes: list[str] = all_classes_resp.get("classes", [])
+    # /all-classes returns {classes: [{name, raw_name}]} objects, not bare strings.
+    raw_classes = all_classes_resp.get("classes", []) if isinstance(all_classes_resp, dict) else []
+    all_classes: list[str] = []
+    for c in raw_classes:
+        if isinstance(c, str):
+            all_classes.append(c)
+        elif isinstance(c, dict):
+            name = c.get("name") or c.get("raw_name", "")
+            if name:
+                all_classes.append(name)
+
     if not all_classes:
         return {
             "error": "NO_CLASSES",
             "message": "No classes found. Ensure a file is loaded in JADX.",
         }
 
-    decompile_status = {}
+    warmup_status = {}
     try:
-        decompile_status = await get_from_jadx("decompile-status")
+        # /decompile-status has no "processed_classes" field — the real decompile counter
+        # ("processed") lives on /warmup-status.
+        warmup_status = await get_from_jadx("warmup-status")
     except Exception as exc:
-        logger.warning(f"Failed to fetch decompile-status: {exc}")
+        logger.warning(f"Failed to fetch warmup-status: {exc}")
 
-    cached_count = decompile_status.get("processed_classes", 0)
+    cached_count = warmup_status.get("processed", 0) if isinstance(warmup_status, dict) else 0
     total_count = len(all_classes)
 
     priority_order = {"high": 0, "medium": 1, "low": 2}

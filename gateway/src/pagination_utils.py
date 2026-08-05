@@ -43,7 +43,12 @@ class PaginationUtils:
 
         params = {"offset": offset}
         if count > 0:
+            # Send both: handlePagination() reads limit/count interchangeably for the page
+            # size, but the xrefs snippet window (XrefsRoutes.java attachSnippets) only reads
+            # "count" — sending limit alone left snippets truncated past the default page size
+            # with no way to tell "truncated" from "genuinely no snippet".
             params["limit"] = count
+            params["count"] = count
         if additional_params:
             params.update(additional_params)
 

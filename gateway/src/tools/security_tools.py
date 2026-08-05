@@ -185,12 +185,17 @@ async def _run_security_scan(
             "message": f"Invalid scan_type '{scan_type}'. Valid values: {list(SCAN_TYPES.keys())}",
         }
 
-    decompile_status = await get_from_jadx("decompile-status")
-    cached_percentage = 0.0
-    if isinstance(decompile_status, dict):
-        cached_percentage = decompile_status.get("cached_percentage", 0.0)
+    # Java never returns "cached_percentage" from /decompile-status — that key only exists
+    # (as "cached_percentage_at_scan") on the unrelated /search-string-literals response. The
+    # real readiness signal for code-body search is /warmup-status's capabilities.code_search.
+    warmup_status = await get_from_jadx("warmup-status")
+    code_search_state = "unknown"
+    if isinstance(warmup_status, dict):
+        capabilities = warmup_status.get("capabilities", {})
+        if isinstance(capabilities, dict):
+            code_search_state = capabilities.get("code_search", "unknown")
 
-    code_search_available = cached_percentage >= 20.0
+    code_search_available = code_search_state == "ready"
     rules = filter_rules(scan_type)
 
     findings: list[dict] = []
@@ -247,8 +252,8 @@ async def _run_security_scan(
             skipped_rules.append({
                 "rule_id": rule_id,
                 "reason": (
-                    f"Code search skipped (cached_percentage={cached_percentage:.1f}% < 20%). "
-                    f"Skipped patterns: {', '.join(rule_skipped_patterns)}"
+                    f"Code search skipped (capabilities.code_search={code_search_state!r}, "
+                    f"not 'ready'). Skipped patterns: {', '.join(rule_skipped_patterns)}"
                 ),
             })
 
@@ -289,7 +294,7 @@ async def _run_security_scan(
         "skipped_rules": skipped_rules,
         "scan_coverage": {
             "code_search_available": code_search_available,
-            "cached_percentage": cached_percentage,
+            "code_search_state": code_search_state,
         },
     }
 

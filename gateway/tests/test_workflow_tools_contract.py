@@ -75,8 +75,8 @@ async def test_list_loaded_files_returns_flat_shape(monkeypatch):
                 "version_code": 1,
                 "apk_identity": {"input_hash": "abc123"},
             }
-        if endpoint == "decompile-status":
-            return {"cached_percentage": 50}
+        if endpoint == "warmup-status":
+            return {"percentage": 50}
         return {}
 
     monkeypatch.setattr(workflow_tools, "get_from_jadx", fake_get_from_jadx)
@@ -124,8 +124,8 @@ async def test_list_loaded_files_reflects_file_info_identity(monkeypatch):
                 "class_count": 4200,
                 "status": "success",
             }
-        if endpoint == "decompile-status":
-            return {"cached_percentage": 42}
+        if endpoint == "warmup-status":
+            return {"percentage": 42}
         return {}
 
     monkeypatch.setattr(workflow_tools, "get_from_jadx", fake_get_from_jadx)
@@ -145,8 +145,8 @@ async def test_list_loaded_files_reports_available_when_nothing_loaded(monkeypat
     async def fake_get_from_jadx(endpoint, *args, **kwargs):
         if endpoint == "file-info":
             return {"type": "file-info", "loaded": False, "error": "No file loaded"}
-        if endpoint == "decompile-status":
-            return {"cached_percentage": 0}
+        if endpoint == "warmup-status":
+            return {"percentage": 0}
         return {}
 
     monkeypatch.setattr(workflow_tools, "get_from_jadx", fake_get_from_jadx)

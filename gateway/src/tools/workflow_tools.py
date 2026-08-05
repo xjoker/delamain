@@ -48,10 +48,12 @@ async def _fetch_file_info(instance) -> dict:
     return result
 
 
-async def _fetch_decompile_status(instance) -> dict:
-    result = await get_from_jadx("decompile-status")
+async def _fetch_warmup_status(instance) -> dict:
+    # /decompile-status carries no "percentage"/"cached_percentage" field; the real
+    # decompile-progress number lives on /warmup-status.
+    result = await get_from_jadx("warmup-status")
     if not result or result.get("error"):
-        logger.debug(f"_fetch_decompile_status({instance.name}): {result.get('message') if result else 'no result'}")
+        logger.debug(f"_fetch_warmup_status({instance.name}): {result.get('message') if result else 'no result'}")
         return {}
     return result
 
@@ -118,17 +120,17 @@ async def analyze_apk(
                 "next_steps": [result["error"]],
             }
         note = (
-            "File is loading. Poll get_decompile_status until cached_percentage stabilises."
+            "File is loading. Poll get_warmup_status until percentage reaches 100."
             if strategy == "replace"
             else "Dependency appended to open project. "
-            "Poll get_decompile_status until cached_percentage stabilises."
+            "Poll get_warmup_status until percentage reaches 100."
         )
         return {
             "status": "loaded",
             "instance": _instance_summary(target),
             "path": path,
             "ready": False,
-            "poll_with": "get_decompile_status",
+            "poll_with": "get_warmup_status",
             "next_steps": [note],
         }
 
@@ -160,8 +162,8 @@ async def analyze_apk(
             "instance": _instance_summary(target),
             "path": path,
             "ready": False,
-            "poll_with": "get_decompile_status",
-            "next_steps": ["File is loading. Poll get_decompile_status until cached_percentage stabilises."],
+            "poll_with": "get_warmup_status",
+            "next_steps": ["File is loading. Poll get_warmup_status until percentage reaches 100."],
         }
 
     loaded_name = file_info.get("file_name") or file_info.get("apk_package") or "unknown"
@@ -186,7 +188,7 @@ async def list_loaded_files() -> dict:
         return {"error": ErrorCode.NO_INSTANCE, "message": "No JADX backend configured"}
 
     file_info = await _fetch_file_info(target)
-    decompile_status = await _fetch_decompile_status(target)
+    warmup_status = await _fetch_warmup_status(target)
 
     available = _instance_has_no_file(file_info)
     identity = file_info.get("apk_identity") or {}
@@ -194,7 +196,7 @@ async def list_loaded_files() -> dict:
         file_info.get("file_name") or identity.get("file_name") or file_info.get("apk_package") or None
     )
 
-    progress = decompile_status.get("cached_percentage") or decompile_status.get("percentage") or 0.0
+    progress = warmup_status.get("percentage") or 0.0
     decompile_progress = round(float(progress) / 100.0, 2) if isinstance(progress, (int, float)) else 0.0
 
     return {

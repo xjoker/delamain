@@ -212,7 +212,7 @@ def generate_analysis_tips(
 
     if not tips:
         tips.append(
-            "Start with get_main_application_classes_names and batch_get_class_source on a few "
+            "Start with get_all_classes and batch_get_class_source on a few "
             "representative classes to build an overall understanding."
         )
 
@@ -262,13 +262,21 @@ async def _generate_apk_digest() -> dict:
     )
     total_classes = 0
     if isinstance(class_count_result, dict):
-        total_classes = class_count_result.get("total", 0)
+        # /all-classes puts "total" inside the nested "pagination" object, not at the top
+        # level (see PaginationUtils.java buildPaginationResponse) — reading a missing
+        # top-level "total" silently gave 0, which Java's own pagination then treats as
+        # "no limit" and returns everything.
+        total_classes = class_count_result.get("pagination", {}).get("total", 0)
 
+    # Progress lives on /warmup-status; /decompile-status carries no
+    # "cached_percentage" field (reading it silently pinned this at 0.0).
     decompile_status = await get_from_jadx("decompile-status")
+    warmup_status = await get_from_jadx("warmup-status")
     cached_percentage = 0.0
     decompile_total = 0
+    if isinstance(warmup_status, dict):
+        cached_percentage = warmup_status.get("percentage", 0.0)
     if isinstance(decompile_status, dict):
-        cached_percentage = decompile_status.get("cached_percentage", 0.0)
         decompile_total = decompile_status.get("total_classes", total_classes)
 
     sample_count = min(total_classes, 200)
