@@ -46,11 +46,11 @@ public class DelamainServer {
     private final AuthConfig authConfig;
 
     // Package-private so the contract is directly assertable (see DelamainServerNoFilePathsTest).
-    // /memory-diagnostics belongs here for the same reason /memory-config does: it reads only the
-    // JVM, /proc and index statics, and its most valuable readings (baseline before a load,
-    // verifying the container-derived heap took effect) are taken with nothing loaded.
+    // /memory-diagnostics belongs here because it reads only the JVM, /proc and index statics, and
+    // its most valuable readings (baseline before a load, verifying the container-derived heap
+    // took effect) are taken with nothing loaded.
     static final Set<String> NO_FILE_REQUIRED_PATHS = Set.of(
-            "/health", "/apk-info", "/decompile-status", "/memory-config", "/memory-diagnostics",
+            "/health", "/apk-info", "/decompile-status", "/memory-diagnostics",
             "/list-available-files", "/load-file",
             "/create-transfer-token", "/transfer/upload", "/transfer/status");
 
@@ -292,7 +292,7 @@ public class DelamainServer {
         new ClassRoutes(wrapper, paginationUtils).register(app, authConfig);
         SearchRoutes searchRoutes = new SearchRoutes(wrapper, paginationUtils);
         searchRoutes.register(app, authConfig);
-        new BatchRoutes(wrapper, paginationUtils, searchRoutes).register(app, authConfig);
+        new BatchRoutes(wrapper, searchRoutes).register(app, authConfig);
         new XrefsRoutes(wrapper, paginationUtils).register(app, authConfig);
         new MethodRoutes(wrapper).register(app, authConfig);
         new ResourceRoutes(wrapper, paginationUtils).register(app, authConfig);

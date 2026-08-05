@@ -43,7 +43,7 @@ poll could hit a partially-registered route table.
 Two path sets get special auth treatment:
 - `NO_FILE_REQUIRED_PATHS` — endpoints that must respond even before any
   APK is loaded (`/health`, `/apk-info`, `/decompile-status`,
-  `/memory-config`, `/list-available-files`, `/load-file`,
+  `/memory-diagnostics`, `/list-available-files`, `/load-file`,
   `/create-transfer-token`, `/transfer/upload`, `/transfer/status`).
 - `TRANSFER_TOKEN_AUTH_PATHS` (`/transfer/upload`, `/transfer/status`) —
   authenticate via their own one-time `X-Transfer-Token` header instead of

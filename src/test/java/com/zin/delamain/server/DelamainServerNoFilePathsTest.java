@@ -14,8 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * whose most useful answers are exactly the ones asked when nothing is loaded (baseline before a
  * load, capacity planning, checking whether the container-derived heap took effect). Gating it on
  * a loaded APK makes the endpoint unusable at the moment it matters most, and it needs no wrapper
- * state at all: {@code buildMemoryDiagnostics} reads only the JVM, /proc and the index statics.
- * Same reasoning already applied to its sibling {@code /memory-config}.</p>
+ * state at all: {@code buildMemoryDiagnostics} reads only the JVM, /proc and the index statics.</p>
  */
 class DelamainServerNoFilePathsTest {
 
@@ -27,7 +26,7 @@ class DelamainServerNoFilePathsTest {
 
     @Test
     void theOtherApkFreeEndpointsStayApkFree() {
-        for (String path : new String[]{"/health", "/apk-info", "/decompile-status", "/memory-config",
+        for (String path : new String[]{"/health", "/apk-info", "/decompile-status",
                 "/list-available-files", "/load-file"}) {
             assertTrue(DelamainServer.NO_FILE_REQUIRED_PATHS.contains(path),
                 path + " must stay reachable without a loaded APK");

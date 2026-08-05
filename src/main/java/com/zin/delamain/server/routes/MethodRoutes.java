@@ -8,18 +8,11 @@ import jadx.api.JavaClass;
 import jadx.api.JavaMethod;
 import jadx.api.plugins.input.data.IMethodRef;
 import jadx.api.utils.CodeUtils;
-import jadx.api.plugins.input.data.annotations.IAnnotation;
-import jadx.api.plugins.input.data.attributes.JadxAttrType;
-import jadx.api.plugins.input.data.attributes.types.AnnotationsAttr;
-import jadx.core.dex.attributes.AType;
-import jadx.core.dex.attributes.nodes.MethodOverrideAttr;
-import jadx.core.dex.info.AccessInfo;
 import jadx.core.dex.info.MethodInfo;
 import jadx.core.dex.instructions.BaseInvokeNode;
 import jadx.core.dex.instructions.args.ArgType;
 import jadx.core.dex.instructions.args.InsnArg;
 import jadx.core.dex.instructions.args.InsnWrapArg;
-import jadx.core.dex.nodes.IMethodDetails;
 import jadx.core.dex.nodes.InsnNode;
 import jadx.core.dex.nodes.MethodNode;
 
@@ -70,7 +63,6 @@ public class MethodRoutes {
         app.get("/method-signature",    this::handleMethodSignature);
         app.get("/method-callees",      this::handleMethodCallees);
         app.get("/search-native-methods", this::handleSearchNativeMethods);
-        app.get("/method-symbol-view",  this::handleMethodSymbolView);
         app.get("/method-source",       this::handleMethodSource);
     }
 
@@ -567,99 +559,6 @@ public class MethodRoutes {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Method symbol view
-    // -------------------------------------------------------------------------
-
-    public void handleMethodSymbolView(Context ctx) {
-        String className = ctx.queryParam("class_name");
-        String methodName = validateMethodParam(ctx);
-        if (methodName == null) return;
-
-        // method_signature is optional; used to disambiguate overloads
-        String methodSignature = ctx.queryParam("method_signature");
-        if (methodSignature != null && methodSignature.isBlank()) methodSignature = null;
-
-        if (className == null || className.isEmpty()) {
-            ctx.status(400).json(Map.of("error", "Missing required parameter 'class_name'"));
-            return;
-        }
-
-        try {
-            if (wrapper == null || !wrapper.isLoaded()) {
-                ctx.status(500).json(Map.of("error", "Wrapper not initialized"));
-                return;
-            }
-
-            if (!JadxSearchLock.tryAcquireRead()) {
-                ctx.status(503).json(Map.of("error", "Decompilation operation in progress",
-                    "retry_after", JadxSearchLock.RETRY_AFTER_SECONDS, "busy", true));
-                return;
-            }
-
-            JavaClass foundCls = null;
-            List<JavaMethod> candidates = null;
-            try {
-                for (JavaClass cls : wrapper.getClassesWithInners()) {
-                    if (JadxApiAdapter.matchesClassName(cls, className)) {
-                        candidates = findMethodsByName(cls, methodName);
-                        foundCls = cls;
-                        break;
-                    }
-                }
-            } finally {
-                JadxSearchLock.releaseRead();
-            }
-
-            if (foundCls == null) {
-                ctx.status(404).json(Map.of("error", "Class " + className + " not found."));
-                return;
-            }
-            if (candidates == null || candidates.isEmpty()) {
-                ctx.status(404).json(Map.of("error", "Method " + methodName + " not found in class " + className));
-                return;
-            }
-
-            // Disambiguate overloads
-            JavaMethod targetMethod = null;
-            if (methodSignature != null) {
-                for (JavaMethod m : candidates) {
-                    if (JadxApiAdapter.matchesMethodDescriptor(m, methodSignature)) {
-                        targetMethod = m;
-                        break;
-                    }
-                }
-                if (targetMethod == null) {
-                    List<String> available = collectDescriptors(candidates);
-                    Map<String, Object> err = new HashMap<>();
-                    err.put("error", "No overload of " + methodName + " matches descriptor '"
-                        + methodSignature + "' in class " + foundCls.getFullName());
-                    err.put("available_descriptors", available);
-                    ctx.status(404).json(err);
-                    return;
-                }
-            } else if (candidates.size() == 1) {
-                targetMethod = candidates.get(0);
-            } else {
-                List<String> available = collectDescriptors(candidates);
-                Map<String, Object> err = new HashMap<>();
-                err.put("error", "Method " + methodName + " in class " + foundCls.getFullName()
-                    + " has " + candidates.size()
-                    + " overloads. Provide 'method_signature' to select one.");
-                err.put("available_descriptors", available);
-                // 400, not 300 (Multiple Choices): clients that don't special-case 3xx would
-                // treat this as success. This is a "need a disambiguating param" client error.
-                ctx.status(400).json(err);
-                return;
-            }
-
-            ctx.json(buildMethodSymbolView(foundCls, targetMethod));
-        } catch (Exception e) {
-            logger.error("Internal error retrieving method symbol view: {}", e.getMessage(), e);
-            ctx.status(500).json(Map.of("error", "Internal error: " + e.getMessage()));
-        }
-    }
-
     public void handleMethodSource(Context ctx) {
         String className = ctx.queryParam("class_name");
         String methodSignature = ctx.queryParam("method_signature");
@@ -848,165 +747,6 @@ public class MethodRoutes {
             logger.debug("Failed to extract imports for {}: {}", cls.getFullName(), e.getMessage());
             return Collections.emptyList();
         }
-    }
-
-    private Map<String, Object> buildMethodSymbolView(JavaClass cls, JavaMethod method) {
-        Map<String, Object> result = new LinkedHashMap<>();
-
-        // --- Identity (raw + display dual-track) ---
-        result.put("class_name", cls.getFullName());
-        result.put("raw_class_name", cls.getRawName());
-        result.put("method_name", method.getName());
-        result.put("raw_method_name", JadxApiAdapter.getMethodRawName(method));
-        result.put("method_full_id", JadxApiAdapter.getMethodFullId(method));
-        result.put("raw_method_full_id", JadxApiAdapter.getMethodRawFullId(method));
-
-        // --- Return type ---
-        ArgType returnType = method.getReturnType();
-        result.put("return_type", returnType != null ? returnType.toString() : "void");
-        result.put("return_type_frida", returnType != null ? FridaTypeConverter.toFridaType(returnType) : "void");
-
-        // --- Parameters ---
-        List<Map<String, String>> params = new ArrayList<>();
-        List<ArgType> argTypes = new ArrayList<>();
-        try {
-            argTypes = new ArrayList<>(method.getArguments());
-            int idx = 0;
-            for (ArgType argType : argTypes) {
-                Map<String, String> param = new HashMap<>();
-                param.put("name", "arg" + idx);
-                param.put("type", argType.toString());
-                param.put("type_frida", FridaTypeConverter.toFridaType(argType));
-                params.add(param);
-                idx++;
-            }
-        } catch (Exception e) {
-            logger.warn("Failed to get arguments for {}: {}", method.getName(), e.getMessage());
-        }
-        result.put("parameters", params);
-        result.put("frida_overload", FridaTypeConverter.toFridaOverloadString(argTypes));
-        result.put("is_constructor", method.isConstructor());
-        result.put("is_class_init", method.isClassInit());
-
-        // --- Declared throws (from MethodNode) ---
-        List<String> throwsList = new ArrayList<>();
-        MethodNode methodNode = JadxApiAdapter.getInternalMethodNode(method);
-        if (methodNode != null) {
-            try {
-                List<ArgType> throws_ = methodNode.getThrows();
-                if (throws_ != null) {
-                    for (ArgType t : throws_) {
-                        throwsList.add(t.toString());
-                    }
-                }
-            } catch (Exception e) {
-                logger.warn("Failed to get throws for {}: {}", method.getName(), e.getMessage());
-            }
-        }
-        result.put("throws", throwsList);
-
-        // --- Access flags ---
-        AccessInfo accessInfo = method.getAccessFlags();
-        Map<String, Object> accessMap = new LinkedHashMap<>();
-        if (accessInfo != null) {
-            accessMap.put("raw_string", accessInfo.toString());
-            accessMap.put("is_public", accessInfo.isPublic());
-            accessMap.put("is_protected", accessInfo.isProtected());
-            accessMap.put("is_private", accessInfo.isPrivate());
-            accessMap.put("is_package_private", accessInfo.isPackagePrivate());
-            accessMap.put("is_static", accessInfo.isStatic());
-            accessMap.put("is_final", accessInfo.isFinal());
-            accessMap.put("is_abstract", accessInfo.isAbstract());
-            accessMap.put("is_synchronized", accessInfo.isSynchronized());
-            accessMap.put("is_native", accessInfo.isNative());
-            accessMap.put("is_bridge", accessInfo.isBridge());
-            accessMap.put("is_synthetic", accessInfo.isSynthetic());
-            accessMap.put("is_var_args", accessInfo.isVarArgs());
-            accessMap.put("raw_value", accessInfo.rawValue());
-        }
-        result.put("access_flags", accessMap);
-
-        // --- Java annotations on this method ---
-        List<Map<String, Object>> annotations = new ArrayList<>();
-        if (methodNode != null) {
-            try {
-                AnnotationsAttr annAttr = methodNode.get(JadxAttrType.ANNOTATION_LIST);
-                if (annAttr != null && !annAttr.isEmpty()) {
-                    for (IAnnotation ann : annAttr.getList()) {
-                        Map<String, Object> annMap = new LinkedHashMap<>();
-                        annMap.put("annotation_class", ann.getAnnotationClass());
-                        annMap.put("visibility", ann.getVisibility() != null ? ann.getVisibility().toString() : null);
-                        Map<String, String> valuesStr = new LinkedHashMap<>();
-                        if (ann.getValues() != null) {
-                            for (Map.Entry<String, jadx.api.plugins.input.data.annotations.EncodedValue> entry : ann.getValues().entrySet()) {
-                                valuesStr.put(entry.getKey(), entry.getValue() != null ? entry.getValue().toString() : null);
-                            }
-                        }
-                        annMap.put("values", valuesStr);
-                        annotations.add(annMap);
-                    }
-                }
-            } catch (Exception e) {
-                logger.warn("Failed to get annotations for {}: {}", method.getName(), e.getMessage());
-            }
-        }
-        result.put("annotations", annotations);
-
-        // --- Owning class inheritance chain ---
-        Map<String, Object> classHierarchy = new LinkedHashMap<>();
-        classHierarchy.put("super_class", JadxApiAdapter.getSuperClass(cls));
-        classHierarchy.put("interfaces", JadxApiAdapter.getInterfaces(cls));
-        result.put("class_hierarchy", classHierarchy);
-
-        // --- Override relations via JavaMethod.getOverrideRelatedMethods() ---
-        List<Map<String, Object>> overrideRelated = new ArrayList<>();
-        try {
-            List<JavaMethod> related = method.getOverrideRelatedMethods();
-            if (related != null) {
-                for (JavaMethod rel : related) {
-                    if (rel == method) continue; // skip self
-                    Map<String, Object> relMap = new LinkedHashMap<>();
-                    relMap.put("class_name", rel.getDeclaringClass() != null ? rel.getDeclaringClass().getFullName() : "");
-                    relMap.put("raw_class_name", rel.getDeclaringClass() != null ? rel.getDeclaringClass().getRawName() : "");
-                    relMap.put("method_name", rel.getName());
-                    relMap.put("raw_method_name", JadxApiAdapter.getMethodRawName(rel));
-                    relMap.put("raw_method_full_id", JadxApiAdapter.getMethodRawFullId(rel));
-                    overrideRelated.add(relMap);
-                }
-            }
-        } catch (Exception e) {
-            logger.warn("Failed to get override related methods for {}: {}", method.getName(), e.getMessage());
-        }
-        result.put("override_related_methods", overrideRelated);
-
-        // --- Base methods via MethodOverrideAttr (more precise: which interface/super defines this) ---
-        List<Map<String, Object>> baseMethods = new ArrayList<>();
-        if (methodNode != null) {
-            try {
-                MethodOverrideAttr overrideAttr = methodNode.get(AType.METHOD_OVERRIDE);
-                if (overrideAttr != null) {
-                    for (IMethodDetails base : overrideAttr.getBaseMethods()) {
-                        MethodInfo baseInfo = base.getMethodInfo();
-                        if (baseInfo == null) continue;
-                        Map<String, Object> baseMap = new LinkedHashMap<>();
-                        baseMap.put("class_name", baseInfo.getDeclClass().getFullName());
-                        baseMap.put("raw_class_name", baseInfo.getDeclClass().getRawName());
-                        // raw = getName() (original/runtime name — use this for Frida/Xposed hooks);
-                        // display = getAlias() (deobf/renamed name). Keep the two distinct.
-                        baseMap.put("method_name", baseInfo.getAlias() != null ? baseInfo.getAlias() : baseInfo.getName());
-                        baseMap.put("raw_method_name", baseInfo.getName());
-                        baseMap.put("raw_method_full_id", baseInfo.getRawFullId());
-                        baseMap.put("short_id", baseInfo.getShortId());
-                        baseMethods.add(baseMap);
-                    }
-                }
-            } catch (Exception e) {
-                logger.warn("Failed to get base methods for {}: {}", method.getName(), e.getMessage());
-            }
-        }
-        result.put("base_methods", baseMethods);
-
-        return result;
     }
 
     // -------------------------------------------------------------------------

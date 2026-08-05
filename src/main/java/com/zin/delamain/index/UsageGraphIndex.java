@@ -165,14 +165,6 @@ public final class UsageGraphIndex {
         return chain(target, classToReferrers, maxDepth, maxNodes, "callers");
     }
 
-    /**
-     * Forward multi-hop reachability ("what this class transitively calls/references") via BFS
-     * over the transposed graph — the data-flow-direction counterpart of {@link #callersChain}.
-     */
-    public static Map<String, Object> calleesChain(JavaClass target, int maxDepth, int maxNodes) {
-        return chain(target, classToCallees, maxDepth, maxNodes, "callees");
-    }
-
     private static Map<String, Object> chain(JavaClass target, int[][] adj, int maxDepth, int maxNodes, String direction) {
         if (!ready) return null;
         IdentityHashMap<JavaClass, Integer> c2id = classToId;

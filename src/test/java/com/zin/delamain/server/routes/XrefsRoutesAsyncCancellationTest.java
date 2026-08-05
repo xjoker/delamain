@@ -1,9 +1,7 @@
 package com.zin.delamain.server.routes;
 
 import com.zin.delamain.core.HeadlessJadxWrapper;
-import com.zin.delamain.utils.JadxSearchLock;
 import com.zin.delamain.utils.PaginationUtils;
-import com.zin.delamain.utils.TicketRegistry;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -16,7 +14,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Collections;
 import java.util.concurrent.AbstractExecutorService;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -48,41 +45,6 @@ class XrefsRoutesAsyncCancellationTest {
     void tearDown() {
         if (executor != null) executor.shutdownNow();
         if (wrapper != null) wrapper.close();
-    }
-
-    @Test
-    void cancelRouteInterruptsRunningTaskAndReleasesBothReadLocks() throws Exception {
-        XrefsRoutes routes = new XrefsRoutes(wrapper, new PaginationUtils(), executor);
-
-        CountDownLatch started = new CountDownLatch(1);
-        String ticket = routes.submitAsyncTask(() -> {
-            if (!JadxSearchLock.tryAcquireRead()) {
-                throw new IllegalStateException("test could not acquire JadxSearchLock read lock");
-            }
-            started.countDown();
-            try {
-                Thread.sleep(TimeUnit.MINUTES.toMillis(1));
-                return Map.of("unexpected", true);
-            } finally {
-                JadxSearchLock.releaseRead();
-            }
-        });
-        assertTrue(started.await(2, TimeUnit.SECONDS));
-        assertEquals(1, wrapper.getAnalysisReadLockCount());
-        assertEquals(1, JadxSearchLock.getReadLockCount());
-
-        assertTrue(routes.cancelAsyncTask(ticket));
-
-        CountDownLatch drained = new CountDownLatch(1);
-        executor.execute(drained::countDown);
-        assertTrue(drained.await(2, TimeUnit.SECONDS),
-            "executor sentinel proves the cancelled task returned through both finally blocks");
-        assertEquals(0, wrapper.getAnalysisReadLockCount());
-        assertEquals(0, JadxSearchLock.getReadLockCount());
-        assertEquals(
-            TicketRegistry.Status.NOT_FOUND,
-            routes.pollAsyncTask(ticket).getStatus(),
-            "cancelled tickets must remain absent from the one-shot poll contract");
     }
 
     @Test

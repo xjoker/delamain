@@ -56,8 +56,7 @@ public final class MemoryConfig {
      * and unloads it, so what a worker actually holds is one class's decompile working set.
      * 384 MB keeps a wide margin over that while letting a right-sized container run real
      * parallelism; {@link com.zin.delamain.index.WarmupManager#isHighMemoryPressure()} is the
-     * reactive net if a pathological class overshoots, and this stays hot-updatable via
-     * POST /memory-config.</p>
+     * reactive net if a pathological class overshoots.</p>
      */
     static final long DEFAULT_PER_WORKER_HEAP_MB = 384L;
 

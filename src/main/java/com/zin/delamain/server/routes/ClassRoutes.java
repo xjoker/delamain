@@ -29,10 +29,9 @@ import java.util.stream.Collectors;
 /**
  * Lean navigation and class-metadata MCP endpoints (headless port).
  *
- * <p>Covers: {@code /current-class}, {@code /all-classes}, {@code /selected-text},
- * {@code /class-info}, {@code /methods-of-class}, {@code /fields-of-class},
- * {@code /package-classes}, {@code /package-tree}, {@code /jar-bytecode},
- * {@code /jar-entry-points}.</p>
+ * <p>Covers: {@code /all-classes}, {@code /class-info}, {@code /methods-of-class},
+ * {@code /fields-of-class}, {@code /package-classes}, {@code /package-tree},
+ * {@code /jar-bytecode}, {@code /jar-entry-points}.</p>
  */
 public class ClassRoutes {
     private static final Logger logger = LoggerFactory.getLogger(ClassRoutes.class);
@@ -57,9 +56,7 @@ public class ClassRoutes {
     }
 
     public void register(Javalin app, AuthConfig authConfig) {
-        app.get("/current-class", this::handleCurrentClass);
         app.get("/all-classes", this::handleAllClasses);
-        app.get("/selected-text", this::handleSelectedText);
         app.get("/class-info", this::handleClassInfo);
         app.get("/methods-of-class", this::handleMethodsOfClass);
         app.get("/fields-of-class", this::handleFieldsOfClass);
@@ -70,30 +67,6 @@ public class ClassRoutes {
     }
 
     // ------------------------------- Request Handlers --------------------------
-
-    /**
-     * Handles {@code /current-class}.
-     * Not available in headless mode — returns 501.
-     */
-    public void handleCurrentClass(Context ctx) {
-        ctx.status(501).json(Map.of(
-            "error", "not_available_in_headless_mode",
-            "headless", true,
-            "message", "current-class requires JADX GUI. Use get_class_source with a class name instead."
-        ));
-    }
-
-    /**
-     * Handles {@code /selected-text}.
-     * Not available in headless mode — returns 501.
-     */
-    public void handleSelectedText(Context ctx) {
-        ctx.status(501).json(Map.of(
-            "error", "not_available_in_headless_mode",
-            "headless", true,
-            "message", "selected-text requires JADX GUI."
-        ));
-    }
 
     /**
      * Handles {@code /all-classes}.

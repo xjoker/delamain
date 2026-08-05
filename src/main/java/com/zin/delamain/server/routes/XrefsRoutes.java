@@ -318,32 +318,8 @@ public class XrefsRoutes {
         app.get("/xrefs-to-field",  this::handleXrefsToField);
         app.get("/batch-xrefs",     this::handleBatchXrefs);
         app.get("/callers-chain",   this::handleCallersChain);
-        app.get("/callees-chain",   this::handleCalleesChain);
-        app.get("/diag/usage-harvest", this::handleUsageHarvestProbe);
         app.post("/submit-xref",    this::handleSubmitXref);
         app.get("/xref-status",     this::handleXrefStatus);
-        app.post("/cancel-xref",    this::handleCancelXref);
-    }
-
-    /**
-     * Forward multi-hop "what does this class transitively call/reach" via instant BFS over the
-     * transposed usage graph — the data-flow-direction counterpart of /callers-chain.
-     */
-    public void handleCalleesChain(Context ctx) {
-        String className = validateRequiredParam(ctx, "class_name");
-        if (className == null) return;
-        int depth = Math.min(Math.max(parseIntParam(ctx.queryParam("depth"), 3), 1), 12);
-        int maxNodes = Math.min(Math.max(parseIntParam(ctx.queryParam("max_nodes"), 2000), 1), 50000);
-        if (!UsageGraphIndex.isReady()) {
-            ctx.status(503).json(Map.of("error", "Usage graph not ready",
-                "hint", "Call start-warmup first.", "retry_after", 10));
-            return;
-        }
-        JavaClass target = findClassByName(ctx, className);
-        if (target == null) return;
-        Map<String, Object> result = UsageGraphIndex.calleesChain(target, depth, maxNodes);
-        if (result == null) { ctx.status(404).json(Map.of("error", "Class not in usage graph: " + className)); return; }
-        ctx.json(result);
     }
 
     /**
@@ -372,117 +348,6 @@ public class XrefsRoutes {
             return;
         }
         ctx.json(result);
-    }
-
-    /**
-     * DIAGNOSTIC PROBE — validates the "precompute usage graph during warmup" hypothesis.
-     * After full warmup, measures:
-     *   (1) raw getUseIn() cost per class (the graph edges) — should be cheap if usage info
-     *       was built during decompile and isn't evicted;
-     *   (2) optional precise getUsePlacesFor() cost (decompiles referencing classes) — the
-     *       expensive part we'd harvest once and persist.
-     * Returns aggregate timings + edge counts + heap delta so we can size a persistent index.
-     */
-    // Hard ceiling for the usage-harvest probe. It runs under the analysis read lock and (when
-    // precise) live-decompiles each referrer without the search lock or a deadline, so an
-    // unbounded scan over ~138k classes reproduces the 2026-07-22 outage model (one request pins
-    // the read lock for minutes, stalling /load-file). The projection field still extrapolates to
-    // the full corpus, so a capped sample keeps the diagnostic useful.
-    private static final int USAGE_HARVEST_MAX_PROBE = 20000;
-
-    public void handleUsageHarvestProbe(Context ctx) {
-        int limit = parseIntParam(ctx.queryParam("limit"), 2000);
-        boolean precise = "true".equalsIgnoreCase(ctx.queryParam("precise"));
-
-        Runtime rt = Runtime.getRuntime();
-        long memBefore = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
-
-        List<JavaClass> all = wrapper.getClassesWithInners();
-        int requested = (limit <= 0) ? all.size() : limit;
-        int n = Math.min(Math.min(requested, USAGE_HARVEST_MAX_PROBE), all.size());
-        boolean probeCapped = requested > n;
-
-        // Time budget on top of the count cap: this probe holds the analysis read lock and (when
-        // precise) live-decompiles referrers, exactly the shape that took the service down on
-        // 2026-07-22. Reuse the xref live deadline so it can never pin the read lock longer than
-        // that path can. Check the inner precise loop too — a single high-fan-in class can spend
-        // the whole budget there (the 20260722.7 inner-loop lesson).
-        Deadline deadline = Deadline.in(LIVE_DEADLINE_MILLIS);
-        long t0 = System.nanoTime();
-        long totalEdges = 0;
-        long useInNsTotal = 0, useInNsMax = 0;
-        String slowest = null;
-        int over1ms = 0, over10ms = 0, over100ms = 0;
-        long preciseNsTotal = 0, precisePlaces = 0;
-        int errors = 0;
-        int probed = 0;
-
-        for (int i = 0; i < n; i++) {
-            if (deadline.shouldStop()) break;
-            probed++;
-            JavaClass cls = all.get(i);
-            long c0 = System.nanoTime();
-            List<JavaNode> uses;
-            try {
-                uses = cls.getUseIn();
-            } catch (Exception e) {
-                errors++;
-                continue;
-            }
-            long dur = System.nanoTime() - c0;
-            useInNsTotal += dur;
-            if (dur > useInNsMax) { useInNsMax = dur; slowest = cls.getFullName(); }
-            if (dur > 1_000_000L) over1ms++;
-            if (dur > 10_000_000L) over10ms++;
-            if (dur > 100_000_000L) over100ms++;
-            totalEdges += (uses == null ? 0 : uses.size());
-
-            if (precise && uses != null) {
-                long p0 = System.nanoTime();
-                for (JavaNode u : uses) {
-                    if (deadline.shouldStop()) break;
-                    if (u instanceof JavaClass) {
-                        try {
-                            ICodeInfo ci = ((JavaClass) u).getCodeInfo();
-                            if (ci != null && ci.hasMetadata()) {
-                                precisePlaces += ((JavaClass) u).getUsePlacesFor(ci, cls).size();
-                            }
-                        } catch (Exception ignored) {}
-                    }
-                }
-                preciseNsTotal += System.nanoTime() - p0;
-            }
-        }
-        long totalMs = (System.nanoTime() - t0) / 1_000_000L;
-        long memAfter = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
-
-        Map<String, Object> r = new HashMap<>();
-        r.put("classes_probed", probed);
-        r.put("probe_capped", probeCapped);
-        r.put("probe_cap", USAGE_HARVEST_MAX_PROBE);
-        r.put("deadline_truncated", deadline.truncated());
-        r.put("partial_results", probeCapped || deadline.truncated());
-        r.put("total_classes", all.size());
-        r.put("errors", errors);
-        r.put("total_edges", totalEdges);
-        r.put("avg_edges_per_class", probed > 0 ? (totalEdges / (double) probed) : 0);
-        r.put("getUseIn_total_ms", useInNsTotal / 1_000_000L);
-        r.put("getUseIn_avg_us", probed > 0 ? (useInNsTotal / 1000L / probed) : 0);
-        r.put("getUseIn_max_ms", useInNsMax / 1_000_000L);
-        r.put("getUseIn_slowest_class", slowest);
-        r.put("getUseIn_calls_over_1ms", over1ms);
-        r.put("getUseIn_calls_over_10ms", over10ms);
-        r.put("getUseIn_calls_over_100ms", over100ms);
-        r.put("precise_enabled", precise);
-        r.put("precise_total_ms", preciseNsTotal / 1_000_000L);
-        r.put("precise_use_places", precisePlaces);
-        r.put("wall_total_ms", totalMs);
-        r.put("heap_before_mb", memBefore);
-        r.put("heap_after_mb", memAfter);
-        r.put("heap_delta_mb", memAfter - memBefore);
-        r.put("projected_full_graph_edges", probed > 0
-            ? (long) (totalEdges / (double) probed * all.size()) : 0);
-        ctx.json(r);
     }
 
     // -------------------------------------------------------------------------
@@ -1190,22 +1055,6 @@ public class XrefsRoutes {
         }
     }
 
-    /** Cancels a queued/running async xref. Completed, expired, or unknown tickets are absent. */
-    public void handleCancelXref(Context ctx) {
-        String ticket = ctx.queryParam("ticket");
-        if (ticket == null || ticket.isEmpty()) {
-            ctx.status(400).json(Map.of("error", "Missing 'ticket' parameter"));
-            return;
-        }
-        if (cancelAsyncTask(ticket)) {
-            ctx.json(Map.of("status", "cancelled"));
-        } else {
-            ctx.status(404).json(Map.of(
-                "status", "not_found",
-                "message", "Ticket not found, completed, or expired"));
-        }
-    }
-
     Map<String, Object> buildXrefStatusResponse(Context ctx, Map<String, Object> payload) throws PaginationException {
         if ("batch".equals(payload.get("kind"))) {
             // Batch results are already complete and bounded (max MAX_BATCH_SIZE targets) — no
@@ -1268,10 +1117,6 @@ public class XrefsRoutes {
             throw e;
         }
         return ticket;
-    }
-
-    boolean cancelAsyncTask(String ticket) {
-        return XREF_TICKETS.cancel(ticket);
     }
 
     TicketRegistry.PollResult<Map<String, Object>> pollAsyncTask(String ticket) {
