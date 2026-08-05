@@ -9,6 +9,7 @@ import java.nio.file.*;
 import java.security.MessageDigest;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.CRC32;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
@@ -52,6 +53,26 @@ public class CodeStore {
     /** className -> CRC32 of its decompiled source bytes. Empty for stores predating this feature. */
     private final Map<String, Integer> crcMap = new ConcurrentHashMap<>();
 
+    // P2 fix: put() used to swallow every write failure at debug level with no aggregate signal —
+    // a systemic disk failure (full disk, permissions) could silently drop most/all classes while
+    // warmup still called markComplete() and reported success. These counters feed that guard.
+    private final AtomicLong successfulPuts = new AtomicLong(0);
+    private final AtomicLong putFailures = new AtomicLong(0);
+
+    /** Minimum fraction of attempted puts that must have actually landed on disk for
+     * {@link #markComplete} to accept the store as complete. */
+    private static final double MIN_COMPLETE_RATIO = 0.99;
+
+    /** Number of {@link #put} calls that threw (write failures), for diagnostics/tests. */
+    public long putFailureCount() {
+        return putFailures.get();
+    }
+
+    /** Number of {@link #put} calls that succeeded, for diagnostics/tests. */
+    public long successfulPutCount() {
+        return successfulPuts.get();
+    }
+
     public CodeStore(Path indexDir, String inputHash) throws IOException {
         String tag = inputHash.length() >= 8 ? inputHash.substring(0, 8) : inputHash;
         this.baseDir = indexDir.resolve("code").resolve(tag);
@@ -66,9 +87,15 @@ public class CodeStore {
         return baseDir.resolve(h.substring(0, 2)).resolve(h + ".gz");
     }
 
-    /** Writes (gzipped) decompiled source for a class. Safe to call from parallel workers. */
-    public void put(String className, String code) {
-        if (className == null || code == null) return;
+    /**
+     * Writes (gzipped) decompiled source for a class. Safe to call from parallel workers.
+     *
+     * @return {@code true} if the write succeeded, {@code false} if {@code className}/{@code code}
+     *         was null or the write threw (caller should count this toward warmup's failure total —
+     *         see {@link #putFailureCount()} and the {@link #markComplete} ratio guard).
+     */
+    public boolean put(String className, String code) {
+        if (className == null || code == null) return false;
         Path p = pathFor(className);
         try {
             byte[] bytes = code.getBytes(StandardCharsets.UTF_8);
@@ -83,8 +110,12 @@ public class CodeStore {
             CRC32 crc = new CRC32();
             crc.update(bytes);
             crcMap.put(className, (int) crc.getValue());
+            successfulPuts.incrementAndGet();
+            return true;
         } catch (Exception e) {
+            putFailures.incrementAndGet();
             logger.debug("[CodeStore] put failed for {}: {}", className, e.getMessage());
+            return false;
         }
     }
 
@@ -140,14 +171,39 @@ public class CodeStore {
         }
     }
 
-    /** Marks the store fully populated (call after a complete warmup). */
-    public void markComplete(int classCount) {
+    /**
+     * Marks the store fully populated (call after a complete warmup).
+     *
+     * <p>P2 fix: refuses to write the marker if fewer than {@link #MIN_COMPLETE_RATIO} of
+     * {@code attemptedCount} puts actually succeeded. Without this guard, a systemic write failure
+     * (disk full, permissions) could still reach this call with most/all puts having silently
+     * failed; the {@code .complete} marker would then make every future restart FAST_RESTORE onto
+     * a store that serves almost nothing from {@link #get}, with no diagnostic trail.
+     *
+     * @param attemptedCount the number of classes THIS warmup actually attempted to persist (i.e.
+     *        successfully decompiled — Phase-1's {@code processed} count), not the raw target list
+     *        size, so legitimate decompile failures (excluded before ever calling {@link #put})
+     *        don't themselves erode the ratio.
+     * @return {@code true} if the store was marked complete, {@code false} if refused (WARN logged)
+     *         or the marker write itself failed.
+     */
+    public boolean markComplete(int attemptedCount) {
+        long ok = successfulPuts.get();
+        if (attemptedCount > 0 && ok < attemptedCount * MIN_COMPLETE_RATIO) {
+            logger.warn("[CodeStore] refusing to mark complete: only {}/{} puts succeeded ({} failures, "
+                + "ratio {} < required {}) — a future restart would FAST_RESTORE onto an incomplete store",
+                ok, attemptedCount, putFailures.get(),
+                String.format("%.4f", (double) ok / attemptedCount), MIN_COMPLETE_RATIO);
+            return false;
+        }
         writeCrcManifest();
         try {
-            Files.writeString(completeMarker, Integer.toString(classCount), StandardCharsets.UTF_8);
-            logger.info("[CodeStore] marked complete ({} classes) at {}", classCount, baseDir);
+            Files.writeString(completeMarker, Integer.toString(attemptedCount), StandardCharsets.UTF_8);
+            logger.info("[CodeStore] marked complete ({} classes) at {}", attemptedCount, baseDir);
+            return true;
         } catch (IOException e) {
             logger.warn("[CodeStore] failed to write complete marker: {}", e.getMessage());
+            return false;
         }
     }
 

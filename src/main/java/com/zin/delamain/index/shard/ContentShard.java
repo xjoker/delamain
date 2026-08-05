@@ -104,6 +104,23 @@ public final class ContentShard implements Closeable {
         ByteBuffer dictBuf = region(full, dictOffset, dictLen);
         ByteBuffer blobBuf = region(full, blobOffset, blobLen);
 
+        // P2 fix: the four top-level regions were bounds-checked above, but each dictionary entry's
+        // own postingOffset/postingLength (pointing into the blob region) were not. A corrupt or
+        // truncated dictionary let postingsFor() throw IllegalArgumentException deep in a QUERY
+        // thread (ByteBuffer.slice on an out-of-range view) — bypassing ContentShardIndex.loadCatalog's
+        // "skip this shard" degradation path entirely, since that only guards the open() call. Scan
+        // every entry here, at open (off the query path), so a bad shard fails loudly via the same
+        // IOException the catalog loader already knows how to skip.
+        for (int i = 0; i < trigramCount; i++) {
+            int base = i * DICT_ENTRY_BYTES;
+            long postingOffset = dictBuf.getLong(base + 6);
+            int postingLength = dictBuf.getInt(base + 14);
+            if (postingOffset < 0 || postingLength < 0 || postingOffset + postingLength > blobLen) {
+                throw new IOException("shard dict entry " + i + " posting region out of bounds: off="
+                        + postingOffset + " len=" + postingLength + " blobLen=" + blobLen + " in " + file);
+            }
+        }
+
         return new ContentShard(shardSeq, idLo, idHi, trigramCount, covered, excluded, dictBuf, blobBuf, full);
     }
 

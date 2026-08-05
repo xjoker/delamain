@@ -42,6 +42,15 @@ public class ClassCacheManager {
     private static final AtomicReference<Map<String, List<JavaClass>>> methodNameIndex = new AtomicReference<>();
     private static final AtomicReference<Map<String, List<JavaClass>>> fieldNameIndex = new AtomicReference<>();
 
+    // Reverse index: for each class, the bucket keys it currently occupies in the corresponding
+    // name index above. Lets reindex()/removeFromIndex() remove a renamed class's stale entries
+    // with a handful of direct HashMap lookups instead of an O(bucket-count) entrySet() scan of the
+    // whole index (rename-perf fix — see removeFromIndex). Populated once at initCache() build time
+    // and kept current by reindex() on every subsequent rename.
+    private static final AtomicReference<Map<JavaClass, Set<String>>> classKeyIndex = new AtomicReference<>();
+    private static final AtomicReference<Map<JavaClass, Set<String>>> methodKeyIndex = new AtomicReference<>();
+    private static final AtomicReference<Map<JavaClass, Set<String>>> fieldKeyIndex = new AtomicReference<>();
+
     private static final AtomicBoolean isInitialized = new AtomicBoolean(false);
     private static final AtomicReference<CompletableFuture<Void>> initFuture = new AtomicReference<>();
     private static final AtomicLong generationToken = new AtomicLong(0);
@@ -84,6 +93,12 @@ public class ClassCacheManager {
                     Map<String, List<JavaClass>> clsNameIdx = new HashMap<>();
                     Map<String, List<JavaClass>> mthNameIdx = new HashMap<>();
                     Map<String, List<JavaClass>> fldNameIdx = new HashMap<>();
+                    // Reverse index seeded alongside the forward buckets above, so the very first
+                    // rename of any class (not just ones already reindexed once) gets the O(k)
+                    // removeFromIndex fast path instead of falling back to a full entrySet() scan.
+                    Map<JavaClass, Set<String>> clsKeysIdx = new HashMap<>();
+                    Map<JavaClass, Set<String>> mthKeysIdx = new HashMap<>();
+                    Map<JavaClass, Set<String>> fldKeysIdx = new HashMap<>();
 
                     for (JavaClass cls : allClasses) {
                         if (isLoadStale(generation)) {
@@ -101,9 +116,15 @@ public class ClassCacheManager {
                             }
                         }
 
+                        Set<String> clsKeys = new HashSet<>();
+                        Set<String> mthKeys = new HashSet<>();
+                        Set<String> fldKeys = new HashSet<>();
+
                         String simpleName = cls.getName();
                         if (simpleName != null && !simpleName.isEmpty()) {
-                            clsNameIdx.computeIfAbsent(simpleName.toLowerCase(), k -> new ArrayList<>()).add(cls);
+                            String k = simpleName.toLowerCase();
+                            clsNameIdx.computeIfAbsent(k, kk -> new ArrayList<>()).add(cls);
+                            clsKeys.add(k);
                         }
                         // Bug 1 fix: also bucket the raw (pre-deobfuscation) simple class name, so
                         // an EXACT/SUBSTRING/PREFIX class-name search for the raw DEX identifier
@@ -112,28 +133,42 @@ public class ClassCacheManager {
                         String rawSimpleName = JadxApiAdapter.getClassRawSimpleName(cls);
                         if (rawSimpleName != null && !rawSimpleName.isEmpty()
                                 && !rawSimpleName.equalsIgnoreCase(simpleName)) {
-                            clsNameIdx.computeIfAbsent(rawSimpleName.toLowerCase(), k -> new ArrayList<>()).add(cls);
+                            String k = rawSimpleName.toLowerCase();
+                            clsNameIdx.computeIfAbsent(k, kk -> new ArrayList<>()).add(cls);
+                            clsKeys.add(k);
                         }
                         for (JadxApiAdapter.MethodInfoSnapshot m : JadxApiAdapter.getDeclaredMethodInfos(cls)) {
                             String mName = m.getName();
                             if (mName != null && !mName.isEmpty()) {
-                                mthNameIdx.computeIfAbsent(mName.toLowerCase(), k -> new ArrayList<>()).add(cls);
+                                String k = mName.toLowerCase();
+                                mthNameIdx.computeIfAbsent(k, kk -> new ArrayList<>()).add(cls);
+                                mthKeys.add(k);
                             }
                             String mAlias = m.getAliasName();
                             if (mAlias != null && !mAlias.isEmpty() && !mAlias.equals(mName)) {
-                                mthNameIdx.computeIfAbsent(mAlias.toLowerCase(), k -> new ArrayList<>()).add(cls);
+                                String k = mAlias.toLowerCase();
+                                mthNameIdx.computeIfAbsent(k, kk -> new ArrayList<>()).add(cls);
+                                mthKeys.add(k);
                             }
                         }
                         for (JadxApiAdapter.FieldInfoSnapshot f : JadxApiAdapter.getDeclaredFieldInfos(cls)) {
                             String fName = f.getName();
                             if (fName != null && !fName.isEmpty()) {
-                                fldNameIdx.computeIfAbsent(fName.toLowerCase(), k -> new ArrayList<>()).add(cls);
+                                String k = fName.toLowerCase();
+                                fldNameIdx.computeIfAbsent(k, kk -> new ArrayList<>()).add(cls);
+                                fldKeys.add(k);
                             }
                             String fAlias = f.getAliasName();
                             if (fAlias != null && !fAlias.isEmpty() && !fAlias.equals(fName)) {
-                                fldNameIdx.computeIfAbsent(fAlias.toLowerCase(), k -> new ArrayList<>()).add(cls);
+                                String k = fAlias.toLowerCase();
+                                fldNameIdx.computeIfAbsent(k, kk -> new ArrayList<>()).add(cls);
+                                fldKeys.add(k);
                             }
                         }
+
+                        clsKeysIdx.put(cls, clsKeys);
+                        mthKeysIdx.put(cls, mthKeys);
+                        fldKeysIdx.put(cls, fldKeys);
                     }
 
                     if (isLoadStale(generation)) {
@@ -156,6 +191,9 @@ public class ClassCacheManager {
                     classNameIndex.set(clsNameIdx);
                     methodNameIndex.set(mthNameIdx);
                     fieldNameIndex.set(fldNameIdx);
+                    classKeyIndex.set(clsKeysIdx);
+                    methodKeyIndex.set(mthKeysIdx);
+                    fieldKeyIndex.set(fldKeysIdx);
                     completionTime.set(System.currentTimeMillis());
                     currentPhase.set("READY");
 
@@ -289,40 +327,66 @@ public class ClassCacheManager {
         if (clsIdx == null || mthIdx == null || fldIdx == null) {
             return;
         }
+        // May legitimately be null (reindex() called before the first initCache() build finished
+        // publishing them) — removeFromIndex/updateKeysOf below treat that as "no reverse-index yet,
+        // fall back to a full scan / skip the bookkeeping", never a NPE.
+        Map<JavaClass, Set<String>> clsKeys = classKeyIndex.get();
+        Map<JavaClass, Set<String>> mthKeys = methodKeyIndex.get();
+        Map<JavaClass, Set<String>> fldKeys = fieldKeyIndex.get();
 
-        removeFromIndex(clsIdx, cls);
-        removeFromIndex(mthIdx, cls);
-        removeFromIndex(fldIdx, cls);
+        removeFromIndex(clsIdx, clsKeys, cls);
+        removeFromIndex(mthIdx, mthKeys, cls);
+        removeFromIndex(fldIdx, fldKeys, cls);
+
+        Set<String> newClsKeys = new HashSet<>();
+        Set<String> newMthKeys = new HashSet<>();
+        Set<String> newFldKeys = new HashSet<>();
 
         String simpleName = cls.getName();
         if (simpleName != null && !simpleName.isEmpty()) {
-            addToIndex(clsIdx, simpleName.toLowerCase(), cls);
+            String k = simpleName.toLowerCase();
+            addToIndex(clsIdx, k, cls);
+            newClsKeys.add(k);
         }
         String rawSimpleName = JadxApiAdapter.getClassRawSimpleName(cls);
         if (rawSimpleName != null && !rawSimpleName.isEmpty()
                 && !rawSimpleName.equalsIgnoreCase(simpleName)) {
-            addToIndex(clsIdx, rawSimpleName.toLowerCase(), cls);
+            String k = rawSimpleName.toLowerCase();
+            addToIndex(clsIdx, k, cls);
+            newClsKeys.add(k);
         }
         for (JadxApiAdapter.MethodInfoSnapshot m : JadxApiAdapter.getDeclaredMethodInfos(cls)) {
             String mName = m.getName();
             if (mName != null && !mName.isEmpty()) {
-                addToIndex(mthIdx, mName.toLowerCase(), cls);
+                String k = mName.toLowerCase();
+                addToIndex(mthIdx, k, cls);
+                newMthKeys.add(k);
             }
             String mAlias = m.getAliasName();
             if (mAlias != null && !mAlias.isEmpty() && !mAlias.equals(mName)) {
-                addToIndex(mthIdx, mAlias.toLowerCase(), cls);
+                String k = mAlias.toLowerCase();
+                addToIndex(mthIdx, k, cls);
+                newMthKeys.add(k);
             }
         }
         for (JadxApiAdapter.FieldInfoSnapshot f : JadxApiAdapter.getDeclaredFieldInfos(cls)) {
             String fName = f.getName();
             if (fName != null && !fName.isEmpty()) {
-                addToIndex(fldIdx, fName.toLowerCase(), cls);
+                String k = fName.toLowerCase();
+                addToIndex(fldIdx, k, cls);
+                newFldKeys.add(k);
             }
             String fAlias = f.getAliasName();
             if (fAlias != null && !fAlias.isEmpty() && !fAlias.equals(fName)) {
-                addToIndex(fldIdx, fAlias.toLowerCase(), cls);
+                String k = fAlias.toLowerCase();
+                addToIndex(fldIdx, k, cls);
+                newFldKeys.add(k);
             }
         }
+
+        if (clsKeys != null) clsKeys.put(cls, newClsKeys);
+        if (mthKeys != null) mthKeys.put(cls, newMthKeys);
+        if (fldKeys != null) fldKeys.put(cls, newFldKeys);
     }
 
     /**
@@ -354,7 +418,75 @@ public class ClassCacheManager {
         classCache.set(updated);
     }
 
-    private static void removeFromIndex(Map<String, List<JavaClass>> index, JavaClass cls) {
+    /** One rename to apply as part of a {@link #reindexRenamedClassesBatch} call. */
+    public static final class RenamedClass {
+        public final JavaClass cls;
+        public final String previousFullName;
+
+        public RenamedClass(JavaClass cls, String previousFullName) {
+            this.cls = cls;
+            this.previousFullName = previousFullName;
+        }
+    }
+
+    /**
+     * Batch counterpart to {@link #reindexRenamedClass} (rename-perf fix). Refreshes the name-index
+     * buckets for every class in {@code renames} — same O(k) {@link #reindex} as the single-class
+     * path — but publishes exactly ONE new {@code classCache} snapshot at the end instead of
+     * copying the full class map once per rename.
+     *
+     * <p>On a 238k-class APK, a package-wide rename of M classes through the single-class path
+     * costs M full {@code new HashMap<>(cache)} copies (O(M×N) just for the classCache
+     * republish, on top of M lock acquire/releases in the caller); this collapses the copy to a
+     * single O(N) pass regardless of M. Callers must still hold {@link JadxSearchLock}'s write lock
+     * across the WHOLE batch (same requirement as the single-class path) so no concurrent search
+     * reads a half-updated index.
+     *
+     * <p>Not yet wired to a caller: {@code RenameStorage}/{@code RefactoringRoutes} still call
+     * {@link #reindexRenamedClass} once per class in their batch-rename loops. Switching those loops
+     * to collect {@link RenamedClass} entries and call this once at the end is a follow-up outside
+     * this class's ownership.
+     */
+    public static void reindexRenamedClassesBatch(List<RenamedClass> renames) {
+        if (renames == null || renames.isEmpty()) return;
+
+        Map<String, JavaClass> cache = classCache.get();
+        Map<String, JavaClass> updated = cache != null ? new HashMap<>(cache) : null;
+
+        for (RenamedClass rc : renames) {
+            if (rc == null || rc.cls == null) continue;
+            reindex(rc.cls);
+            String newFullName = rc.cls.getFullName();
+            if (updated != null && newFullName != null && !newFullName.equals(rc.previousFullName)) {
+                updated.put(newFullName, rc.cls);
+            }
+        }
+
+        if (updated != null) {
+            classCache.set(updated);
+        }
+    }
+
+    /**
+     * Removes {@code cls} from every bucket of {@code index} it occupies.
+     *
+     * <p>Rename-perf fix: when {@code keyIndex} (the reverse index of bucket keys {@code cls}
+     * currently occupies, maintained by {@link #reindex}) has an entry for {@code cls}, this does a
+     * handful of direct {@code index.get(key)} lookups instead of an {@code entrySet()} scan of the
+     * WHOLE index. On a 238k-class APK the name-index buckets number in the hundreds of thousands;
+     * a package-wide batch rename of M classes previously cost O(M×N) (3 full scans per class), the
+     * dominant cost of a bulk rename. Falls back to the old full scan only when no reverse-index
+     * entry exists yet for this class (e.g. reindex() raced initCache()'s first publish).
+     */
+    private static void removeFromIndex(Map<String, List<JavaClass>> index,
+                                         Map<JavaClass, Set<String>> keyIndex, JavaClass cls) {
+        Set<String> keys = keyIndex != null ? keyIndex.get(cls) : null;
+        if (keys != null) {
+            for (String key : keys) {
+                removeFromBucket(index, key, cls);
+            }
+            return;
+        }
         for (Map.Entry<String, List<JavaClass>> entry : index.entrySet()) {
             List<JavaClass> bucket = entry.getValue();
             if (bucket instanceof ArrayList) {
@@ -372,6 +504,30 @@ public class ClassCacheManager {
                     mutable.remove(cls);
                     entry.setValue(Collections.unmodifiableList(mutable));
                 }
+            }
+        }
+    }
+
+    /** Removes {@code cls} from exactly one bucket ({@code index.get(key)}), if present. */
+    private static void removeFromBucket(Map<String, List<JavaClass>> index, String key, JavaClass cls) {
+        List<JavaClass> bucket = index.get(key);
+        if (bucket == null) {
+            return;
+        }
+        if (bucket instanceof ArrayList) {
+            bucket.remove(cls);
+        } else {
+            boolean present = false;
+            for (JavaClass c : bucket) {
+                if (c == cls) {
+                    present = true;
+                    break;
+                }
+            }
+            if (present) {
+                List<JavaClass> mutable = new ArrayList<>(bucket);
+                mutable.remove(cls);
+                index.put(key, Collections.unmodifiableList(mutable));
             }
         }
     }
@@ -673,6 +829,15 @@ public class ClassCacheManager {
                     return;
                 }
                 clearCacheState("project owner changed", true);
+                // F7 fix (path A): clearCacheState(..., true) just wiped CodeContentIndex's id
+                // space via CodeContentIndex.clear(). If this owner-rotate is firing mid-warmup
+                // (the exact production timeline: WarmupManager.runWarmup preAssigns ids for the
+                // NEW apk, then calls initCache(wrapper) for that SAME apk near the end of the run,
+                // which is what rotates the owner away from the PREVIOUS apk), the ids just wiped
+                // are the ones the in-flight/just-built mmap shard depends on. Restore them
+                // immediately — before any query can observe the gap — from WarmupManager's own
+                // record of the class list it preAssigned ids for.
+                WarmupManager.reassignIdsForCurrentApk();
                 cacheOwnerKey.set(ownerKey);
             }
             logger.info("[JAI] Class index cache invalidated due to project switch");
@@ -727,6 +892,9 @@ public class ClassCacheManager {
         classNameIndex.set(null);
         methodNameIndex.set(null);
         fieldNameIndex.set(null);
+        classKeyIndex.set(null);
+        methodKeyIndex.set(null);
+        fieldKeyIndex.set(null);
         upstreamCodeCacheRef.set(null);
         cacheOwnerKey.set("");
         isInitialized.set(false);

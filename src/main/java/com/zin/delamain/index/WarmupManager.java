@@ -220,6 +220,33 @@ public class WarmupManager {
         return currentInputHash;
     }
 
+    // F7: the exact class list this warmup instance last called CodeContentIndex.preAssignIds()
+    // with. This is the id space's single source of truth for the CURRENT apk — any path that
+    // clears CodeContentIndex out from under an already-served (or being-built) shard must restore
+    // ids from THIS list, not re-derive its own, so the restored id<->class mapping is byte-for-byte
+    // identical to what the shard was built against (preAssignIds is a deterministic from-0 walk of
+    // the list order, so replaying the same list reproduces the same ids).
+    private static volatile List<JavaClass> lastPreAssignedClasses = null;
+
+    /**
+     * Re-seeds {@link CodeContentIndex}'s id space from the last class list this warmup instance
+     * preAssigned ids for (F7 fix: id-space ownership gap). Any code path that calls
+     * {@link CodeContentIndex#clear()} on state this process is actively serving — the
+     * {@code ClassCacheManager} owner-rotate clear, or WarmupManager's own Phase-4 heap-pressure
+     * clear — must call this immediately afterward, before any query can observe a wiped id space.
+     * Skipping the restore lets {@code resolveClass} return null for every already-built shard
+     * candidate (silently wrong/missing search results) or, worse, lets a later self-heal
+     * ({@code getOrAssignId}) reassign ids in a different order than the shard was built with,
+     * resolving candidates to the WRONG class. No-op if no warmup has preAssigned ids yet in this
+     * process (nothing to protect).
+     */
+    public static void reassignIdsForCurrentApk() {
+        List<JavaClass> snapshot = lastPreAssignedClasses;
+        if (snapshot != null) {
+            CodeContentIndex.preAssignIds(snapshot);
+        }
+    }
+
     /**
      * Invalidates the published APK identity at the start of a file reload/replace (req5).
      *
@@ -513,6 +540,7 @@ public class WarmupManager {
             }
 
             CodeContentIndex.preAssignIds(sorted);
+            lastPreAssignedClasses = sorted; // F7: single source of truth for id-space restores
             UsageGraphIndex.assignIds(sorted);
             UsePlacesIndex.assignIds(sorted);
 
@@ -613,8 +641,19 @@ public class WarmupManager {
 
                 // CodeStore is complete after Phase-1 (write-through) — mark it now, independent of
                 // the use-places harvest, so a restart can FAST_RESTORE immediately.
+                //
+                // P2 fix: pass processed.get() (classes Phase-1 actually decompiled, i.e. the number
+                // of cs.put() ATTEMPTS), not sorted.size() (the full target list). sorted.size()
+                // also counts classes whose decompile itself failed and therefore never even
+                // attempted a put — comparing successful puts against that inflated denominator
+                // would make markComplete's write-success ratio check (see CodeStore#markComplete)
+                // false-reject perfectly healthy warmups whenever the normal decompile-failure rate
+                // alone exceeds the tolerance.
                 if (codeStore != null && !cancelRequested.get()) {
-                    codeStore.markComplete(sorted.size());
+                    if (!codeStore.markComplete(processed.get())) {
+                        logger.warn("[JAI] CodeStore NOT marked complete — see prior warning for the "
+                            + "write-success ratio; a restart will re-run Phase-1 instead of FAST_RESTORE");
+                    }
                 }
 
                 // Cold-path shard build: mirror the FAST_RESTORE dual-build trigger (see above) so a
@@ -813,6 +852,12 @@ public class WarmupManager {
                     freeMB, trigramEstMB, headroomNeededMB);
                 CodeContentIndex.clear();
                 trigramCleared = true;
+                // F7 fix: restore the id space immediately, from THIS warmup's own preAssigned-ids
+                // snapshot, before the harvest (or a query) can observe it wiped. Without this, the
+                // upcoming background trigram rebuild's getOrAssignId calls would assign fresh,
+                // gap-compacted ids (it skips empty/oversized classes) that drift out of sync with
+                // the already-built mmap shard's id space — the exact bug this fixes.
+                reassignIdsForCurrentApk();
                 System.gc(); // give GC a window to reclaim freed BitSets before harvest starts
             } else {
                 logger.info("[JAI] Phase-4 memory: freeMB={}, trigramEst={}MB — enough headroom, "
@@ -878,6 +923,16 @@ public class WarmupManager {
      * Builds the trigram code-content index from the persistent CodeStore in a low-priority
      * background thread, then persists it. Used on the FAST_RESTORE path so code search works
      * after a restart without re-running the multi-minute Phase-1 decompile. Idempotent.
+     *
+     * <h2>Epoch gate (F7-b)</h2>
+     * Same defect class as {@link #startBackgroundShardBuild}'s (C) fix: this thread can run long
+     * enough for a NEWER apk to load and start its own warmup while this one is still mid-loop or
+     * paused under memory pressure. {@code cancelRequested} alone cannot gate that — {@link #start}
+     * resets it to {@code false} at the top of every new warmup — so the hash captured at launch is
+     * compared against the live {@link #currentInputHash} both inside the loop (to stop indexing
+     * further into the SHARED, hash-unpartitioned {@link CodeContentIndex} heap state on behalf of
+     * an apk that is no longer current) and again immediately before {@link #tryPersistIndex} (to
+     * never write a stale/foreign product to disk). See {@link #backgroundBuildStillValid}.
      */
     private static void startBackgroundTrigramBuild(HeadlessJadxWrapper wrapper, List<JavaClass> sorted) {
         // A1: heap trigram index off → search goes through the mmap shard layer; never build BitSets.
@@ -898,17 +953,25 @@ public class WarmupManager {
             return;
         }
         trigramSkipReason.set(null);
+        // F7-b: the hash this build is FOR, captured once at launch — compared against the live
+        // currentInputHash both mid-loop and before persisting, never against cancelRequested alone.
+        String builtForHash = currentInputHash;
         Thread t = new Thread(() -> {
             long t0 = System.currentTimeMillis();
             int built = 0;
+            boolean completed = true;
             try {
                 CodeStore cs = codeStore;
                 if (cs == null) return;
                 logger.info("[JAI] Background trigram build started from CodeStore: {} classes", sorted.size());
                 for (JavaClass cls : sorted) {
-                    if (cancelRequested.get() || Thread.currentThread().isInterrupted()) break;
+                    if (cancelRequested.get() || Thread.currentThread().isInterrupted()
+                            || !backgroundBuildStillValid(true, builtForHash, currentInputHash)) {
+                        completed = false;
+                        break;
+                    }
                     if (isHighMemoryPressure()) {
-                        try { Thread.sleep(1500); } catch (InterruptedException ie) { break; }
+                        try { Thread.sleep(1500); } catch (InterruptedException ie) { completed = false; break; }
                     }
                     String code = cs.get(cls.getRawName()); // CodeStore keyed by raw name (deobf-stable)
                     if (code != null && !code.isEmpty() && CodeContentIndex.tryIndexFromCache(cls, code)) {
@@ -917,8 +980,17 @@ public class WarmupManager {
                 }
                 logger.info("[JAI] Background trigram build finished: {} classes indexed, {} trigrams, {}s",
                     built, CodeContentIndex.trigramCount(), (System.currentTimeMillis() - t0) / 1000);
-                if (!cancelRequested.get() && CodeContentIndex.trigramCount() > 0) {
+                if (backgroundBuildStillValid(completed, builtForHash, currentInputHash)
+                        && CodeContentIndex.trigramCount() > 0) {
                     tryPersistIndex(wrapper);
+                } else if (!completed || (builtForHash != null && !builtForHash.equals(currentInputHash))) {
+                    logger.warn("[JAI] Background trigram build for hash {}... DISCARDED — completed={}, "
+                        + "currentInputHash={}... (build was interrupted, or superseded by a newer apk "
+                        + "load before it finished — persisting it would write a stale/foreign trigram "
+                        + "index to disk under the wrong hash)",
+                        builtForHash != null ? builtForHash.substring(0, Math.min(8, builtForHash.length())) : "null",
+                        completed,
+                        currentInputHash != null ? currentInputHash.substring(0, Math.min(8, currentInputHash.length())) : "null");
                 }
             } finally {
                 trigramBuildRunning.set(false);
@@ -979,11 +1051,15 @@ public class WarmupManager {
                     sorted.size(), SHARD_BUDGET_BYTES / (1024 * 1024));
                 ContentShardBuilder builder = new ContentShardBuilder(dir, hash, SHARD_BUDGET_BYTES);
                 int covered = 0;
+                boolean completed = true;
                 try {
                     for (int i = 0; i < sorted.size(); i++) {
-                        if (cancelRequested.get() || Thread.currentThread().isInterrupted()) break;
+                        if (cancelRequested.get() || Thread.currentThread().isInterrupted()) {
+                            completed = false;
+                            break;
+                        }
                         if (isHighMemoryPressure()) {
-                            try { Thread.sleep(1500); } catch (InterruptedException ie) { break; }
+                            try { Thread.sleep(1500); } catch (InterruptedException ie) { completed = false; break; }
                         }
                         JavaClass cls = sorted.get(i);
                         // id == i by the preAssignIds contract documented above.
@@ -1003,12 +1079,28 @@ public class WarmupManager {
                     builder.close(); // trailing flush of the final window
                 }
                 List<ShardCatalog.ShardEntry> shardsWritten = builder.writtenShards();
-                if (!cancelRequested.get()) {
+                // F7 (C) + P2 fix: publish only if the build both (a) ran to full completion — never
+                // on a cancelled/interrupted partial pass, which used to write a catalog anyway and
+                // permanently gate isBuilt() shut on a truncated index (P2) — and (b) still targets
+                // the hash that IS this process's current APK at publish time. cancelRequested alone
+                // is unsound for (b): start() resets it to false at the top of every new warmup, so
+                // an old build blocked on I/O can wake up after a NEW APK has already loaded, see
+                // cancelRequested read as false again, and publish the OLD APK's shard catalog into
+                // the NEW APK's global ContentShardIndex (the race documented in DelamainServer's
+                // quiesce comment). Comparing the hash CAPTURED at this build's start against the
+                // CURRENT currentInputHash closes that race regardless of the flag's state.
+                if (backgroundBuildStillValid(completed, hash, currentInputHash)) {
                     ShardCatalog.write(dir, hash, shardsWritten);
                     ContentShardIndex.loadCatalog(dir, hash);
                     logger.info("[JAI] Background shard build done: {} shards, {} covered classes, {}s",
                         shardsWritten.size(), covered, (System.currentTimeMillis() - t0) / 1000);
                     writePrebakedManifest(dir, hash, sorted.size(), shardsWritten.size(), covered, wrapper);
+                } else {
+                    logger.warn("[JAI] Background shard build for hash {}... DISCARDED — completed={}, "
+                        + "currentInputHash={}... (build was interrupted, or superseded by a newer APK "
+                        + "load before it finished — publishing it would serve a stale/incomplete index)",
+                        hash.substring(0, Math.min(8, hash.length())), completed,
+                        currentInputHash != null ? currentInputHash.substring(0, Math.min(8, currentInputHash.length())) : "null");
                 }
             } catch (Exception e) {
                 logger.warn("[JAI] Background shard build failed: {}", e.getMessage());
@@ -1019,6 +1111,24 @@ public class WarmupManager {
         t.setDaemon(true);
         t.setPriority(Thread.MIN_PRIORITY);
         t.start();
+    }
+
+    /**
+     * Pure epoch/completeness gate for publishing the product of a background index build
+     * (package-private for direct unit testing — F7 fix C, generalized as F7-b). Shared by
+     * {@link #startBackgroundShardBuild} and {@link #startBackgroundTrigramBuild} — both launch a
+     * long-running background thread against a class list captured at a point in time, and both
+     * write into state ({@code ContentShardIndex} / {@code CodeContentIndex}'s persisted trigram
+     * file) that must never be published once a NEWER apk has become current. A build may publish
+     * only if it (a) ran to full completion — never on a cancelled/interrupted/memory-paused
+     * partial pass — and (b) was built for the hash that is STILL current at publish time.
+     * {@code cancelRequested} alone cannot answer (b): {@link #start} resets it to {@code false} at
+     * the top of every new warmup, so a stale thread blocked on I/O or memory pressure can wake up
+     * after a newer apk has already loaded, see {@code cancelRequested} read as false again, and
+     * publish the OLD apk's product into state the NEW apk is now serving from.
+     */
+    static boolean backgroundBuildStillValid(boolean completed, String builtForHash, String currentHash) {
+        return completed && builtForHash != null && builtForHash.equals(currentHash);
     }
 
     private static final Gson MANIFEST_GSON = new GsonBuilder().setPrettyPrinting().create();
@@ -1233,7 +1343,14 @@ public class WarmupManager {
                             // evicted cache-miss) reads source from disk instead of re-decompiling.
                             CodeStore cs = codeStore;
                             if (cs != null && code != null) {
-                                cs.put(cls.getRawName(), code); // CodeStore keyed by raw name (deobf-stable)
+                                // P2 fix: put() failures used to be swallowed at debug level with no
+                                // aggregate signal, so a systemic disk write failure (full disk,
+                                // permissions) could silently drop most/all classes while warmup
+                                // still reported success — see the markComplete() ratio guard below,
+                                // which this feeds.
+                                if (!cs.put(cls.getRawName(), code)) {
+                                    failed.incrementAndGet();
+                                }
                             }
                             // Evict the decompiled IR from JADX's internal ClassNode cache. Without
                             // this, every ClassNode permanently holds its decompiled source in heap
@@ -1312,7 +1429,7 @@ public class WarmupManager {
                 try {
                     int pos;
                     while ((pos = indexPos.getAndIncrement()) < targets.size()) {
-                        if (cancelRequested.get()) break;
+                        if (cancelRequested.get() || Thread.currentThread().isInterrupted()) break;
                         JavaClass cls = targets.get(pos);
                         // Source from the persistent CodeStore (disk, complete after Phase-1)
                         // rather than jadx's transient ICodeCache, which is largely evicted by
@@ -1335,12 +1452,24 @@ public class WarmupManager {
             });
         }
 
+        boolean completed;
         try {
-            latch.await(300, TimeUnit.SECONDS);
+            completed = latch.await(300, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            completed = false;
         } finally {
             indexPool.shutdownNow();
+        }
+        if (!completed) {
+            // P2 fix: the return value used to be discarded — a timeout silently fell through to
+            // Phase-3 with the trigram index partially filled and no signal anyone could act on.
+            // shutdownNow() alone doesn't stop a worker either: it only interrupts, and the loop
+            // above now checks isInterrupted() (previously only cancelRequested) so a timeout
+            // actually drains the workers instead of leaving them running past this method's return.
+            logger.warn("[JAI] Warmup phase-2 TIMED OUT after 300s waiting for index workers — "
+                + "proceeding to Phase-3 with a PARTIAL trigram index ({} of {} classes indexed so far)",
+                indexed.get(), targets.size());
         }
 
         long phaseMs = System.currentTimeMillis() - phaseStart;
