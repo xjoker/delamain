@@ -46,3 +46,15 @@ backend only ever binds loopback inside the container. See
 - **Context-window discipline** — large file uploads (APK/JAR/AAR/DEX) never
   pass through the AI's context; they move out-of-band via one-time
   transfer tokens. See `docs/file-upload.md`.
+
+## Guard-drift protection
+
+Any list that must mirror another system's real state needs a test that
+fails when it drifts — not a comment. New guard/assertion/invariant must
+ship with a test proving "remove the guard, test goes red" (break it,
+confirm red, revert) before it counts as done. Copy one of these shapes:
+- `busy_tracker.validate_lane_coverage()` — fail-fast if a tool has no lane
+- `WarmupManager.backgroundBuildStillValid()` — one gate, two builds
+- `MultiFileLoader.VALID_EXTENSIONS` — single source, `FileManagementRoutes` reuses it
+- `gateway/tests/test_timeout_tier_route_coverage.py` — timeout tiers vs real Java routes
+- `DelamainServerRouteAuthCoverageTest` — auth exemptions vs Javalin's real route table

@@ -58,7 +58,9 @@ public class DelamainServer {
     // (see the upload-transfer contract), not the standard bearer token — a curl/CLI client may
     // only ever hold the transfer token. /create-transfer-token still goes through standard
     // bearer auth below, matching the other routes.
-    private static final Set<String> TRANSFER_TOKEN_AUTH_PATHS = Set.of(
+    // Package-private so the contract is directly assertable (see
+    // DelamainServerRouteAuthCoverageTest), same rationale as NO_FILE_REQUIRED_PATHS above.
+    static final Set<String> TRANSFER_TOKEN_AUTH_PATHS = Set.of(
             "/transfer/upload", "/transfer/status");
     private static final String ANALYSIS_LOCK_ATTRIBUTE = "jadx-analysis-lock";
     private static final String IN_FLIGHT_TOKEN_ATTRIBUTE = "jadx-in-flight-token";
@@ -171,6 +173,25 @@ public class DelamainServer {
 
     public int getPort() {
         return port;
+    }
+
+    /**
+     * Every path with a real registered HTTP handler, straight from Javalin's own route table
+     * (not a hand-maintained mirror of it). Package-private for route-coverage assertions — see
+     * DelamainServerRouteAuthCoverageTest, which checks {@link #NO_FILE_REQUIRED_PATHS} and
+     * {@link #TRANSFER_TOKEN_AUTH_PATHS} against this so a stale or misspelled entry in either
+     * list is caught instead of silently becoming a dead exemption or a functional gap. Must be
+     * called after {@link #start()}.
+     */
+    Set<String> registeredHttpPaths() {
+        Set<String> paths = new java.util.HashSet<>();
+        for (io.javalin.router.ParsedEndpoint parsed : app.unsafeConfig().pvt.internalRouter.allHttpHandlers()) {
+            io.javalin.router.Endpoint endpoint = parsed.getEndpoint();
+            if (endpoint.getMethod().isHttpMethod()) {
+                paths.add(endpoint.getPath());
+            }
+        }
+        return paths;
     }
 
     // -------------------------------------------------------------------------
