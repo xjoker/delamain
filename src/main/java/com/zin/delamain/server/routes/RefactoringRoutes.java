@@ -83,7 +83,7 @@ public class RefactoringRoutes {
                 ClassCacheManager.invalidateCode(className);
                 ClassCacheManager.invalidateCode(cls.getFullName());
                 logger.info("Renamed class '{}' to '{}'", oldName, newName);
-                ctx.json(Map.of("result", "Renamed Class " + oldName + " to " + newName));
+                ctx.json(withStorageStatus(Map.of("result", "Renamed Class " + oldName + " to " + newName)));
                 return;
             }
 
@@ -208,7 +208,7 @@ public class RefactoringRoutes {
                         ClassCacheManager.invalidateCode(className);
                         ClassCacheManager.invalidateCode(cls.getFullName());
                         logger.info("Renamed field '{}' to '{}'", oldName, newFieldName);
-                        ctx.json(Map.of("result", "Renamed field " + oldName + " to " + newFieldName));
+                        ctx.json(withStorageStatus(Map.of("result", "Renamed field " + oldName + " to " + newFieldName)));
                         return;
                     }
                 }
@@ -231,19 +231,32 @@ public class RefactoringRoutes {
         String newPackage = getBodyString(requestBody, "new_package_name");
         if (validateParams(ctx, oldPackage, newPackage)) return;
 
-        try {
-            List<String> errors = new ArrayList<>();
-            int count = 0;
-            int total = 0;
+        List<String> errors = new ArrayList<>();
+        int count = 0;
+        int total = 0;
+        boolean interrupted = false;
 
-            for (JavaClass cls : wrapper.getClassesWithInners()) {
-                String fullName = cls.getFullName();
-                if (fullName.startsWith(oldPackage + ".") || fullName.equals(oldPackage)) {
+        try {
+            // One JadxSearchLock write-lock acquisition for the whole package (rename-perf fix)
+            // instead of one per class; see RenameStorage.Batch's javadoc for why isInterrupted()
+            // must be checked before each class once the lock is held this long.
+            try (RenameStorage.Batch batch = renameStorage.beginBatch()) {
+                for (JavaClass cls : wrapper.getClassesWithInners()) {
+                    String fullName = cls.getFullName();
+                    if (!(fullName.startsWith(oldPackage + ".") || fullName.equals(oldPackage))) {
+                        continue;
+                    }
+                    if (batch.isInterrupted()) {
+                        // Safe checkpoint: nothing for this class has started, everything renamed
+                        // so far is fully committed -- an orderly partial batch, not a stuck lock.
+                        interrupted = true;
+                        break;
+                    }
                     total++;
                     try {
                         String relativePath = fullName.substring(oldPackage.length());
                         String newFullName = newPackage + relativePath;
-                        renameStorage.renameClass(cls, newFullName);
+                        batch.renameClass(cls, newFullName);
                         count++;
                     } catch (Exception e) {
                         errors.add("Failed to rename " + fullName + ": " + e.getMessage());
@@ -259,7 +272,8 @@ public class RefactoringRoutes {
             result.put("renamed", count);
             result.put("total", total);
             result.put("errors", errors);
-            ctx.json(result);
+            result.put("interrupted", interrupted);
+            ctx.json(withStorageStatus(result));
         } catch (Exception e) {
             logger.error("Internal error renaming package: {}", e.getMessage(), e);
             ctx.status(500).json(Map.of("error", "Internal error: " + e.getMessage()));
@@ -344,115 +358,128 @@ public class RefactoringRoutes {
             Map<String, JavaClass> classMap = ClassCacheManager.getCache();
             int successCount = 0;
             int failCount = 0;
+            boolean interrupted = false;
             List<String> errors = new ArrayList<>();
 
-            for (JsonElement element : mappingsArray) {
-                if (!element.isJsonObject()) {
-                    failCount++;
-                    errors.add("Skipped non-object element");
-                    continue;
-                }
-
-                JsonObject entry = element.getAsJsonObject();
-                String type = getStringFromJson(entry, "type");
-                String originalName = getStringFromJson(entry, "original_name");
-                String newName = getStringFromJson(entry, "new_name");
-                String classContext = getStringFromJson(entry, "class_context");
-
-                if (type == null || originalName == null || newName == null) {
-                    failCount++;
-                    errors.add("Missing required fields (type/original_name/new_name) in entry: " + entry);
-                    continue;
-                }
-
-                try {
-                    switch (type.toLowerCase()) {
-                        case "class": {
-                            JavaClass cls = ClassCacheManager.findClass(classMap, originalName);
-                            if (cls == null) {
-                                failCount++;
-                                errors.add("Class not found: " + originalName);
-                                continue;
-                            }
-                            renameStorage.renameClass(cls, newName);
-                            ClassCacheManager.invalidateCode(originalName);
-                            successCount++;
-                            break;
-                        }
-                        case "method": {
-                            if (classContext == null || classContext.isEmpty()) {
-                                failCount++;
-                                errors.add("class_context required for method: " + originalName);
-                                continue;
-                            }
-                            JavaClass cls = ClassCacheManager.findClass(classMap, classContext);
-                            if (cls == null) {
-                                failCount++;
-                                errors.add("Class not found for method: " + classContext);
-                                continue;
-                            }
-                            boolean found = false;
-                            for (JavaMethod method : cls.getMethods()) {
-                                if (JadxApiAdapter.matchesMethodName(method, originalName)) {
-                                    renameStorage.renameMethod(method, newName);
-                                    ClassCacheManager.invalidateCode(classContext);
-                                    found = true;
-                                    successCount++;
-                                    break;
-                                }
-                            }
-                            if (!found) {
-                                failCount++;
-                                errors.add("Method not found: " + originalName + " in " + classContext);
-                            }
-                            break;
-                        }
-                        case "field": {
-                            if (classContext == null || classContext.isEmpty()) {
-                                failCount++;
-                                errors.add("class_context required for field: " + originalName);
-                                continue;
-                            }
-                            JavaClass cls = ClassCacheManager.findClass(classMap, classContext);
-                            if (cls == null) {
-                                failCount++;
-                                errors.add("Class not found for field: " + classContext);
-                                continue;
-                            }
-                            boolean found = false;
-                            for (JavaField field : cls.getFields()) {
-                                if (JadxApiAdapter.matchesFieldName(field, originalName)) {
-                                    renameStorage.renameField(field, newName);
-                                    ClassCacheManager.invalidateCode(classContext);
-                                    found = true;
-                                    successCount++;
-                                    break;
-                                }
-                            }
-                            if (!found) {
-                                failCount++;
-                                errors.add("Field not found: " + originalName + " in " + classContext);
-                            }
-                            break;
-                        }
-                        default:
-                            failCount++;
-                            errors.add("Unknown type '" + type + "' for entry: " + originalName);
+            // One JadxSearchLock write-lock acquisition for the whole mappings array (rename-perf
+            // fix) instead of one per entry; see RenameStorage.Batch's javadoc for why
+            // isInterrupted() must be checked before each entry once the lock is held this long.
+            try (RenameStorage.Batch batch = renameStorage.beginBatch()) {
+                for (JsonElement element : mappingsArray) {
+                    if (batch.isInterrupted()) {
+                        // Safe checkpoint: nothing for this entry has started, everything applied
+                        // so far is fully committed -- an orderly partial batch, not a stuck lock.
+                        interrupted = true;
+                        break;
                     }
-                } catch (Exception e) {
-                    failCount++;
-                    errors.add("Error processing " + type + " '" + originalName + "': " + e.getMessage());
+                    if (!element.isJsonObject()) {
+                        failCount++;
+                        errors.add("Skipped non-object element");
+                        continue;
+                    }
+
+                    JsonObject entry = element.getAsJsonObject();
+                    String type = getStringFromJson(entry, "type");
+                    String originalName = getStringFromJson(entry, "original_name");
+                    String newName = getStringFromJson(entry, "new_name");
+                    String classContext = getStringFromJson(entry, "class_context");
+
+                    if (type == null || originalName == null || newName == null) {
+                        failCount++;
+                        errors.add("Missing required fields (type/original_name/new_name) in entry: " + entry);
+                        continue;
+                    }
+
+                    try {
+                        switch (type.toLowerCase()) {
+                            case "class": {
+                                JavaClass cls = ClassCacheManager.findClass(classMap, originalName);
+                                if (cls == null) {
+                                    failCount++;
+                                    errors.add("Class not found: " + originalName);
+                                    continue;
+                                }
+                                batch.renameClass(cls, newName);
+                                ClassCacheManager.invalidateCode(originalName);
+                                successCount++;
+                                break;
+                            }
+                            case "method": {
+                                if (classContext == null || classContext.isEmpty()) {
+                                    failCount++;
+                                    errors.add("class_context required for method: " + originalName);
+                                    continue;
+                                }
+                                JavaClass cls = ClassCacheManager.findClass(classMap, classContext);
+                                if (cls == null) {
+                                    failCount++;
+                                    errors.add("Class not found for method: " + classContext);
+                                    continue;
+                                }
+                                boolean found = false;
+                                for (JavaMethod method : cls.getMethods()) {
+                                    if (JadxApiAdapter.matchesMethodName(method, originalName)) {
+                                        batch.renameMethod(method, newName);
+                                        ClassCacheManager.invalidateCode(classContext);
+                                        found = true;
+                                        successCount++;
+                                        break;
+                                    }
+                                }
+                                if (!found) {
+                                    failCount++;
+                                    errors.add("Method not found: " + originalName + " in " + classContext);
+                                }
+                                break;
+                            }
+                            case "field": {
+                                if (classContext == null || classContext.isEmpty()) {
+                                    failCount++;
+                                    errors.add("class_context required for field: " + originalName);
+                                    continue;
+                                }
+                                JavaClass cls = ClassCacheManager.findClass(classMap, classContext);
+                                if (cls == null) {
+                                    failCount++;
+                                    errors.add("Class not found for field: " + classContext);
+                                    continue;
+                                }
+                                boolean found = false;
+                                for (JavaField field : cls.getFields()) {
+                                    if (JadxApiAdapter.matchesFieldName(field, originalName)) {
+                                        batch.renameField(field, newName);
+                                        ClassCacheManager.invalidateCode(classContext);
+                                        found = true;
+                                        successCount++;
+                                        break;
+                                    }
+                                }
+                                if (!found) {
+                                    failCount++;
+                                    errors.add("Field not found: " + originalName + " in " + classContext);
+                                }
+                                break;
+                            }
+                            default:
+                                failCount++;
+                                errors.add("Unknown type '" + type + "' for entry: " + originalName);
+                        }
+                    } catch (Exception e) {
+                        failCount++;
+                        errors.add("Error processing " + type + " '" + originalName + "': " + e.getMessage());
+                    }
                 }
             }
 
             Map<String, Object> result = new HashMap<>();
-            result.put("success", failCount == 0);
+            result.put("success", failCount == 0 && !interrupted);
             result.put("total", mappingsArray.size());
             result.put("applied", successCount);
             result.put("failed", failCount);
             result.put("errors", errors);
-            logger.info("Import rename mappings: applied={}, failed={}", successCount, failCount);
-            ctx.json(result);
+            result.put("interrupted", interrupted);
+            logger.info("Import rename mappings: applied={}, failed={}, interrupted={}", successCount, failCount, interrupted);
+            ctx.json(withStorageStatus(result));
         } catch (Exception e) {
             logger.error("Failed to import rename mappings: {}", e.getMessage(), e);
             ctx.status(500).json(Map.of("error", "Internal error: " + e.getMessage()));
@@ -503,7 +530,7 @@ public class RefactoringRoutes {
         }
 
         if (mappingsArray.size() == 0) {
-            ctx.json(Map.of("applied", 0, "failed", 0, "errors", parseErrors, "total", 0, "format", "proguard"));
+            ctx.json(withStorageStatus(Map.of("applied", 0, "failed", 0, "errors", parseErrors, "total", 0, "format", "proguard")));
             return;
         }
 
@@ -515,34 +542,47 @@ public class RefactoringRoutes {
             Map<String, JavaClass> classMap = ClassCacheManager.getCache();
             int successCount = 0;
             int failCount = 0;
+            boolean interrupted = false;
             List<String> errors = new ArrayList<>(parseErrors);
 
-            for (JsonElement element : mappingsArray) {
-                if (!element.isJsonObject()) {
-                    failCount++;
-                    continue;
-                }
-                JsonObject entry = element.getAsJsonObject();
-                String originalName = getStringFromJson(entry, "original_name");
-                String newName = getStringFromJson(entry, "new_name");
-                if (originalName == null || newName == null) {
-                    failCount++;
-                    continue;
-                }
-
-                try {
-                    JavaClass cls = ClassCacheManager.findClass(classMap, originalName);
-                    if (cls == null) {
+            // One JadxSearchLock write-lock acquisition for the whole mapping file (rename-perf
+            // fix, same defect as rename-package / import-rename-mappings -- see
+            // RenameStorage.Batch's javadoc) instead of one per entry; isInterrupted() must be
+            // checked before each entry once the lock is held this long.
+            try (RenameStorage.Batch batch = renameStorage.beginBatch()) {
+                for (JsonElement element : mappingsArray) {
+                    if (batch.isInterrupted()) {
+                        // Safe checkpoint: nothing for this entry has started, everything applied
+                        // so far is fully committed -- an orderly partial batch, not a stuck lock.
+                        interrupted = true;
+                        break;
+                    }
+                    if (!element.isJsonObject()) {
                         failCount++;
-                        errors.add("Class not found: " + originalName);
                         continue;
                     }
-                    renameStorage.renameClass(cls, newName);
-                    ClassCacheManager.invalidateCode(originalName);
-                    successCount++;
-                } catch (Exception e) {
-                    failCount++;
-                    errors.add("Error renaming '" + originalName + "': " + e.getMessage());
+                    JsonObject entry = element.getAsJsonObject();
+                    String originalName = getStringFromJson(entry, "original_name");
+                    String newName = getStringFromJson(entry, "new_name");
+                    if (originalName == null || newName == null) {
+                        failCount++;
+                        continue;
+                    }
+
+                    try {
+                        JavaClass cls = ClassCacheManager.findClass(classMap, originalName);
+                        if (cls == null) {
+                            failCount++;
+                            errors.add("Class not found: " + originalName);
+                            continue;
+                        }
+                        batch.renameClass(cls, newName);
+                        ClassCacheManager.invalidateCode(originalName);
+                        successCount++;
+                    } catch (Exception e) {
+                        failCount++;
+                        errors.add("Error renaming '" + originalName + "': " + e.getMessage());
+                    }
                 }
             }
 
@@ -552,8 +592,9 @@ public class RefactoringRoutes {
             result.put("errors", errors);
             result.put("total", mappingsArray.size());
             result.put("format", "proguard");
-            logger.info("Apply ProGuard mapping: applied={}, failed={}", successCount, failCount);
-            ctx.json(result);
+            result.put("interrupted", interrupted);
+            logger.info("Apply ProGuard mapping: applied={}, failed={}, interrupted={}", successCount, failCount, interrupted);
+            ctx.json(withStorageStatus(result));
         } catch (Exception e) {
             logger.error("Failed to apply ProGuard mapping: {}", e.getMessage(), e);
             ctx.status(500).json(Map.of("error", "Internal error: " + e.getMessage()));
@@ -588,11 +629,27 @@ public class RefactoringRoutes {
             ClassCacheManager.invalidateCode(className);
             ClassCacheManager.invalidateCode(cls.getFullName());
             logger.info("Renamed method '{}' to '{}'", oldName, newName);
-            ctx.json(Map.of("result", "Rename method " + oldName + " to " + newName));
+            ctx.json(withStorageStatus(Map.of("result", "Rename method " + oldName + " to " + newName)));
         } catch (Exception e) {
             logger.error("Failed to rename method: {}", e.getMessage(), e);
             ctx.status(500).json(Map.of("error", "Failed to rename method: " + e.getMessage()));
         }
+    }
+
+    /**
+     * Surfaces {@link RenameStorage#isDegraded()} on rename-affecting responses instead of it
+     * being visible only in a log line -- a corrupt {@code renames.json} means this session's
+     * rename data silently started empty (see {@link RenameStorage#getDegradedReason()}), which a
+     * caller has no other way to notice.
+     */
+    private Map<String, Object> withStorageStatus(Map<String, Object> body) {
+        if (!renameStorage.isDegraded()) {
+            return body;
+        }
+        Map<String, Object> augmented = new HashMap<>(body);
+        augmented.put("storage_degraded", true);
+        augmented.put("storage_degraded_reason", renameStorage.getDegradedReason());
+        return augmented;
     }
 
     private List<String> collectMethodDescriptors(List<JavaMethod> methods) {

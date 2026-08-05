@@ -62,6 +62,12 @@ public class RenameStorage {
     /** Live data; replaced atomically after each save. */
     private volatile RenameData data;
 
+    /** True once a corrupt/unparseable {@code renames.json} forced this session to start with an
+     *  empty rename set; see {@link #getDegradedReason()} for what happened and where the
+     *  original file was preserved. */
+    private volatile boolean degraded = false;
+    private volatile String degradedReason = null;
+
     /**
      * @param dataDir directory where {@code renames.json} is stored; created if absent
      */
@@ -110,8 +116,7 @@ public class RenameStorage {
             JadxSearchLock.release();
         }
 
-        data.classes.put(originalName, newName);
-        saveToDisk();
+        putAndSave(data.classes, originalName, newName);
         logger.info("[RenameStorage] Renamed class '{}' → '{}'", originalName, newName);
     }
 
@@ -145,8 +150,7 @@ public class RenameStorage {
             JadxSearchLock.release();
         }
 
-        data.methods.put(key, newName);
-        saveToDisk();
+        putAndSave(data.methods, key, newName);
         logger.info("[RenameStorage] Renamed method '{}' → '{}'", key, newName);
     }
 
@@ -177,8 +181,7 @@ public class RenameStorage {
             JadxSearchLock.release();
         }
 
-        data.fields.put(key, newName);
-        saveToDisk();
+        putAndSave(data.fields, key, newName);
         logger.info("[RenameStorage] Renamed field '{}' → '{}'", key, newName);
     }
 
@@ -188,20 +191,17 @@ public class RenameStorage {
 
     /** Persists a class rename by original full name (used during session restore). */
     public synchronized void renameClass(String originalFullName, String newName) throws IOException {
-        data.classes.put(originalFullName, newName);
-        saveToDisk();
+        putAndSave(data.classes, originalFullName, newName);
     }
 
     /** Persists a method rename by key ({@code declaringClass#shortId}). */
     public synchronized void renameMethod(String methodKey, String newName) throws IOException {
-        data.methods.put(methodKey, newName);
-        saveToDisk();
+        putAndSave(data.methods, methodKey, newName);
     }
 
     /** Persists a field rename by key ({@code declaringClass#fieldName:type}). */
     public synchronized void renameField(String fieldKey, String newName) throws IOException {
-        data.fields.put(fieldKey, newName);
-        saveToDisk();
+        putAndSave(data.fields, fieldKey, newName);
     }
 
     // -------------------------------------------------------------------------
@@ -238,6 +238,18 @@ public class RenameStorage {
         return d.classes.size() + d.methods.size() + d.fields.size();
     }
 
+    /** True once loading hit a corrupt/unparseable {@code renames.json} this session -- this
+     *  session started with an EMPTY rename set even though the on-disk file was not itself
+     *  empty. See {@link #getDegradedReason()} for detail and where the original file went. */
+    public boolean isDegraded() {
+        return degraded;
+    }
+
+    /** Human-readable detail for {@link #isDegraded()}; {@code null} while not degraded. */
+    public String getDegradedReason() {
+        return degradedReason;
+    }
+
     // -------------------------------------------------------------------------
     // Key builders
     // -------------------------------------------------------------------------
@@ -257,6 +269,157 @@ public class RenameStorage {
     }
 
     // -------------------------------------------------------------------------
+    // Batch rename (rename-perf fix + orderly interruption)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Begins a batch: acquires {@link JadxSearchLock}'s write lock ONCE for however many items the
+     * caller applies through the returned {@link Batch}, instead of once per item (rename-perf fix
+     * -- see {@link ClassCacheManager#reindexRenamedClassesBatch}, which this collapses every
+     * item's index refresh into a single end-of-batch call for).
+     *
+     * <p>Holding one lock across a whole batch means a slow/huge batch is now the thing most likely
+     * to run past {@link JadxSearchLock}'s stale-holder watchdog timeout -- which is exactly why
+     * {@link Batch#isInterrupted()} exists: callers MUST check it before starting each item so the
+     * watchdog's interrupt signal can produce an orderly, partial exit (lock released, everything
+     * completed so far persisted) instead of a write lock that is held forever because nothing in
+     * the loop ever looks at {@code Thread.interrupted()}.</p>
+     *
+     * <p>Callers MUST close the returned {@link Batch} (try-with-resources) so the lock is always
+     * released and the batch's renames are indexed/persisted exactly once.</p>
+     */
+    public synchronized Batch beginBatch() throws IOException {
+        if (!JadxSearchLock.tryAcquire(JadxSearchLock.LOCK_TIMEOUT_SECONDS)) {
+            throw new IOException("Timed out waiting for search lock before starting batch rename");
+        }
+        return new Batch();
+    }
+
+    /**
+     * A single batch rename session obtained from {@link #beginBatch()}.
+     *
+     * <pre>
+     * try (RenameStorage.Batch batch = storage.beginBatch()) {
+     *     for (Item item : items) {
+     *         if (batch.isInterrupted()) break;   // safe checkpoint -- see class javadoc
+     *         batch.renameClass(item.cls, item.newName);
+     *     }
+     * } // close(): one reindexRenamedClassesBatch() call, one saveToDisk(), lock released
+     * </pre>
+     *
+     * <h2>Where the interrupt checkpoint is safe, and where it is not</h2>
+     * <p>{@link #isInterrupted()} is meant to be checked ONLY between items, never in the middle of
+     * one. Once {@link #renameClass}/{@link #renameMethod}/{@link #renameField} starts mutating a
+     * live JADX node it always runs the rename + index-bucket refresh for that single node through
+     * to completion before returning -- stopping partway through would leave the node's alias
+     * updated but its name-index bucket / {@code classCache} key still pointing at the old name (a
+     * half-renamed, unsearchable node). That is the exact data corruption the watchdog redesign
+     * (dropping the old steal-the-lock {@code forceRelease()} behavior) was meant to prevent, so
+     * this class deliberately gives callers no way to interrupt inside a single item -- only
+     * between two fully-committed ones.</p>
+     */
+    public final class Batch implements Closeable {
+        private final List<ClassCacheManager.RenamedClass> touched = new ArrayList<>();
+        private final Map<String, String> classesSnapshot;
+        private final Map<String, String> methodsSnapshot;
+        private final Map<String, String> fieldsSnapshot;
+        private boolean closed = false;
+
+        private Batch() {
+            // Snapshots let close() roll every map mutation this batch made back at once if the
+            // single end-of-batch saveToDisk() fails -- same map/disk-divergence concern as
+            // putAndSave(), just covering every key this batch touched instead of one.
+            this.classesSnapshot = new LinkedHashMap<>(data.classes);
+            this.methodsSnapshot = new LinkedHashMap<>(data.methods);
+            this.fieldsSnapshot = new LinkedHashMap<>(data.fields);
+        }
+
+        /**
+         * True once this thread has been cooperatively asked to stop (e.g. by
+         * {@link JadxSearchLock}'s stale-holder watchdog calling {@code Thread.interrupt()} on the
+         * batch-driving thread). Check this BEFORE starting the next item -- see class javadoc for
+         * why that is the only safe place.
+         */
+        public boolean isInterrupted() {
+            return Thread.currentThread().isInterrupted();
+        }
+
+        /** Renames one class as part of this batch. Must run to completion once started (see class javadoc). */
+        public void renameClass(JavaClass cls, String newName) {
+            Objects.requireNonNull(cls, "cls");
+            Objects.requireNonNull(newName, "newName");
+            String originalName = cls.getFullName();
+            cls.getClassNode().rename(newName);
+            cls.getClassNode().unloadFromCache();
+            touched.add(new ClassCacheManager.RenamedClass(cls, originalName));
+            data.classes.put(originalName, newName);
+        }
+
+        /** Renames one method as part of this batch. Must run to completion once started (see class javadoc). */
+        public void renameMethod(JavaMethod method, String newName) {
+            Objects.requireNonNull(method, "method");
+            Objects.requireNonNull(newName, "newName");
+            String key = methodKey(method);
+            JavaClass declaringClass = method.getDeclaringClass();
+            method.getMethodNode().rename(newName);
+            if (declaringClass != null) {
+                declaringClass.getClassNode().unloadFromCache();
+                touched.add(new ClassCacheManager.RenamedClass(declaringClass, declaringClass.getFullName()));
+            }
+            data.methods.put(key, newName);
+        }
+
+        /** Renames one field as part of this batch. Must run to completion once started (see class javadoc). */
+        public void renameField(JavaField field, String newName) {
+            Objects.requireNonNull(field, "field");
+            Objects.requireNonNull(newName, "newName");
+            String key = fieldKey(field);
+            JavaClass declaringClass = field.getDeclaringClass();
+            field.getFieldNode().rename(newName);
+            if (declaringClass != null) {
+                declaringClass.getClassNode().unloadFromCache();
+                touched.add(new ClassCacheManager.RenamedClass(declaringClass, declaringClass.getFullName()));
+            }
+            data.fields.put(key, newName);
+        }
+
+        /**
+         * Refreshes indexes for every touched class in ONE call, persists ONCE, then releases the
+         * write lock -- always, even if nothing was renamed (e.g. interrupted before the first
+         * item) or if reindexing/saving throws.
+         */
+        @Override
+        public void close() throws IOException {
+            if (closed) return;
+            closed = true;
+            try {
+                if (!touched.isEmpty()) {
+                    ClassCacheManager.reindexRenamedClassesBatch(touched);
+                }
+            } finally {
+                JadxSearchLock.release();
+            }
+            if (touched.isEmpty()) {
+                return;
+            }
+            try {
+                saveToDisk();
+            } catch (IOException e) {
+                // Same map/disk-divergence rollback as putAndSave(), for every key this batch
+                // touched at once (see the Batch constructor's snapshot comment).
+                data.classes.clear();
+                data.classes.putAll(classesSnapshot);
+                data.methods.clear();
+                data.methods.putAll(methodsSnapshot);
+                data.fields.clear();
+                data.fields.putAll(fieldsSnapshot);
+                throw e;
+            }
+            logger.info("[RenameStorage] Batch rename persisted; {} class(es) touched", touched.size());
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Disk I/O
     // -------------------------------------------------------------------------
 
@@ -268,9 +431,38 @@ public class RenameStorage {
             RenameData loaded = gson.fromJson(r, RenameData.class);
             return loaded != null ? loaded : new RenameData();
         } catch (Exception e) {
-            logger.warn("[RenameStorage] Failed to load renames from {}; starting fresh: {}", storagePath, e.getMessage());
+            quarantineCorruptFile(e);
             return new RenameData();
         }
+    }
+
+    /**
+     * A corrupt/unparseable {@code renames.json} used to be silently discarded here (a WARN log
+     * line) and then permanently destroyed by the very next {@link #saveToDisk()}, whose atomic
+     * tmp-file move overwrites the same path. This is the only place in the project a user's own
+     * hand-produced data lives (CodeStore / UsageGraphStore / ContentShard are all regenerable
+     * caches, safe to rebuild from the APK) -- so on a parse failure the unreadable file is moved
+     * aside instead of being left where the next save can clobber it, and {@link #isDegraded()}
+     * gives callers a way to surface the loss instead of it being invisible outside a log line.
+     */
+    private void quarantineCorruptFile(Exception cause) {
+        Path quarantined = storagePath.resolveSibling(
+                storagePath.getFileName() + ".corrupt-" + System.currentTimeMillis());
+        try {
+            Files.move(storagePath, quarantined, StandardCopyOption.REPLACE_EXISTING);
+            degradedReason = "Failed to parse " + storagePath.getFileName() + " (" + cause.getMessage()
+                    + "); original file preserved at " + quarantined.getFileName()
+                    + " for manual recovery. Starting with an EMPTY rename set -- all previously "
+                    + "recorded aliases are inaccessible until that file is restored by hand.";
+            logger.error("[RenameStorage] {}", degradedReason, cause);
+        } catch (IOException moveFailure) {
+            degradedReason = "Failed to parse " + storagePath + " (" + cause.getMessage()
+                    + ") AND failed to quarantine it (" + moveFailure.getMessage()
+                    + "); starting with an EMPTY rename set. The corrupt file was NOT moved and may "
+                    + "still be overwritten by the next save.";
+            logger.error("[RenameStorage] {}", degradedReason, moveFailure);
+        }
+        degraded = true;
     }
 
     private void saveToDisk() throws IOException {
@@ -279,6 +471,34 @@ public class RenameStorage {
             gson.toJson(data, w);
         }
         Files.move(tmpPath, storagePath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    /**
+     * Applies {@code map.put(key, newValue)} then persists, rolling the map entry back to
+     * whatever it was before if the save fails.
+     *
+     * <p>Before this, a failed {@link #saveToDisk()} left three states disagreeing: the live JADX
+     * node already renamed, this in-memory map already updated, and the disk file still holding
+     * the old value -- so every query for the rest of this session would show the new alias while
+     * a restart would silently lose it, with no way for the user to tell which one was "real". This
+     * at least keeps the in-memory map and disk in agreement (both without the failed change); the
+     * live JADX node rename itself is not undone -- JADX has no supported "undo rename" and the
+     * node's alias is not persisted data, so it does not carry the same data-loss risk.</p>
+     */
+    private void putAndSave(Map<String, String> map, String key, String newValue) throws IOException {
+        boolean hadPrevious = map.containsKey(key);
+        String previous = map.get(key);
+        map.put(key, newValue);
+        try {
+            saveToDisk();
+        } catch (IOException e) {
+            if (hadPrevious) {
+                map.put(key, previous);
+            } else {
+                map.remove(key);
+            }
+            throw e;
+        }
     }
 
     // -------------------------------------------------------------------------
