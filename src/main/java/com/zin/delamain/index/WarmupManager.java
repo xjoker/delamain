@@ -924,15 +924,9 @@ public class WarmupManager {
      * background thread, then persists it. Used on the FAST_RESTORE path so code search works
      * after a restart without re-running the multi-minute Phase-1 decompile. Idempotent.
      *
-     * <h2>Epoch gate (F7-b)</h2>
-     * Same defect class as {@link #startBackgroundShardBuild}'s (C) fix: this thread can run long
-     * enough for a NEWER apk to load and start its own warmup while this one is still mid-loop or
-     * paused under memory pressure. {@code cancelRequested} alone cannot gate that — {@link #start}
-     * resets it to {@code false} at the top of every new warmup — so the hash captured at launch is
-     * compared against the live {@link #currentInputHash} both inside the loop (to stop indexing
-     * further into the SHARED, hash-unpartitioned {@link CodeContentIndex} heap state on behalf of
-     * an apk that is no longer current) and again immediately before {@link #tryPersistIndex} (to
-     * never write a stale/foreign product to disk). See {@link #backgroundBuildStillValid}.
+     * <p>The actual build loop is {@link #runTrigramBuildLoop} — extracted so its epoch gate (see
+     * that method's doc) can be exercised directly by a test instead of only as a standalone
+     * pure-function check of {@link #backgroundBuildStillValid}.
      */
     private static void startBackgroundTrigramBuild(HeadlessJadxWrapper wrapper, List<JavaClass> sorted) {
         // A1: heap trigram index off → search goes through the mmap shard layer; never build BitSets.
@@ -956,49 +950,70 @@ public class WarmupManager {
         // F7-b: the hash this build is FOR, captured once at launch — compared against the live
         // currentInputHash both mid-loop and before persisting, never against cancelRequested alone.
         String builtForHash = currentInputHash;
-        Thread t = new Thread(() -> {
-            long t0 = System.currentTimeMillis();
-            int built = 0;
-            boolean completed = true;
-            try {
-                CodeStore cs = codeStore;
-                if (cs == null) return;
-                logger.info("[JAI] Background trigram build started from CodeStore: {} classes", sorted.size());
-                for (JavaClass cls : sorted) {
-                    if (cancelRequested.get() || Thread.currentThread().isInterrupted()
-                            || !backgroundBuildStillValid(true, builtForHash, currentInputHash)) {
-                        completed = false;
-                        break;
-                    }
-                    if (isHighMemoryPressure()) {
-                        try { Thread.sleep(1500); } catch (InterruptedException ie) { completed = false; break; }
-                    }
-                    String code = cs.get(cls.getRawName()); // CodeStore keyed by raw name (deobf-stable)
-                    if (code != null && !code.isEmpty() && CodeContentIndex.tryIndexFromCache(cls, code)) {
-                        built++;
-                    }
-                }
-                logger.info("[JAI] Background trigram build finished: {} classes indexed, {} trigrams, {}s",
-                    built, CodeContentIndex.trigramCount(), (System.currentTimeMillis() - t0) / 1000);
-                if (backgroundBuildStillValid(completed, builtForHash, currentInputHash)
-                        && CodeContentIndex.trigramCount() > 0) {
-                    tryPersistIndex(wrapper);
-                } else if (!completed || (builtForHash != null && !builtForHash.equals(currentInputHash))) {
-                    logger.warn("[JAI] Background trigram build for hash {}... DISCARDED — completed={}, "
-                        + "currentInputHash={}... (build was interrupted, or superseded by a newer apk "
-                        + "load before it finished — persisting it would write a stale/foreign trigram "
-                        + "index to disk under the wrong hash)",
-                        builtForHash != null ? builtForHash.substring(0, Math.min(8, builtForHash.length())) : "null",
-                        completed,
-                        currentInputHash != null ? currentInputHash.substring(0, Math.min(8, currentInputHash.length())) : "null");
-                }
-            } finally {
-                trigramBuildRunning.set(false);
-            }
-        }, "jadx-trigram-build");
+        Thread t = new Thread(() -> runTrigramBuildLoop(wrapper, sorted, builtForHash), "jadx-trigram-build");
         t.setDaemon(true);
         t.setPriority(Thread.MIN_PRIORITY);
         t.start();
+    }
+
+    /**
+     * The trigram-build thread body — extracted from {@link #startBackgroundTrigramBuild} (package-
+     * private for direct unit testing) so the epoch gate below can be exercised on the actual call
+     * path instead of only as a standalone pure-function check of {@link #backgroundBuildStillValid}.
+     *
+     * <h2>Epoch gate (F7-b)</h2>
+     * Same defect class as {@link #startBackgroundShardBuild}'s (C) fix: this thread can run long
+     * enough for a NEWER apk to load and start its own warmup while this one is still mid-loop or
+     * paused under memory pressure. {@code cancelRequested} alone cannot gate that — {@link #start}
+     * resets it to {@code false} at the top of every new warmup — so the hash captured at launch is
+     * compared against the live {@link #currentInputHash} both inside the loop (to stop indexing
+     * further into the SHARED, hash-unpartitioned {@link CodeContentIndex} heap state on behalf of
+     * an apk that is no longer current) and again immediately before {@link #tryPersistIndex} (to
+     * never write a stale/foreign product to disk). See {@link #backgroundBuildStillValid}.
+     *
+     * <p>Owns the full lifecycle a caller starting this as a thread would expect: resets
+     * {@code trigramBuildRunning} to {@code false} in its own {@code finally}, so calling it directly
+     * (as a test does) never leaves that flag stuck {@code true}.
+     */
+    static void runTrigramBuildLoop(HeadlessJadxWrapper wrapper, List<JavaClass> sorted, String builtForHash) {
+        long t0 = System.currentTimeMillis();
+        int built = 0;
+        boolean completed = true;
+        try {
+            CodeStore cs = codeStore;
+            if (cs == null) return;
+            logger.info("[JAI] Background trigram build started from CodeStore: {} classes", sorted.size());
+            for (JavaClass cls : sorted) {
+                if (cancelRequested.get() || Thread.currentThread().isInterrupted()
+                        || !backgroundBuildStillValid(true, builtForHash, currentInputHash)) {
+                    completed = false;
+                    break;
+                }
+                if (isHighMemoryPressure()) {
+                    try { Thread.sleep(1500); } catch (InterruptedException ie) { completed = false; break; }
+                }
+                String code = cs.get(cls.getRawName()); // CodeStore keyed by raw name (deobf-stable)
+                if (code != null && !code.isEmpty() && CodeContentIndex.tryIndexFromCache(cls, code)) {
+                    built++;
+                }
+            }
+            logger.info("[JAI] Background trigram build finished: {} classes indexed, {} trigrams, {}s",
+                built, CodeContentIndex.trigramCount(), (System.currentTimeMillis() - t0) / 1000);
+            if (backgroundBuildStillValid(completed, builtForHash, currentInputHash)
+                    && CodeContentIndex.trigramCount() > 0) {
+                tryPersistIndex(wrapper);
+            } else if (!completed || (builtForHash != null && !builtForHash.equals(currentInputHash))) {
+                logger.warn("[JAI] Background trigram build for hash {}... DISCARDED — completed={}, "
+                    + "currentInputHash={}... (build was interrupted, or superseded by a newer apk "
+                    + "load before it finished — persisting it would write a stale/foreign trigram "
+                    + "index to disk under the wrong hash)",
+                    builtForHash != null ? builtForHash.substring(0, Math.min(8, builtForHash.length())) : "null",
+                    completed,
+                    currentInputHash != null ? currentInputHash.substring(0, Math.min(8, currentInputHash.length())) : "null");
+            }
+        } finally {
+            trigramBuildRunning.set(false);
+        }
     }
 
     private static final AtomicBoolean shardBuildRunning = new AtomicBoolean(false);
@@ -1013,6 +1028,23 @@ public class WarmupManager {
      * background thread, writes the catalog, then loads it into {@link ContentShardIndex}. Runs in
      * parallel with (and independent of) the heap-bound trigram index — the shard layer is not yet
      * consulted by queries (Wave B), so this is a pure additive build with zero search-behavior risk.
+     *
+     * <p>The actual build loop is {@link #runShardBuildLoop} — extracted so its class-id contract
+     * and epoch gate (see that method's doc) can be exercised directly by a test instead of only as
+     * a standalone pure-function check of {@link #backgroundBuildStillValid}.
+     */
+    private static void startBackgroundShardBuild(HeadlessJadxWrapper wrapper, List<JavaClass> sorted, String hash) {
+        if (hash == null) return;
+        if (!shardBuildRunning.compareAndSet(false, true)) return;
+        Thread t = new Thread(() -> runShardBuildLoop(wrapper, sorted, hash), "jadx-shard-build");
+        t.setDaemon(true);
+        t.setPriority(Thread.MIN_PRIORITY);
+        t.start();
+    }
+
+    /**
+     * The shard-build thread body — extracted from {@link #startBackgroundShardBuild} (package-
+     * private for direct unit testing).
      *
      * <h2>Class-id contract (soundness-critical)</h2>
      * {@code sorted} is the exact list passed to {@link CodeContentIndex#preAssignIds}, which assigns
@@ -1037,80 +1069,84 @@ public class WarmupManager {
      * gated on both signals — {@code code != null} (CodeStore hit, not a library miss) AND
      * {@code cls.isInner()} — so a non-inner class with genuinely empty/failed source (e.g. a
      * Phase-1 decompile failure) is NOT excluded and still falls back to a real scan.
+     *
+     * <h2>Epoch gate</h2>
+     * {@code hash} is the value this build is FOR, captured once by the caller — compared against
+     * the live {@link #currentInputHash} immediately before publishing (writing the catalog and
+     * loading it into {@link ContentShardIndex}). See {@link #backgroundBuildStillValid}: a build
+     * only publishes if it (a) ran to full completion and (b) is still for the current hash at
+     * publish time.
+     *
+     * <p>Owns the full lifecycle a caller starting this as a thread would expect: resets
+     * {@code shardBuildRunning} to {@code false} in its own {@code finally}, so calling it directly
+     * (as a test does) never leaves that flag stuck {@code true}.
      */
-    private static void startBackgroundShardBuild(HeadlessJadxWrapper wrapper, List<JavaClass> sorted, String hash) {
-        if (hash == null) return;
-        if (!shardBuildRunning.compareAndSet(false, true)) return;
-        Thread t = new Thread(() -> {
-            long t0 = System.currentTimeMillis();
+    static void runShardBuildLoop(HeadlessJadxWrapper wrapper, List<JavaClass> sorted, String hash) {
+        long t0 = System.currentTimeMillis();
+        try {
+            CodeStore cs = codeStore;
+            if (cs == null) return;
+            java.nio.file.Path dir = indexCacheDir();
+            logger.info("[JAI] Background shard build started from CodeStore: {} classes, budget={}MB",
+                sorted.size(), SHARD_BUDGET_BYTES / (1024 * 1024));
+            ContentShardBuilder builder = new ContentShardBuilder(dir, hash, SHARD_BUDGET_BYTES);
+            int covered = 0;
+            boolean completed = true;
             try {
-                CodeStore cs = codeStore;
-                if (cs == null) return;
-                java.nio.file.Path dir = indexCacheDir();
-                logger.info("[JAI] Background shard build started from CodeStore: {} classes, budget={}MB",
-                    sorted.size(), SHARD_BUDGET_BYTES / (1024 * 1024));
-                ContentShardBuilder builder = new ContentShardBuilder(dir, hash, SHARD_BUDGET_BYTES);
-                int covered = 0;
-                boolean completed = true;
-                try {
-                    for (int i = 0; i < sorted.size(); i++) {
-                        if (cancelRequested.get() || Thread.currentThread().isInterrupted()) {
-                            completed = false;
-                            break;
-                        }
-                        if (isHighMemoryPressure()) {
-                            try { Thread.sleep(1500); } catch (InterruptedException ie) { completed = false; break; }
-                        }
-                        JavaClass cls = sorted.get(i);
-                        // id == i by the preAssignIds contract documented above.
-                        String code = cs.get(cls.getRawName()); // CodeStore keyed by raw name (deobf-stable)
-                        if (code != null && !code.isEmpty()) {
-                            builder.addClass(i, code.toLowerCase()); // addClass routes <3-char source to excluded
-                            covered++;
-                        } else if (code != null && cls.isInner()) {
-                            // CodeStore hit but empty source AND inner class: soundly excludable,
-                            // see the "Empty inner classes" contract above.
-                            builder.markExcluded(i);
-                        }
-                        // else: CodeStore miss (library/unpersisted) or non-inner empty source —
-                        // leave id i as a hole (not excludable without risking a false judgment).
+                for (int i = 0; i < sorted.size(); i++) {
+                    if (cancelRequested.get() || Thread.currentThread().isInterrupted()) {
+                        completed = false;
+                        break;
                     }
-                } finally {
-                    builder.close(); // trailing flush of the final window
+                    if (isHighMemoryPressure()) {
+                        try { Thread.sleep(1500); } catch (InterruptedException ie) { completed = false; break; }
+                    }
+                    JavaClass cls = sorted.get(i);
+                    // id == i by the preAssignIds contract documented above.
+                    String code = cs.get(cls.getRawName()); // CodeStore keyed by raw name (deobf-stable)
+                    if (code != null && !code.isEmpty()) {
+                        builder.addClass(i, code.toLowerCase()); // addClass routes <3-char source to excluded
+                        covered++;
+                    } else if (code != null && cls.isInner()) {
+                        // CodeStore hit but empty source AND inner class: soundly excludable,
+                        // see the "Empty inner classes" contract above.
+                        builder.markExcluded(i);
+                    }
+                    // else: CodeStore miss (library/unpersisted) or non-inner empty source —
+                    // leave id i as a hole (not excludable without risking a false judgment).
                 }
-                List<ShardCatalog.ShardEntry> shardsWritten = builder.writtenShards();
-                // F7 (C) + P2 fix: publish only if the build both (a) ran to full completion — never
-                // on a cancelled/interrupted partial pass, which used to write a catalog anyway and
-                // permanently gate isBuilt() shut on a truncated index (P2) — and (b) still targets
-                // the hash that IS this process's current APK at publish time. cancelRequested alone
-                // is unsound for (b): start() resets it to false at the top of every new warmup, so
-                // an old build blocked on I/O can wake up after a NEW APK has already loaded, see
-                // cancelRequested read as false again, and publish the OLD APK's shard catalog into
-                // the NEW APK's global ContentShardIndex (the race documented in DelamainServer's
-                // quiesce comment). Comparing the hash CAPTURED at this build's start against the
-                // CURRENT currentInputHash closes that race regardless of the flag's state.
-                if (backgroundBuildStillValid(completed, hash, currentInputHash)) {
-                    ShardCatalog.write(dir, hash, shardsWritten);
-                    ContentShardIndex.loadCatalog(dir, hash);
-                    logger.info("[JAI] Background shard build done: {} shards, {} covered classes, {}s",
-                        shardsWritten.size(), covered, (System.currentTimeMillis() - t0) / 1000);
-                    writePrebakedManifest(dir, hash, sorted.size(), shardsWritten.size(), covered, wrapper);
-                } else {
-                    logger.warn("[JAI] Background shard build for hash {}... DISCARDED — completed={}, "
-                        + "currentInputHash={}... (build was interrupted, or superseded by a newer APK "
-                        + "load before it finished — publishing it would serve a stale/incomplete index)",
-                        hash.substring(0, Math.min(8, hash.length())), completed,
-                        currentInputHash != null ? currentInputHash.substring(0, Math.min(8, currentInputHash.length())) : "null");
-                }
-            } catch (Exception e) {
-                logger.warn("[JAI] Background shard build failed: {}", e.getMessage());
             } finally {
-                shardBuildRunning.set(false);
+                builder.close(); // trailing flush of the final window
             }
-        }, "jadx-shard-build");
-        t.setDaemon(true);
-        t.setPriority(Thread.MIN_PRIORITY);
-        t.start();
+            List<ShardCatalog.ShardEntry> shardsWritten = builder.writtenShards();
+            // F7 (C) + P2 fix: publish only if the build both (a) ran to full completion — never
+            // on a cancelled/interrupted partial pass, which used to write a catalog anyway and
+            // permanently gate isBuilt() shut on a truncated index (P2) — and (b) still targets
+            // the hash that IS this process's current APK at publish time. cancelRequested alone
+            // is unsound for (b): start() resets it to false at the top of every new warmup, so
+            // an old build blocked on I/O can wake up after a NEW APK has already loaded, see
+            // cancelRequested read as false again, and publish the OLD APK's shard catalog into
+            // the NEW APK's global ContentShardIndex (the race documented in DelamainServer's
+            // quiesce comment). Comparing the hash CAPTURED at this build's start against the
+            // CURRENT currentInputHash closes that race regardless of the flag's state.
+            if (backgroundBuildStillValid(completed, hash, currentInputHash)) {
+                ShardCatalog.write(dir, hash, shardsWritten);
+                ContentShardIndex.loadCatalog(dir, hash);
+                logger.info("[JAI] Background shard build done: {} shards, {} covered classes, {}s",
+                    shardsWritten.size(), covered, (System.currentTimeMillis() - t0) / 1000);
+                writePrebakedManifest(dir, hash, sorted.size(), shardsWritten.size(), covered, wrapper);
+            } else {
+                logger.warn("[JAI] Background shard build for hash {}... DISCARDED — completed={}, "
+                    + "currentInputHash={}... (build was interrupted, or superseded by a newer APK "
+                    + "load before it finished — publishing it would serve a stale/incomplete index)",
+                    hash.substring(0, Math.min(8, hash.length())), completed,
+                    currentInputHash != null ? currentInputHash.substring(0, Math.min(8, currentInputHash.length())) : "null");
+            }
+        } catch (Exception e) {
+            logger.warn("[JAI] Background shard build failed: {}", e.getMessage());
+        } finally {
+            shardBuildRunning.set(false);
+        }
     }
 
     /**
