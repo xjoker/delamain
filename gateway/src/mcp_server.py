@@ -7,6 +7,7 @@ Builds and configures the FastMCP HTTP server with all registered tools.
 from contextlib import asynccontextmanager
 
 from fastmcp import FastMCP
+from .busy_tracker import validate_lane_coverage
 from .tools import register_all_tools
 from .tools.transfer_tools import register_transfer_tools, register_transfer_proxy_routes
 
@@ -61,6 +62,11 @@ def build_mcp_app() -> FastMCP:
     register_all_tools(mcp)
     register_transfer_tools(mcp)
     register_transfer_proxy_routes(mcp)
+
+    # Every @with_busy_check tool must declare a lane. The fallback is the most
+    # restrictive one (exclusive), so an undeclared tool silently serializes the
+    # whole backend instead of failing loudly — fail fast at startup instead.
+    validate_lane_coverage()
 
     # Health check custom route (no auth required)
     @mcp.custom_route("/health", methods=["GET"])

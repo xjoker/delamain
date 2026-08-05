@@ -22,6 +22,7 @@ from src.registry.instance_registry import InstanceRegistry
 from src.routing import request_router
 from src.busy_tracker import (
     InstanceBusyTracker,
+    LANE_ANALYSIS,
     LANE_CODE_READ,
     LANE_EXCLUSIVE,
     LANE_METADATA,
@@ -120,9 +121,15 @@ async def test_with_busy_check_strips_tool_suffix_for_code_read_lane():
 
 
 @pytest.mark.asyncio
-async def test_with_busy_check_batch_get_xrefs_hits_metadata_lane():
-    """In xrefs_tools.py, batch_get_xrefs_tool is registered as batch_get_xrefs
-    (metadata policy)."""
+async def test_with_busy_check_batch_get_xrefs_hits_analysis_lane():
+    """In xrefs_tools.py, batch_get_xrefs_tool is registered as batch_get_xrefs.
+
+    Task F4 item 3 moved full-repo-traversal-grade operations (get_xrefs,
+    batch_get_xrefs, run_security_scan, trace_data_flow, find_callers_chain,
+    get_attack_surface, export_callgraph) out of the unbounded metadata lane
+    into a new bounded 'analysis' lane (active_limit=2), so N concurrent
+    heavy calls can no longer saturate the Java-side thread pool unchecked.
+    """
     InstanceRegistry.configure(host="127.0.0.1", port=8650, name="jadx")
     observed_lane = {}
 
@@ -130,12 +137,12 @@ async def test_with_busy_check_batch_get_xrefs_hits_metadata_lane():
     async def batch_get_xrefs_tool():
         snapshot = InstanceBusyTracker.get_snapshot()
         observed_lane["lane"] = (
-            LANE_METADATA if snapshot["metadata_inflight"] else LANE_EXCLUSIVE
+            LANE_ANALYSIS if snapshot["analysis_inflight"] else LANE_EXCLUSIVE
         )
         return {"ok": True}
 
     await batch_get_xrefs_tool()
-    assert observed_lane["lane"] == LANE_METADATA
+    assert observed_lane["lane"] == LANE_ANALYSIS
 
 
 @pytest.mark.asyncio
