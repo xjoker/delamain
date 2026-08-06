@@ -1,7 +1,7 @@
 package com.zin.delamain.utils;
 
 import com.zin.delamain.core.HeadlessJadxWrapper;
-import com.zin.delamain.index.CodeContentIndex;
+import com.zin.delamain.index.ClassIdRegistry;
 import com.zin.delamain.index.shard.ContentShardIndex;
 
 import jadx.api.JavaClass;
@@ -39,14 +39,14 @@ class ClassCacheManagerRenameIndexTest {
     void setUp() {
         ClassCacheManager.resetForTests();
         ContentShardIndex.clear();
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
     }
 
     @AfterEach
     void tearDown() {
         ClassCacheManager.resetForTests();
         ContentShardIndex.clear();
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
     }
 
     @Test

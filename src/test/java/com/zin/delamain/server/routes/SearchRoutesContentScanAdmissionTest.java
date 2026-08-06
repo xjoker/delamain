@@ -1,6 +1,6 @@
 package com.zin.delamain.server.routes;
 
-import com.zin.delamain.index.CodeContentIndex;
+import com.zin.delamain.index.ClassIdRegistry;
 import com.zin.delamain.index.shard.ContentShardBuilder;
 import com.zin.delamain.index.shard.ContentShardIndex;
 import com.zin.delamain.index.shard.ShardCatalog;
@@ -83,14 +83,14 @@ class SearchRoutesContentScanAdmissionTest {
 
     @BeforeEach
     void reset() {
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         ContentShardIndex.clear();
     }
 
     @AfterEach
     void tearDown() {
         ContentShardIndex.clear();
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         SearchRoutes.BROAD_CANDIDATE_THRESHOLD = SearchRoutes.DEFAULT_BROAD_CANDIDATE_THRESHOLD;
         SearchRoutes.BROAD_SAMPLE_SCAN = SearchRoutes.DEFAULT_BROAD_SAMPLE_SCAN;
         SearchRoutes.UNINDEXED_CONTENT_SCAN_MAX = SearchRoutes.DEFAULT_UNINDEXED_CONTENT_SCAN_MAX;
@@ -128,7 +128,7 @@ class SearchRoutesContentScanAdmissionTest {
     @Test
     void contentOnlySearchWithNoUsableIndexIsRefusedInsteadOfFullScan() {
         List<JavaClass> sorted = sortedClasses();
-        CodeContentIndex.preAssignIds(sorted);
+        ClassIdRegistry.preAssignIds(sorted);
         SearchRoutes.UNINDEXED_CONTENT_SCAN_MAX = 2; // corpus (>=4) is "too large to scan blind"
 
         Set<SearchRoutes.SearchLocation> locations = EnumSet.of(SearchRoutes.SearchLocation.CODE);
@@ -154,7 +154,7 @@ class SearchRoutesContentScanAdmissionTest {
     @Test
     void mixedSearchWithNoUsableIndexStillReturnsMetadataMatches() {
         List<JavaClass> sorted = sortedClasses();
-        CodeContentIndex.preAssignIds(sorted);
+        ClassIdRegistry.preAssignIds(sorted);
         int mainActivityId = indexOfMainActivity(sorted);
         assertTrue(mainActivityId >= 0, "test APK must contain a class with 'mainactivity' in its name");
         SearchRoutes.UNINDEXED_CONTENT_SCAN_MAX = 2;
@@ -179,7 +179,7 @@ class SearchRoutesContentScanAdmissionTest {
     @Test
     void smallCorpusStillRunsTheFullContentScan() {
         List<JavaClass> sorted = sortedClasses();
-        CodeContentIndex.preAssignIds(sorted);
+        ClassIdRegistry.preAssignIds(sorted);
         // Default cap (20 000) is far above the test APK's class count.
 
         Set<SearchRoutes.SearchLocation> locations = EnumSet.of(SearchRoutes.SearchLocation.CODE);
@@ -199,7 +199,7 @@ class SearchRoutesContentScanAdmissionTest {
     @Test
     void broadTermOnMixedSearchBoundsTheContentScan(@TempDir Path dir) throws IOException {
         List<JavaClass> sorted = sortedClasses();
-        CodeContentIndex.preAssignIds(sorted);
+        ClassIdRegistry.preAssignIds(sorted);
         int mainActivityId = indexOfMainActivity(sorted);
         assertTrue(mainActivityId >= 0, "test APK must contain a class with 'mainactivity' in its name");
 

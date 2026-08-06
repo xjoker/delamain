@@ -141,20 +141,6 @@ public final class MemoryConfig {
         return rt.maxMemory() > 0 ? (double) used / rt.maxMemory() : 1.0;
     }
 
-    /** Estimated heap for the trigram index in MB (~30 KB BitSet per class). */
-    public long estimateTrigramMB(int classCount) {
-        return (long) classCount * 30L / 1024L;
-    }
-
-    /**
-     * Whether current heap has enough headroom to start a background trigram build.
-     * Returns false when free heap &lt; 2× estimated trigram cost; the build would likely
-     * cause severe GC thrash or OOM.
-     */
-    public boolean canAffordTrigramBuild(int classCount) {
-        return freeHeapMB() >= estimateTrigramMB(classCount) * 2;
-    }
-
     /**
      * Whether current heap can afford starting the use-places harvest.
      * Returns false when usage is already at or above the pressure threshold; adding

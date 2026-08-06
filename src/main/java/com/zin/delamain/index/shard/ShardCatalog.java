@@ -18,9 +18,9 @@ import java.util.List;
 /**
  * Reads and writes the shard catalog ({@code {inputHash}.shardcat}) — the ordered list of shard
  * files that together make up one logical content index. Mirrors the
- * {@code PersistentIndexStore}/{@code UsageGraphStore} conventions: magic + version header and an
- * atomic temp-then-move write. Entry order is the class-id order (each shard covers a strictly
- * increasing, non-overlapping id range).
+ * {@code UsageGraphStore} conventions: magic + version header and an atomic temp-then-move write.
+ * Entry order is the class-id order (each shard covers a strictly increasing, non-overlapping id
+ * range).
  *
  * <pre>
  *   MAGIC   (4 bytes) = 0x4A415243  "JARC" (JADx Roaring Catalog)

@@ -1,6 +1,6 @@
 package com.zin.delamain.server.routes;
 
-import com.zin.delamain.index.CodeContentIndex;
+import com.zin.delamain.index.ClassIdRegistry;
 import com.zin.delamain.index.shard.ContentShardBuilder;
 import com.zin.delamain.index.shard.ContentShardIndex;
 import com.zin.delamain.index.shard.ShardCatalog;
@@ -79,7 +79,7 @@ class SearchRoutesResidualScanBudgetTest {
 
     @BeforeEach
     void reset() {
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         ContentShardIndex.clear();
         // Drive the parallel branch (the one production takes) with this small fixture.
         SearchRoutes.PARALLEL_SCAN_MIN_CLASSES = 1;
@@ -88,7 +88,7 @@ class SearchRoutesResidualScanBudgetTest {
     @AfterEach
     void tearDown() {
         ContentShardIndex.clear();
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         SearchRoutes.PARALLEL_SCAN_MIN_CLASSES = SearchRoutes.DEFAULT_PARALLEL_SCAN_MIN_CLASSES;
         SearchRoutes.CONTENT_SCAN_BUDGET = SearchRoutes.DEFAULT_CONTENT_SCAN_BUDGET;
         SearchRoutes.BROAD_CANDIDATE_THRESHOLD = SearchRoutes.DEFAULT_BROAD_CANDIDATE_THRESHOLD;
@@ -118,7 +118,7 @@ class SearchRoutesResidualScanBudgetTest {
     @Test
     void shardUncoveredResidueIsBoundedByTheScanBudget(@TempDir Path dir) throws IOException {
         List<JavaClass> sorted = sortedClasses();
-        CodeContentIndex.preAssignIds(sorted);
+        ClassIdRegistry.preAssignIds(sorted);
 
         // Shard covers ONLY id 0 (and it is not a candidate for the term) — every other real class
         // is uncovered residue, exactly like the ~131k uncovered classes in production.
@@ -151,7 +151,7 @@ class SearchRoutesResidualScanBudgetTest {
     @Test
     void shardCandidatesAreScannedBeforeTheUnindexedResidue(@TempDir Path dir) throws IOException {
         List<JavaClass> sorted = sortedClasses();
-        CodeContentIndex.preAssignIds(sorted);
+        ClassIdRegistry.preAssignIds(sorted);
 
         // Find a real class whose decompiled source genuinely contains "onclick".
         int matchId = -1;
@@ -183,7 +183,7 @@ class SearchRoutesResidualScanBudgetTest {
     @Test
     void scanWithinBudgetIsNotMarkedSampled(@TempDir Path dir) throws IOException {
         List<JavaClass> sorted = sortedClasses();
-        CodeContentIndex.preAssignIds(sorted);
+        ClassIdRegistry.preAssignIds(sorted);
         Map<Integer, String> corpus = new LinkedHashMap<>();
         corpus.put(0, "class marker0 { void unrelatedmethod() {} }");
         buildAndLoadShard(dir, corpus);

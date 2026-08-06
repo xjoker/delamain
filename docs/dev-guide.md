@@ -85,9 +85,6 @@ java -jar target/delamain.jar \
 | `JADX_FILE_ROOT` | — | Sandbox root for `load_file`/uploads; the fused Compose setup sets this to `/apks` |
 | `DELAMAIN_WARMUP_ON_START` | true | Auto-starts background warmup once the server is up |
 | `DELAMAIN_WARMUP_DECOMPILE_WORKERS` | auto (derived from heap & CPU) | Phase 1 parallel decompile worker count |
-| `DELAMAIN_WARMUP_INDEX_WORKERS` | — | Phase 2 (trigram/shard build) worker count |
-| `DELAMAIN_CODE_INDEX_MAX_TRIGRAMS` | 500000 | Trigram cap (OOM guard) |
-| `DELAMAIN_CODE_INDEX_EVICTION_ENABLED` | — | Heap-pressure eviction for the trigram index |
 | `DELAMAIN_INLINE_RESPONSE_MAX_BYTES` | — | Inline response size cap before a tool must fall back to batching/chunking |
 | `DELAMAIN_RELOAD_LOCK_TIMEOUT_SECONDS` | 60 | How long `/load-file` reload waits to acquire the analysis write lock before failing and rolling back to the previously loaded file |
 | `DELAMAIN_XREF_DEADLINE_SECONDS` | 25 | Server-side deadline for the live-decompile path of `/xrefs-to-class`, `/xrefs-to-method`, `/xrefs-to-field`, and `/batch-xrefs`; on timeout the response returns partial results (`partial_results: true`) instead of blocking indefinitely — use `/submit-xref` for an unbounded async alternative |

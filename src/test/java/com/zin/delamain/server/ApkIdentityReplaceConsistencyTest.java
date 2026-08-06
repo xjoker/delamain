@@ -2,8 +2,7 @@ package com.zin.delamain.server;
 
 import com.google.gson.Gson;
 import com.zin.delamain.core.HeadlessJadxWrapper;
-import com.zin.delamain.index.CodeContentIndex;
-import com.zin.delamain.index.PersistentIndexStore;
+import com.zin.delamain.index.ClassIdRegistry;
 import com.zin.delamain.index.WarmupManager;
 import com.zin.delamain.index.shard.ContentShardIndex;
 import com.zin.delamain.server.routes.FileManagementRoutes;
@@ -67,7 +66,7 @@ class ApkIdentityReplaceConsistencyTest {
             Thread.sleep(200);
         }
         ContentShardIndex.clear();
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         if (wrapper != null) {
             wrapper.close();
         }
@@ -156,9 +155,8 @@ class ApkIdentityReplaceConsistencyTest {
         // Precondition: A and B are genuinely different APKs (distinct package/version), so a
         // stale-A-after-loading-B would be an observably wrong identity — the split-brain this
         // guards against.
-        PersistentIndexStore store = new PersistentIndexStore(indexDir);
-        String hashA = store.computeInputHash(List.of(aInSandbox.toFile()));
-        String hashB = store.computeInputHash(List.of(bInSandbox.toFile()));
+        String hashA = WarmupManager.computeInputHash(List.of(aInSandbox.toFile()));
+        String hashB = WarmupManager.computeInputHash(List.of(bInSandbox.toFile()));
         assertTrue(!hashA.equals(hashB), "A and B must have distinct input hashes");
 
         // 1) Load A directly (no HTTP round trip needed for the initial load) and start a real

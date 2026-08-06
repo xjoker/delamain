@@ -1,7 +1,7 @@
 package com.zin.delamain.utils;
 
 import com.zin.delamain.core.HeadlessJadxWrapper;
-import com.zin.delamain.index.CodeContentIndex;
+import com.zin.delamain.index.ClassIdRegistry;
 import com.zin.delamain.index.CodeStore;
 import com.zin.delamain.index.WarmupManager;
 import com.zin.delamain.index.shard.ContentShardIndex;
@@ -319,7 +319,7 @@ public class ClassCacheManager {
         if (cls == null) {
             return;
         }
-        CodeContentIndex.invalidate(cls);
+        ClassIdRegistry.invalidate(cls);
 
         Map<String, List<JavaClass>> clsIdx = classNameIndex.get();
         Map<String, List<JavaClass>> mthIdx = methodNameIndex.get();
@@ -600,7 +600,6 @@ public class ClassCacheManager {
                 return null;
             }
             String lower = code.toLowerCase();
-            CodeContentIndex.index(cls, lower);
             return lower;
         } catch (Exception e) {
             return null;
@@ -639,18 +638,18 @@ public class ClassCacheManager {
                     cs.remove(rawName);
                 }
             }
-            int id = CodeContentIndex.idOf(cls);
+            int id = ClassIdRegistry.idOf(cls);
             if (id >= 0) {
                 ContentShardIndex.tombstone(id);
             }
-            CodeContentIndex.invalidate(cls);
+            ClassIdRegistry.invalidate(cls);
         }
     }
 
     /**
-     * Evicts only the jadx ICodeCache entry for one class (NOT the trigram CodeContentIndex).
+     * Evicts only the jadx ICodeCache entry for one class (NOT its class-id registry entry).
      * Used by the memory-bounded use-places harvest to release a referrer's decompiled code right
-     * after it is consumed, so the JVM heap stays bounded. Trigram search data is untouched.
+     * after it is consumed, so the JVM heap stays bounded.
      */
     public static void evictCodeCacheEntry(JavaClass cls) {
         if (cls == null) return;
@@ -829,8 +828,8 @@ public class ClassCacheManager {
                     return;
                 }
                 clearCacheState("project owner changed", true);
-                // F7 fix (path A): clearCacheState(..., true) just wiped CodeContentIndex's id
-                // space via CodeContentIndex.clear(). If this owner-rotate is firing mid-warmup
+                // F7 fix (path A): clearCacheState(..., true) just wiped ClassIdRegistry's id
+                // space via ClassIdRegistry.clear(). If this owner-rotate is firing mid-warmup
                 // (the exact production timeline: WarmupManager.runWarmup preAssigns ids for the
                 // NEW apk, then calls initCache(wrapper) for that SAME apk near the end of the run,
                 // which is what rotates the owner away from the PREVIOUS apk), the ids just wiped
@@ -869,7 +868,7 @@ public class ClassCacheManager {
      * Test-only: reset all cache + project-owner state to the clean baseline so a shared-JVM test
      * starts from a known slate. {@link #cacheOwnerKey} is process-global static and otherwise leaks
      * between tests — a later test's warmup-triggered {@link #initCache} then sees a foreign owner and
-     * fires a "project owner changed" clear that wipes freshly pre-assigned CodeContentIndex ids
+     * fires a "project owner changed" clear that wipes freshly pre-assigned ClassIdRegistry ids
      * mid-test (an order-dependent flake, not a production path).
      */
     public static void resetForTests() {
@@ -880,7 +879,7 @@ public class ClassCacheManager {
         lastClearTime.set(System.currentTimeMillis());
         if (evictCodeCache) {
             clearCodeCache();
-            CodeContentIndex.clear();
+            ClassIdRegistry.clear();
         }
         long generation = generationToken.incrementAndGet();
         CompletableFuture<Void> future = initFuture.getAndSet(null);

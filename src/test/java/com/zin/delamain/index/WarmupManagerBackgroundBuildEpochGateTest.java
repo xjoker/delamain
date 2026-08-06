@@ -6,30 +6,19 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * F7 fix (path C, generalized as F7-b): a background index build's product may only be published
- * if it (a) ran to full completion and (b) was built for the hash that is STILL the process's
- * current APK at publish time. {@link WarmupManager#backgroundBuildStillValid} is the single shared
- * gate for BOTH background builds that can outlive the warmup that started them:
+ * F7 fix (path C): a background index build's product may only be published if it (a) ran to full
+ * completion and (b) was built for the hash that is STILL the process's current APK at publish
+ * time. {@link WarmupManager#backgroundBuildStillValid} is the shared gate for
+ * {@code startBackgroundShardBuild}, which gates {@code ShardCatalog.write}/{@code loadCatalog}.
  *
- * <ul>
- *   <li>{@code startBackgroundShardBuild} — gates {@code ShardCatalog.write}/{@code loadCatalog}
- *       (path C, the originally-reported defect).</li>
- *   <li>{@code startBackgroundTrigramBuild} — gates the mid-loop continuation into the SHARED,
- *       hash-unpartitioned {@code CodeContentIndex} heap state, and gates {@code tryPersistIndex}
- *       (F7-b: Hub found this to be the exact same defect, independently, after the C fix landed).</li>
- * </ul>
+ * <p>The background build thread is a blocked-on-I/O / paused-under-memory-pressure long-runner
+ * that can wake up AFTER a newer APK has already loaded. {@code cancelRequested} alone cannot gate
+ * this — {@code WarmupManager.start()} resets that flag to {@code false} at the top of every new
+ * warmup, so a stale thread sees "not cancelled" again and would otherwise publish the OLD APK's
+ * product into state the NEW APK is now serving from (false-negative shard verdicts).
  *
- * <p>Both background threads are blocked-on-I/O / paused-under-memory-pressure long-runners that
- * can wake up AFTER a newer APK has already loaded. {@code cancelRequested} alone cannot gate this
- * in either case — {@code WarmupManager.start()} resets that flag to {@code false} at the top of
- * every new warmup, so a stale thread sees "not cancelled" again and would otherwise publish the
- * OLD APK's product into state the NEW APK is now serving from (false-negative shard verdicts, or a
- * stale/foreign trigram index persisted to disk under the wrong hash).
- *
- * <p>This exercises the gate directly (unit-level; see the F7 task report for why an end-to-end
- * thread-race test was judged out of scope) — testing it once here covers both call sites, and is
- * exactly the point of extracting one shared function instead of leaving each caller to reinvent
- * (and potentially get wrong) the same epoch check a third time.
+ * <p>This exercises the gate directly (unit-level; an end-to-end thread-race test was judged out of
+ * scope) — testing it once here is exactly the point of extracting one shared function.
  */
 class WarmupManagerBackgroundBuildEpochGateTest {
 
@@ -67,13 +56,13 @@ class WarmupManagerBackgroundBuildEpochGateTest {
     }
 
     /**
-     * F7-b's specific scenario, as requested: a trigram build captures hash A, the current apk's
+     * F7-b's specific scenario, as requested: a shard build captures hash A, the current apk's
      * hash then changes to B (a newer apk loaded and started its own warmup), and the OLD build
      * subsequently reports "completed" — the gate must still reject it, so
-     * {@code startBackgroundTrigramBuild} never calls {@code tryPersistIndex} for it.
+     * {@code startBackgroundShardBuild} never publishes the catalog for it.
      */
     @Test
-    void trigramBuildThatCompletesAfterAHashChangeMustNotPersist() {
+    void buildThatCompletesAfterAHashChangeMustNotPersist() {
         String builtForHash = "hashA";
         boolean completedAfterHashChanged = true; // the build's loop ran to the end unimpeded
 
@@ -81,10 +70,8 @@ class WarmupManagerBackgroundBuildEpochGateTest {
 
         assertFalse(WarmupManager.backgroundBuildStillValid(
                         completedAfterHashChanged, builtForHash, currentHashAtPersistTime),
-                "a trigram build that finishes AFTER the current apk's hash moved on must not be "
-                        + "persisted — tryPersistIndex would otherwise write the OLD apk's trigram "
-                        + "index to disk, and its in-loop tryIndexFromCache calls would have kept "
-                        + "mutating the shared CodeContentIndex heap state on the OLD apk's behalf "
-                        + "the whole time it kept running");
+                "a build that finishes AFTER the current apk's hash moved on must not be "
+                        + "persisted — publishing would otherwise write the OLD apk's product "
+                        + "to disk on the OLD apk's behalf after a newer apk is already current");
     }
 }

@@ -53,7 +53,7 @@ def register_diagnostics_tools(mcp):
     @mcp.tool()
     @with_busy_check
     async def get_index_stats() -> dict:
-        """Internal index health snapshot (name indices, shard index, trigram index, snapshot cache).
+        """Internal index health snapshot (name indices, shard index, snapshot cache).
 
         Use this to decide whether code-search (search_in='code') is available, or whether to
         stick to metadata (class/method/field name) searches.
@@ -61,12 +61,8 @@ def register_diagnostics_tools(mcp):
         The primary signal is shard_index (mmap'd, sharded RoaringBitmap index):
           - shard_index.built == true and shard_index.covered_classes > 0 → code-search is
             viable. Coverage is decoupled from heap size — this works even on low-memory
-            instances where the old heap-resident index never got there.
+            instances where a heap-resident index never got there.
           - shard_index not yet built → prefer metadata searches until it finishes.
-        trigram_index is now a residual/self-heal layer (library classes + rename recovery
-        cache), not the coverage signal for code-search — its saturation_percent can stay low
-        or even 0% on low-memory setups while shard_index is fully covered and code-search
-        works normally.
         index_prebaked reports whether a pre-baked index volume was loaded at startup (see
         docs/prebaked-index.md); index_prebaked.complete/reason explain partial or missing loads.
         Even with full coverage, broad/common search terms return partial_results (see
@@ -89,9 +85,6 @@ def register_diagnostics_tools(mcp):
             dict: {name_indices: {class_name_buckets, method_name_buckets,
                                   field_name_buckets, raw_name_map_size, index_ready},
                    shard_index: {built, covered_classes, ...},
-                   trigram_index: {enabled, indexed_classes, trigram_count, max_trigrams,
-                                   max_class_size_bytes, estimated_memory_mb,
-                                   saturation_percent},
                    index_prebaked: {complete, reason},
                    xref_readiness: {class_level: "ready"|"building",
                                      precise_snippets: "ready"|"building"|"skipped",
@@ -164,7 +157,7 @@ def register_diagnostics_tools(mcp):
                           used_before_gc_mb, freed_mb},   # last two only when gc ran
                    process: {rss_mb, virtual_mb},          # null off Linux
                    container: {memory_limit_mb},           # null when unlimited/unreadable
-                   consumers: {trigram_count, trigram_indexed_classes, shard_index_built}}
+                   consumers: {shard_index_built}}
         """
         return await _get_memory_diagnostics(gc=gc)
 

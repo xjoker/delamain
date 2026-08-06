@@ -23,8 +23,8 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * F7: the {@code CodeContentIndex} id space (class &lt;-&gt; id, the contract the mmap shard layer's
- * classId depends on — see {@code CodeContentIndex.java}'s class doc) has three independent paths
+ * F7: the {@code ClassIdRegistry} id space (class &lt;-&gt; id, the contract the mmap shard layer's
+ * classId depends on — see {@code ClassIdRegistry.java}'s class doc) has three independent paths
  * that can clear it out from under an already-served/being-built shard. This class covers path (A)
  * and gives (B) a focused unit-level check of the restore mechanism both paths share.
  *
@@ -37,14 +37,14 @@ class WarmupManagerIdSpaceOwnershipTest {
     void setUp() {
         ClassCacheManager.resetForTests();
         ContentShardIndex.clear();
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
     }
 
     @AfterEach
     void tearDown() {
         ClassCacheManager.resetForTests();
         ContentShardIndex.clear();
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         WarmupManager.setIndexDir(new File(System.getProperty("java.io.tmpdir"), "delamain-index").toPath());
     }
 
@@ -95,7 +95,7 @@ class WarmupManagerIdSpaceOwnershipTest {
         assertTrue(sorted.size() >= 4, "test APK must yield at least 4 classes");
 
         for (int i = 0; i < sorted.size(); i++) {
-            assertSame(sorted.get(i), CodeContentIndex.resolveClass(i),
+            assertSame(sorted.get(i), ClassIdRegistry.resolveClass(i),
                     "id " + i + ": after the mid-warmup owner-rotate clear, the id space must still "
                             + "resolve to w2's own class — not null (dropped results) and not a "
                             + "different class (misresolved results)");
@@ -110,7 +110,7 @@ class WarmupManagerIdSpaceOwnershipTest {
 
     /**
      * Path (B), unit-level: the restore mechanism ({@code WarmupManager.reassignIdsForCurrentApk},
-     * called immediately after WarmupManager's own Phase-4 heap-pressure {@code CodeContentIndex.clear()})
+     * called immediately after WarmupManager's own Phase-4 heap-pressure {@code ClassIdRegistry.clear()})
      * reproduces the EXACT same id&lt;-&gt;class mapping a real warmup preAssigned, given a real
      * warmup ran first so the restore snapshot is genuinely populated (not test-seeded).
      *
@@ -142,21 +142,21 @@ class WarmupManagerIdSpaceOwnershipTest {
 
         // Precondition: the real warmup's own preAssignIds already gives us this mapping.
         for (int i = 0; i < sorted.size(); i++) {
-            assertSame(sorted.get(i), CodeContentIndex.resolveClass(i), "precondition id " + i);
+            assertSame(sorted.get(i), ClassIdRegistry.resolveClass(i), "precondition id " + i);
         }
 
         // Simulate WarmupManager.java's Phase-4 heap-pressure clear (line ~814-820): an external
-        // CodeContentIndex.clear() firing mid-session. Immediately after, the fixed production code
+        // ClassIdRegistry.clear() firing mid-session. Immediately after, the fixed production code
         // calls WarmupManager.reassignIdsForCurrentApk() (public API) — call the SAME method here.
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         for (int i = 0; i < sorted.size(); i++) {
-            assertFalse(CodeContentIndex.resolveClass(i) == sorted.get(i),
+            assertFalse(ClassIdRegistry.resolveClass(i) == sorted.get(i),
                     "sanity: clear() must actually wipe the mapping before we test the restore");
         }
         WarmupManager.reassignIdsForCurrentApk();
 
         for (int i = 0; i < sorted.size(); i++) {
-            assertSame(sorted.get(i), CodeContentIndex.resolveClass(i),
+            assertSame(sorted.get(i), ClassIdRegistry.resolveClass(i),
                     "id " + i + ": reassignIdsForCurrentApk() must reproduce EXACTLY the same "
                             + "id<->class mapping the warmup originally built, so a background "
                             + "trigram rebuild's getOrAssignId sees every class already seeded "

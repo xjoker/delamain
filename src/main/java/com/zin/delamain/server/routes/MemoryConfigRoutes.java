@@ -1,6 +1,5 @@
 package com.zin.delamain.server.routes;
 
-import com.zin.delamain.index.CodeContentIndex;
 import com.zin.delamain.index.shard.ContentShardIndex;
 import com.zin.delamain.server.AuthConfig;
 
@@ -97,8 +96,6 @@ public class MemoryConfigRoutes {
         container.put("memory_limit_mb", limitBytes == null ? null : limitBytes / MB);
 
         Map<String, Object> consumers = new LinkedHashMap<>();
-        consumers.put("trigram_count", CodeContentIndex.trigramCount());
-        consumers.put("trigram_indexed_classes", CodeContentIndex.indexedClassCount());
         consumers.put("shard_index_built", ContentShardIndex.isBuilt());
 
         Map<String, Object> diag = new LinkedHashMap<>();

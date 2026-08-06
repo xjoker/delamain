@@ -1,7 +1,7 @@
 package com.zin.delamain.utils;
 
 import com.zin.delamain.core.HeadlessJadxWrapper;
-import com.zin.delamain.index.CodeContentIndex;
+import com.zin.delamain.index.ClassIdRegistry;
 import com.zin.delamain.index.CodeStore;
 import com.zin.delamain.index.WarmupManager;
 import com.zin.delamain.index.shard.ContentShardIndex;
@@ -31,7 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@code codeFromStore}/the shard index whenever {@code ClassCacheManager.getCachedCodeDirect}
  * misses (which it always does right after a rename, since the in-memory jadx code cache was just
  * cleared). Before this fix, {@code ClassCacheManager.invalidateCode} cleared the in-memory jadx
- * cache and the trigram {@code CodeContentIndex} but left the on-disk {@code CodeStore} entry and
+ * cache and the trigram {@code ClassIdRegistry} but left the on-disk {@code CodeStore} entry and
  * the shard coverage bitmap untouched, so a post-rename search kept serving/matching the stale
  * pre-rename source.</p>
  *
@@ -44,11 +44,11 @@ class ClassCacheManagerInvalidateCodeStoreTest {
 
     @BeforeEach
     void setUp() {
-        // CodeContentIndex assigns process-wide IDs that must start at zero for the shard IDs
+        // ClassIdRegistry assigns process-wide IDs that must start at zero for the shard IDs
         // built below; another test's IDs otherwise make this test's class-to-shard lookup stale.
         ClassCacheManager.clearCacheIncludingDecompiled();
         ContentShardIndex.clear();
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
     }
 
     @AfterEach
@@ -101,7 +101,7 @@ class ClassCacheManagerInvalidateCodeStoreTest {
             String rawName = cls.getRawName();
             if (rawName == null || rawName.isEmpty()) continue;
             if (codeStore.get(rawName) == null) continue;
-            int id = CodeContentIndex.idOf(cls);
+            int id = ClassIdRegistry.idOf(cls);
             if (id < 0 || !ContentShardIndex.isCovered(id)) continue;
             target = cls;
             targetRawName = rawName;

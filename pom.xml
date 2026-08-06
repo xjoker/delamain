@@ -254,23 +254,6 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.2</version>
-                <configuration>
-                    <!-- CodeContentIndexTest needs a small, deterministic trigram cap to
-                         exercise the MAX_TRIGRAMS truncation path; MAX_TRIGRAMS is read
-                         once from this env var in a static initializer, so it must be set
-                         before the JVM starts, not per-test. Eviction is disabled so the
-                         background heap watcher can't interfere with the eviction test's
-                         deterministic assertions (the test invokes runEvictionSweep directly).
-                         DELAMAIN_TRIGRAM_HEAP=true pins the heap trigram index ON for the test
-                         JVM (production default is OFF, A1): the trigram-behavior tests build
-                         BitSets and assert isIndexed()==true, so they need it on. The dedicated
-                         heap-OFF tests toggle the (non-final) TRIGRAM_HEAP field at runtime. -->
-                    <environmentVariables>
-                        <DELAMAIN_CODE_INDEX_MAX_TRIGRAMS>5</DELAMAIN_CODE_INDEX_MAX_TRIGRAMS>
-                        <DELAMAIN_CODE_INDEX_EVICTION_ENABLED>false</DELAMAIN_CODE_INDEX_EVICTION_ENABLED>
-                        <DELAMAIN_TRIGRAM_HEAP>true</DELAMAIN_TRIGRAM_HEAP>
-                    </environmentVariables>
-                </configuration>
             </plugin>
         </plugins>
     </build>

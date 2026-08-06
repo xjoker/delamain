@@ -17,7 +17,6 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.BitSet;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -34,15 +33,10 @@ import java.util.function.BooleanSupplier;
 /**
  * Background full-cache warmup manager.
  *
- * <p>Two-phase warmup:
- * <ol>
- *   <li>Phase 1 — parallel decompile using up to {@code DELAMAIN_WARMUP_DECOMPILE_WORKERS}
- *       threads (default 8). No {@link com.zin.delamain.utils.JadxSearchLock} held:
- *       JADX handles its own per-class concurrency internally, so searches can run freely
- *       during warmup.</li>
- *   <li>Phase 2 — parallel trigram index fill from the already-populated JADX code cache.
- *       After Phase 2 completes, the index is persisted via PersistentIndexStore.</li>
- * </ol>
+ * <p>Phase 1 — parallel decompile using up to {@code DELAMAIN_WARMUP_DECOMPILE_WORKERS} threads
+ * (default 8). No {@link com.zin.delamain.utils.JadxSearchLock} held: JADX handles its own
+ * per-class concurrency internally, so searches can run freely during warmup. Code search is then
+ * served by the mmap shard index, built in the background from the persistent CodeStore.
  *
  * <p>Only one warmup may run at a time. Starting while one is in progress returns
  * the current status without restarting.</p>
@@ -62,8 +56,6 @@ public class WarmupManager {
     // Explicit override for Phase-1 decompile worker count (DELAMAIN_WARMUP_DECOMPILE_WORKERS).
     // -1 ⇒ unset ⇒ auto-size adaptively from heap / cores / class count (see computeWarmupWorkers).
     private static final int DECOMPILE_WORKERS_OVERRIDE;
-    // Phase-2 index worker count — configurable via DELAMAIN_WARMUP_INDEX_WORKERS
-    private static final int INDEX_WORKERS;
     // Effective decompile workers for the current warmup, resolved once class count is known.
     private static volatile int effectiveDecompileWorkers = 8;
 
@@ -78,13 +70,6 @@ public class WarmupManager {
         }
         DECOMPILE_WORKERS_OVERRIDE = override;
 
-        int workers = 4;
-        raw = System.getenv("DELAMAIN_WARMUP_INDEX_WORKERS");
-        if (raw != null && !raw.isEmpty()) {
-            try { workers = Math.max(1, Integer.parseInt(raw.trim())); } catch (NumberFormatException ignored) {}
-        }
-        INDEX_WORKERS = workers;
-
         long shardBudgetMB = 128;
         raw = System.getenv("DELAMAIN_SHARD_BUDGET_MB");
         if (raw != null && !raw.isEmpty()) {
@@ -96,7 +81,7 @@ public class WarmupManager {
     /**
      * Auto-size the Phase-1 decompile worker count so warmup completes without OOM/GC-thrash on any
      * machine. Phase-1 is memory-bound, not CPU-bound: each concurrent decompile holds transient
-     * IR, and the persistent indices (trigram / usage graph / CodeStore) take a base slice of heap
+     * IR, and the persistent indices (CodeStore / usage graph / content shards) take a base slice of heap
      * that grows with the class count. Empirically on this codebase, 24 workers on a 38 GB heap with
      * 237 931 classes thrashed (peak ≈ heap limit, ~2× slower); 8 workers stayed ~31 GB and finished.
      *
@@ -308,25 +293,22 @@ public class WarmupManager {
      * progress from one that will never finish (cancelled, or silently stalled). Both reported
      * "warming", so an AI waiting on code search had no way to know whether waiting would help.
      */
-    static String codeSearchCapability(boolean ready, boolean shardBuildRunning, String trigramSkipReason) {
+    static String codeSearchCapability(boolean ready, boolean shardBuildRunning) {
         if (ready) return "ready";
         if (shardBuildRunning) return "building";
-        return trigramSkipReason != null ? "skipped:low-heap" : "warming";
+        return "warming";
     }
 
-    // Persistent index store — lazily initialised
-    private static volatile PersistentIndexStore persistentStore = null;
     private static volatile UsageGraphStore usageGraphStore = null;
     private static volatile UsePlacesStore usePlacesStore = null;
     private static volatile CodeStore codeStore = null;
-    private static volatile HeadlessJadxWrapper lastWrapper = null;
 
     /** Current decompiled-source store (disk-backed), or null before warmup. */
     public static CodeStore codeStore() {
         return codeStore;
     }
 
-    // Directory where persistent indices (trigram + usage graph) are written.
+    // Directory where persistent indices (code store, usage graph, content shards) are written.
     // Defaults to ~/.delamain/index-cache but should be set by Main to the configured
     // --index-dir so the cache lands on a mounted volume and survives container recreation.
     private static volatile java.nio.file.Path configuredIndexDir =
@@ -358,30 +340,29 @@ public class WarmupManager {
         return currentInputHash;
     }
 
-    // F7: the exact class list this warmup instance last called CodeContentIndex.preAssignIds()
+    // F7: the exact class list this warmup instance last called ClassIdRegistry.preAssignIds()
     // with. This is the id space's single source of truth for the CURRENT apk — any path that
-    // clears CodeContentIndex out from under an already-served (or being-built) shard must restore
+    // clears ClassIdRegistry out from under an already-served (or being-built) shard must restore
     // ids from THIS list, not re-derive its own, so the restored id<->class mapping is byte-for-byte
     // identical to what the shard was built against (preAssignIds is a deterministic from-0 walk of
     // the list order, so replaying the same list reproduces the same ids).
     private static volatile List<JavaClass> lastPreAssignedClasses = null;
 
     /**
-     * Re-seeds {@link CodeContentIndex}'s id space from the last class list this warmup instance
+     * Re-seeds {@link ClassIdRegistry}'s id space from the last class list this warmup instance
      * preAssigned ids for (F7 fix: id-space ownership gap). Any code path that calls
-     * {@link CodeContentIndex#clear()} on state this process is actively serving — the
-     * {@code ClassCacheManager} owner-rotate clear, or WarmupManager's own Phase-4 heap-pressure
-     * clear — must call this immediately afterward, before any query can observe a wiped id space.
-     * Skipping the restore lets {@code resolveClass} return null for every already-built shard
-     * candidate (silently wrong/missing search results) or, worse, lets a later self-heal
-     * ({@code getOrAssignId}) reassign ids in a different order than the shard was built with,
-     * resolving candidates to the WRONG class. No-op if no warmup has preAssigned ids yet in this
-     * process (nothing to protect).
+     * {@link ClassIdRegistry#clear()} on state this process is actively serving — the
+     * {@code ClassCacheManager} owner-rotate clear — must call this immediately afterward, before
+     * any query can observe a wiped id space. Skipping the restore lets {@code resolveClass}
+     * return null for every already-built shard candidate (silently wrong/missing search results)
+     * or, worse, lets a later self-heal reassign ids in a different order than the shard was built
+     * with, resolving candidates to the WRONG class. No-op if no warmup has preAssigned ids yet in
+     * this process (nothing to protect).
      */
     public static void reassignIdsForCurrentApk() {
         List<JavaClass> snapshot = lastPreAssignedClasses;
         if (snapshot != null) {
-            CodeContentIndex.preAssignIds(snapshot);
+            ClassIdRegistry.preAssignIds(snapshot);
         }
     }
 
@@ -470,7 +451,6 @@ public class WarmupManager {
             pressureSleepMsTotal.set(0);
             running.set(true);
             phase.set("PHASE1_DECOMPILE");
-            lastWrapper = wrapper;
 
             logger.info("[JAI] Full warmup started: {} targets, {} library classes skipped",
                 targets.size(), skippedCount);
@@ -531,11 +511,6 @@ public class WarmupManager {
         // DELAMAIN_WARMUP_DECOMPILE_WORKERS has no way to confirm it took effect.
         status.put("effective_decompile_workers", effectiveDecompileWorkers);
         status.put("decompile_workers_source", DECOMPILE_WORKERS_OVERRIDE > 0 ? "override" : "auto");
-        status.put("trigram_build_running", trigramBuildRunning.get());
-        status.put("trigram_count", CodeContentIndex.trigramCount());
-        // The shard build is what actually runs in the default deployment (TRIGRAM_HEAP is off),
-        // so reporting only the trigram flag above published a permanently-false signal while
-        // leaving the real background work invisible.
         status.put("shard_build_running", shardBuildRunning.get());
         // Live throttling state + totals. Without these a memory-pressure collapse is
         // indistinguishable from ordinary slowness on any HTTP-visible surface.
@@ -548,8 +523,6 @@ public class WarmupManager {
         status.put("use_places_harvest_running", UsePlacesIndex.isHarvesting());
         status.put("use_places_harvest_processed", UsePlacesIndex.harvestProcessed());
         status.put("use_places_harvest_total", UsePlacesIndex.harvestTotal());
-        String tsReason = trigramSkipReason.get();
-        if (tsReason != null) status.put("trigram_skip_reason", tsReason);
         String upReason = usePlacesSkipReason.get();
         if (upReason != null) status.put("use_places_skip_reason", upReason);
         Map<String, Object> capWarning = capacityWarning;
@@ -603,14 +576,9 @@ public class WarmupManager {
         caps.put("smali", "ready");
         // live_decompile = the one-time JADX engine init is paid; smali / non-cached source are fast after.
         caps.put("live_decompile", isEngineInitDone() ? "ready" : "warming");
-        // code_search is "ready" once EITHER the heap-resident trigram index has entries OR the
-        // mmap shard layer is built (A1 turned the heap trigram index off by default, so
-        // trigramCount() alone would stay 0 forever and permanently misreport "warming" even
-        // though the shard layer is already serving searches).
-        String trigramSkip = trigramSkipReason.get();
-        boolean codeSearchReady = CodeContentIndex.trigramCount() > 0 || ContentShardIndex.isBuilt();
-        caps.put("code_search",
-            codeSearchCapability(codeSearchReady, shardBuildRunning.get(), trigramSkip));
+        // code_search is "ready" once the mmap shard layer is built.
+        boolean codeSearchReady = ContentShardIndex.isBuilt();
+        caps.put("code_search", codeSearchCapability(codeSearchReady, shardBuildRunning.get()));
         caps.put("xref_class_level", UsageGraphIndex.isReady() ? "ready" : "warming");
         String usePlacesSkip = usePlacesSkipReason.get();
         caps.put("precise_xref_snippets", UsePlacesIndex.isReady() ? "ready"
@@ -621,22 +589,25 @@ public class WarmupManager {
 
     /**
      * Best-effort overall warmup progress fraction (0..1) across all phases, weighted by the
-     * measured cost share of each phase on a cold run (Phase-1 decompile ≈58%, trigram ≈4%,
-     * graph ≈1%, use-places harvest ≈37%). Phases with a fine-grained counter (Phase-1 processed,
+     * measured cost share of each phase on a cold run (Phase-1 decompile ≈62%, graph ≈1%,
+     * use-places harvest ≈37%). Phases with a fine-grained counter (Phase-1 processed,
      * use-places harvest) interpolate; counter-less phases report their mid-point.
+     *
+     * <p>Phase-1's share absorbed the ≈4% that the heap trigram build used to hold, since that
+     * phase no longer exists. That is a re-normalisation of the old measurement, not a fresh one —
+     * re-measure on a cold run if these numbers start mattering more than roughly.
      */
     private static double computeOverallFraction(String phase, int processed, int total,
                                                  int harvestProcessed, int harvestTotal) {
         if (phase == null) return 0.0;
-        final double W1 = 0.58, W2 = 0.04, W3 = 0.01; // W4 (use-places) = 0.37
+        final double W1 = 0.62, W3 = 0.01; // W4 (use-places) = 0.37
         switch (phase) {
             case "ENGINE_INIT":    return 0.01;  // one-time JADX init, ~13s of a ~1000s cold warm
             case "PHASE1_DECOMPILE":
                 return total > 0 ? W1 * Math.min(1.0, (double) processed / total) : 0.0;
-            case "PHASE2_INDEX":   return W1 + W2 * 0.5;
-            case "PHASE3_GRAPH":   return W1 + W2 + W3 * 0.5;
+            case "PHASE3_GRAPH":   return W1 + W3 * 0.5;
             case "PHASE4_USEPLACES":
-                double base = W1 + W2 + W3;
+                double base = W1 + W3;
                 double hp = harvestTotal > 0 ? Math.min(1.0, (double) harvestProcessed / harvestTotal) : 0.0;
                 return base + (1.0 - base) * hp;
             case "FAST_RESTORE":   return 0.5;  // quick path; refined by elapsed-based ETA
@@ -651,7 +622,7 @@ public class WarmupManager {
 
     private static void runWarmup(HeadlessJadxWrapper wrapper, List<JavaClass> targets) {
         try {
-            // Deterministic order keyed by RAW name: stable class IDs for graph + trigram across
+            // Deterministic order keyed by RAW name: stable class IDs for the usage graph and content shards across
             // restarts AND independent of deobfuscation state (getFullName() returns aliases when
             // deobf is on, which would shuffle ids; getRawName() is immutable).
             List<JavaClass> sorted = new ArrayList<>(targets);
@@ -691,14 +662,14 @@ public class WarmupManager {
             String hash = null;
             try {
                 ensureStores();
-                hash = persistentStore.computeInputHash(new ArrayList<>(wrapper.getInputFiles()));
+                hash = computeInputHash(new ArrayList<>(wrapper.getInputFiles()));
                 currentInputHash = hash;
                 codeStore = new CodeStore(indexCacheDir(), hash);
             } catch (Exception e) {
                 logger.warn("[JAI] Warmup: persistent store init failed: {}", e.getMessage());
             }
 
-            CodeContentIndex.preAssignIds(sorted);
+            ClassIdRegistry.preAssignIds(sorted);
             lastPreAssignedClasses = sorted; // F7: single source of truth for id-space restores
             UsageGraphIndex.assignIds(sorted);
             UsePlacesIndex.assignIds(sorted);
@@ -722,25 +693,15 @@ public class WarmupManager {
                 // and metadata search from the name indices built below. Per-class live decompile
                 // still happens lazily on demand for anything not covered.
                 phase.set("FAST_RESTORE");
-                tryRestoreIndex(wrapper, sorted); // best-effort trigram restore (harmless if empty)
                 // Precise use-places: restore from disk so /xrefs-to-class?include_snippet=true is
                 // instant after restart. If absent (older build / first restart after this feature),
                 // deep-warm harvests them at its tail once jadx state is hot again.
                 boolean usePlacesRestored = (hash != null) && tryRestoreUsePlaces(hash, sorted.size());
                 logger.info("[JAI] Warmup FAST RESTART: usage graph + code store present — "
-                    + "skipped Phase-1 decompile and Phase-2 index build (use-places restored={})",
+                    + "skipped Phase-1 decompile (use-places restored={})",
                     usePlacesRestored);
-                // If no trigram index was restored (e.g. first restart after a fixed build, or a
-                // prior cold warm that persisted an empty index), rebuild it in the background
-                // from the CodeStore so code-content search works without a full Phase-1 re-run.
-                if (CodeContentIndex.trigramCount() == 0 && codeStore != null && codeStore.isComplete()) {
-                    startBackgroundTrigramBuild(wrapper, sorted);
-                }
-                // Dual-build: also build the mmap shard index from the CodeStore, in parallel with
-                // (and independent of) the trigram gate above. This must NOT reuse the trigramCount
-                // gate — a restored .idx makes trigramCount!=0 while the shard catalog is still
-                // absent, so we gate solely on the catalog. Queries do not yet consult the shard
-                // layer (Wave B), so this is additive and search-behavior-neutral.
+                // Build the mmap shard index from the CodeStore in the background, gated solely on
+                // the shard catalog. Queries consult the shard layer for code search (Wave B).
                 if (hash != null && codeStore != null && codeStore.isComplete()) {
                     try {
                         ContentShardIndex.loadCatalog(indexCacheDir(), hash);
@@ -768,22 +729,6 @@ public class WarmupManager {
                 // reflect Phase-1 instead of staying pinned at the ENGINE_INIT weight.
                 phase.set("PHASE1_DECOMPILE");
                 runPhase1(targets);
-
-                if (!cancelRequested.get()) {
-                    // One-shot GC hint at the Phase-1/Phase-2 boundary. Phase-1 may leave
-                    // JADX's internal decompile IR (ClassNode state, intermediate AST) in heap.
-                    // Phase-2 reads exclusively from the disk-backed CodeStore and needs none of
-                    // that state. Nudging the JVM here — once, at a natural boundary, not per-class —
-                    // gives it a window to reclaim the Phase-1 transient heap before Phase-2 starts
-                    // allocating trigram BitSets, reducing the peak overlap between the two phases.
-                    System.gc();
-                    phase.set("PHASE2_INDEX");
-                    boolean restoredFromCache = tryRestoreIndex(wrapper, sorted);
-                    if (!restoredFromCache) {
-                        runPhase2(targets);
-                        if (!cancelRequested.get()) tryPersistIndex(wrapper);
-                    }
-                }
 
                 if (!cancelRequested.get() && !graphRestored) {
                     phase.set("PHASE3_GRAPH");
@@ -881,11 +826,52 @@ public class WarmupManager {
         }
     }
 
-    /** Lazily initialise the persistent trigram + usage-graph + use-places stores. */
+    /** Lazily initialise the persistent usage-graph + use-places stores. */
     private static void ensureStores() throws IOException {
-        if (persistentStore == null) persistentStore = new PersistentIndexStore(indexCacheDir());
         if (usageGraphStore == null) usageGraphStore = new UsageGraphStore(indexCacheDir());
         if (usePlacesStore == null) usePlacesStore = new UsePlacesStore(indexCacheDir());
+    }
+
+    /**
+     * Computes a stable hash identifying a specific set of input files, used as the key for every
+     * persisted artifact (CodeStore, usage graph, use-places, mmap shard catalog) so a restart can
+     * detect whether the same APK is loaded. Formerly {@code PersistentIndexStore.computeInputHash}
+     * (that class was trigram-only and removed); kept here since this is now its sole caller.
+     *
+     * <p>For efficiency, only the first 64 KB of each file's content is hashed, combined with the
+     * file's absolute path and length — sufficient to detect file replacements while avoiding a
+     * full multi-hundred-MB read on every start.
+     *
+     * @param inputFiles list of APK/JAR/DEX files; must not be null or empty
+     * @return lowercase hex SHA-256 string
+     */
+    public static String computeInputHash(List<File> inputFiles) throws Exception {
+        java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+        List<File> sorted = new ArrayList<>(inputFiles);
+        sorted.sort(Comparator.comparing(File::getAbsolutePath));
+
+        for (File f : sorted) {
+            md.update(f.getAbsolutePath().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            md.update(Long.toString(f.length()).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            try (java.io.InputStream is = new java.io.BufferedInputStream(new java.io.FileInputStream(f))) {
+                byte[] buf = new byte[65536];
+                int n = is.read(buf);
+                if (n > 0) {
+                    md.update(buf, 0, n);
+                }
+            }
+        }
+
+        // Mix in the deobfuscation config: index keys / CodeStore source text all differ between
+        // deobf states, so a deobf change MUST invalidate prior artifacts.
+        md.update(HeadlessJadxWrapper.deobfConfigTag().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        byte[] hash = md.digest();
+        StringBuilder sb = new StringBuilder(hash.length * 2);
+        for (byte b : hash) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
     }
 
     private static final AtomicBoolean usePlacesHarvestRunning = new AtomicBoolean(false);
@@ -893,7 +879,6 @@ public class WarmupManager {
 
     // Degradation skip reasons — set when an index phase is bypassed due to insufficient heap.
     // Exposed via getStatus() so callers know a capability is permanently degraded this session.
-    private static final AtomicReference<String> trigramSkipReason = new AtomicReference<>(null);
     private static final AtomicReference<String> usePlacesSkipReason = new AtomicReference<>(null);
 
     /** True while the one-time precise use-places harvest is running in the background. */
@@ -904,7 +889,7 @@ public class WarmupManager {
     /**
      * Recycler used by the harvest: after a referrer is consumed, free its decompiled state so the
      * heap stays bounded — {@link JavaClass#unload()} drops the (heavy) processed IR, and the jadx
-     * code-cache entry is evicted too. The trigram search index is NOT touched.
+     * code-cache entry is evicted too.
      */
     /**
      * Release a class the caller loaded transiently: drop its decompiled form from jadx and from
@@ -966,7 +951,6 @@ public class WarmupManager {
 
     /** Harvests precise use-places (memory-bounded, source-driven) and persists them. Best-effort. */
     private static void harvestAndPersistUsePlaces(List<JavaClass> sorted, String newLineStr, String hash) {
-        boolean trigramCleared = false;
         try {
             // One-shot GC hint before Phase-4 starts.
             System.gc();
@@ -991,37 +975,6 @@ public class WarmupManager {
                 }
                 return memFused.get();
             };
-
-            // Dynamic memory check: if free heap is below the harvest headroom threshold, evict
-            // the trigram index before starting. Phase-4 re-decompiles all classes while the
-            // usage graph and JADX metadata are already in heap; the trigram index (~3-5 GB on a
-            // 237k-class APK) compounds that and causes OOM. Clearing it costs code-search
-            // performance during harvest (searches fall back to full scan) but lets Phase-4
-            // complete. A background trigram rebuild from CodeStore starts immediately after.
-            Runtime rt = Runtime.getRuntime();
-            long freeMB = (rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())) / (1024L * 1024L);
-            int trigramEntries = CodeContentIndex.trigramCount();
-            // Each trigram entry ≈ 30 KB BitSet for 237k classes; estimate total trigram heap.
-            long trigramEstMB = (long) trigramEntries * 30L / 1024L;
-            // Trigger eviction when free heap < 2× estimated trigram size + 4 GB re-decompile buffer.
-            long headroomNeededMB = trigramEstMB * 2 + 4096L;
-            if (trigramEntries > 0 && freeMB < headroomNeededMB) {
-                logger.info("[JAI] Phase-4 memory: freeMB={}, trigramEst={}MB, threshold={}MB — "
-                    + "clearing trigram index to make room; will rebuild from CodeStore after harvest",
-                    freeMB, trigramEstMB, headroomNeededMB);
-                CodeContentIndex.clear();
-                trigramCleared = true;
-                // F7 fix: restore the id space immediately, from THIS warmup's own preAssigned-ids
-                // snapshot, before the harvest (or a query) can observe it wiped. Without this, the
-                // upcoming background trigram rebuild's getOrAssignId calls would assign fresh,
-                // gap-compacted ids (it skips empty/oversized classes) that drift out of sync with
-                // the already-built mmap shard's id space — the exact bug this fixes.
-                reassignIdsForCurrentApk();
-                System.gc(); // give GC a window to reclaim freed BitSets before harvest starts
-            } else {
-                logger.info("[JAI] Phase-4 memory: freeMB={}, trigramEst={}MB — enough headroom, "
-                    + "keeping trigram index in memory", freeMB, trigramEstMB);
-            }
 
             // Phase-4 uses fewer workers than Phase-1: base memory is now larger (graph already
             // allocated), so concurrent re-decompile transients must be smaller.
@@ -1049,17 +1002,6 @@ public class WarmupManager {
             }
         } catch (Exception e) {
             logger.warn("[JAI] Warmup: use-places harvest/persist failed: {}", e.getMessage());
-        } finally {
-            // If we cleared the trigram index to make room for Phase-4, rebuild it in the
-            // background from the disk-backed CodeStore. The rebuild runs at MIN_PRIORITY so
-            // it doesn't compete with serving requests.
-            if (trigramCleared) {
-                HeadlessJadxWrapper w = lastWrapper;
-                if (w != null && codeStore != null) {
-                    logger.info("[JAI] Phase-4 done — scheduling background trigram rebuild (was cleared for harvest)");
-                    startBackgroundTrigramBuild(w, sorted);
-                }
-            }
         }
     }
 
@@ -1069,110 +1011,6 @@ public class WarmupManager {
     /** True once the one-time JADX engine init is paid; live decompile (smali / non-cached) is fast after. */
     public static boolean isEngineInitDone() {
         return engineInitDone.get();
-    }
-
-    private static final AtomicBoolean trigramBuildRunning = new AtomicBoolean(false);
-
-    /** True while a background trigram build (from the CodeStore) is in progress. */
-    public static boolean isTrigramBuildRunning() {
-        return trigramBuildRunning.get();
-    }
-
-    /**
-     * Builds the trigram code-content index from the persistent CodeStore in a low-priority
-     * background thread, then persists it. Used on the FAST_RESTORE path so code search works
-     * after a restart without re-running the multi-minute Phase-1 decompile. Idempotent.
-     *
-     * <p>The actual build loop is {@link #runTrigramBuildLoop} — extracted so its epoch gate (see
-     * that method's doc) can be exercised directly by a test instead of only as a standalone
-     * pure-function check of {@link #backgroundBuildStillValid}.
-     */
-    private static void startBackgroundTrigramBuild(HeadlessJadxWrapper wrapper, List<JavaClass> sorted) {
-        // A1: heap trigram index off → search goes through the mmap shard layer; never build BitSets.
-        if (!CodeContentIndex.TRIGRAM_HEAP) return;
-        if (!trigramBuildRunning.compareAndSet(false, true)) return;
-        // Graceful degradation: skip trigram build if free heap < 2× estimated index cost.
-        // BitSet-based trigram index uses ~30 KB per class; on a 237k-class APK that is ~7 GB.
-        MemoryConfig mc = MemoryConfig.get();
-        if (!mc.canAffordTrigramBuild(sorted.size())) {
-            long freeMB = mc.freeHeapMB();
-            long estMB = mc.estimateTrigramMB(sorted.size());
-            String reason = String.format("free heap %dMB < 2× estimated trigram %dMB",
-                freeMB, estMB);
-            logger.warn("[JAI] trigram build SKIPPED (low heap): {} — code-content search "
-                + "unavailable this session; restart on a larger-heap machine to enable", reason);
-            trigramSkipReason.set(reason);
-            trigramBuildRunning.set(false);
-            return;
-        }
-        trigramSkipReason.set(null);
-        // F7-b: the hash this build is FOR, captured once at launch — compared against the live
-        // currentInputHash both mid-loop and before persisting, never against cancelRequested alone.
-        String builtForHash = currentInputHash;
-        Thread t = new Thread(() -> runTrigramBuildLoop(wrapper, sorted, builtForHash), "jadx-trigram-build");
-        t.setDaemon(true);
-        t.setPriority(Thread.MIN_PRIORITY);
-        t.start();
-    }
-
-    /**
-     * The trigram-build thread body — extracted from {@link #startBackgroundTrigramBuild} (package-
-     * private for direct unit testing) so the epoch gate below can be exercised on the actual call
-     * path instead of only as a standalone pure-function check of {@link #backgroundBuildStillValid}.
-     *
-     * <h2>Epoch gate (F7-b)</h2>
-     * Same defect class as {@link #startBackgroundShardBuild}'s (C) fix: this thread can run long
-     * enough for a NEWER apk to load and start its own warmup while this one is still mid-loop or
-     * paused under memory pressure. {@code cancelRequested} alone cannot gate that — {@link #start}
-     * resets it to {@code false} at the top of every new warmup — so the hash captured at launch is
-     * compared against the live {@link #currentInputHash} both inside the loop (to stop indexing
-     * further into the SHARED, hash-unpartitioned {@link CodeContentIndex} heap state on behalf of
-     * an apk that is no longer current) and again immediately before {@link #tryPersistIndex} (to
-     * never write a stale/foreign product to disk). See {@link #backgroundBuildStillValid}.
-     *
-     * <p>Owns the full lifecycle a caller starting this as a thread would expect: resets
-     * {@code trigramBuildRunning} to {@code false} in its own {@code finally}, so calling it directly
-     * (as a test does) never leaves that flag stuck {@code true}.
-     */
-    static void runTrigramBuildLoop(HeadlessJadxWrapper wrapper, List<JavaClass> sorted, String builtForHash) {
-        long t0 = System.currentTimeMillis();
-        int built = 0;
-        boolean completed = true;
-        try {
-            CodeStore cs = codeStore;
-            if (cs == null) return;
-            logger.info("[JAI] Background trigram build started from CodeStore: {} classes", sorted.size());
-            for (JavaClass cls : sorted) {
-                if (cancelRequested.get() || Thread.currentThread().isInterrupted()
-                        || !backgroundBuildStillValid(true, builtForHash, currentInputHash)) {
-                    completed = false;
-                    break;
-                }
-                if (isHighMemoryPressure()) {
-                    try { throttleSleep(1500); } catch (InterruptedException ie) { completed = false; break; }
-                }
-                String code = cs.get(cls.getRawName()); // CodeStore keyed by raw name (deobf-stable)
-                if (code != null && !code.isEmpty() && CodeContentIndex.tryIndexFromCache(cls, code)) {
-                    built++;
-                }
-            }
-            logger.info("[JAI] Background trigram build finished: {} classes indexed, {} trigrams, {}s",
-                built, CodeContentIndex.trigramCount(), (System.currentTimeMillis() - t0) / 1000);
-            if (backgroundBuildStillValid(completed, builtForHash, currentInputHash)
-                    && CodeContentIndex.trigramCount() > 0) {
-                tryPersistIndex(wrapper);
-            } else if (!completed || (builtForHash != null && !builtForHash.equals(currentInputHash))) {
-                logger.warn("[JAI] Background trigram build for hash {}... DISCARDED — completed={}, "
-                    + "currentInputHash={}... (build was interrupted, or superseded by a newer apk "
-                    + "load before it finished — persisting it would write a stale/foreign trigram "
-                    + "index to disk under the wrong hash)",
-                    builtForHash != null ? builtForHash.substring(0, Math.min(8, builtForHash.length())) : "null",
-                    completed,
-                    currentInputHash != null ? currentInputHash.substring(0, Math.min(8, currentInputHash.length())) : "null");
-            }
-        } finally {
-            trigramBuildRunning.set(false);
-        }
     }
 
     private static final AtomicBoolean shardBuildRunning = new AtomicBoolean(false);
@@ -1185,8 +1023,7 @@ public class WarmupManager {
     /**
      * Builds the mmap-backed content shard index from the persistent CodeStore in a low-priority
      * background thread, writes the catalog, then loads it into {@link ContentShardIndex}. Runs in
-     * parallel with (and independent of) the heap-bound trigram index — the shard layer is not yet
-     * consulted by queries (Wave B), so this is a pure additive build with zero search-behavior risk.
+     * the sole content-search index; the heap-bound trigram layer it once ran alongside has been removed.
      *
      * <p>The actual build loop is {@link #runShardBuildLoop} — extracted so its class-id contract
      * and epoch gate (see that method's doc) can be exercised directly by a test instead of only as
@@ -1206,10 +1043,10 @@ public class WarmupManager {
      * private for direct unit testing).
      *
      * <h2>Class-id contract (soundness-critical)</h2>
-     * {@code sorted} is the exact list passed to {@link CodeContentIndex#preAssignIds}, which assigns
+     * {@code sorted} is the exact list passed to {@link ClassIdRegistry#preAssignIds}, which assigns
      * id {@code i} to {@code sorted.get(i)} via a from-0 {@code nextId++}. This loop therefore uses
      * the loop index {@code i} directly as the shard class id, so a shard candidate id {@code i}
-     * resolves back to the right class through {@link CodeContentIndex#resolveClass(int)}
+     * resolves back to the right class through {@link ClassIdRegistry#resolveClass(int)}
      * ({@code resolveClass(i) == sorted.get(i)}). Do NOT substitute any other id source here — a
      * mismatch would make Wave B queries resolve candidates to the wrong class. Library / unpersisted
      * classes (CodeStore miss) are skipped entirely (no addClass, no markExcluded): their ids stay
@@ -1310,13 +1147,12 @@ public class WarmupManager {
 
     /**
      * Pure epoch/completeness gate for publishing the product of a background index build
-     * (package-private for direct unit testing — F7 fix C, generalized as F7-b). Shared by
-     * {@link #startBackgroundShardBuild} and {@link #startBackgroundTrigramBuild} — both launch a
-     * long-running background thread against a class list captured at a point in time, and both
-     * write into state ({@code ContentShardIndex} / {@code CodeContentIndex}'s persisted trigram
-     * file) that must never be published once a NEWER apk has become current. A build may publish
-     * only if it (a) ran to full completion — never on a cancelled/interrupted/memory-paused
-     * partial pass — and (b) was built for the hash that is STILL current at publish time.
+     * (package-private for direct unit testing — F7 fix C, generalized as F7-b). Used by
+     * {@link #startBackgroundShardBuild}, which launches a long-running background thread against
+     * a class list captured at a point in time and writes into {@code ContentShardIndex} state that
+     * must never be published once a NEWER apk has become current. A build may publish only if it
+     * (a) ran to full completion — never on a cancelled/interrupted/memory-paused partial pass —
+     * and (b) was built for the hash that is STILL current at publish time.
      * {@code cancelRequested} alone cannot answer (b): {@link #start} resets it to {@code false} at
      * the top of every new warmup, so a stale thread blocked on I/O or memory pressure can wake up
      * after a newer apk has already loaded, see {@code cancelRequested} read as false again, and
@@ -1608,125 +1444,6 @@ public class WarmupManager {
             + "perWorkerStall≈{}% of {}ms wall ({} workers)",
             pressureHits.get(), pressureSleepMs.get(), pressureGcMs.get(),
             String.format("%.1f", perWorkerStallPct), phaseMs, workers);
-    }
-
-    /** Phase 2: parallel trigram index fill from already-cached code (no lock needed). */
-    private static void runPhase2(List<JavaClass> targets) {
-        // A1: heap trigram index off → skip Phase-2 entirely (no BitSet fill). Shard layer serves search.
-        if (!CodeContentIndex.TRIGRAM_HEAP) return;
-        int workers = Math.min(INDEX_WORKERS, Math.max(1, targets.size()));
-        AtomicInteger indexPos = new AtomicInteger(0);
-        AtomicInteger indexed = new AtomicInteger(0);
-        long phaseStart = System.currentTimeMillis();
-
-        ExecutorService indexPool = Executors.newFixedThreadPool(workers);
-        CountDownLatch latch = new CountDownLatch(workers);
-
-        for (int w = 0; w < workers; w++) {
-            indexPool.submit(() -> {
-                try {
-                    int pos;
-                    while ((pos = indexPos.getAndIncrement()) < targets.size()) {
-                        if (cancelRequested.get() || Thread.currentThread().isInterrupted()) break;
-                        JavaClass cls = targets.get(pos);
-                        // Source from the persistent CodeStore (disk, complete after Phase-1)
-                        // rather than jadx's transient ICodeCache, which is largely evicted by
-                        // the time Phase-2 runs — that miss left trigram coverage at 0 (C10).
-                        String code = null;
-                        CodeStore cs = codeStore;
-                        if (cs != null) {
-                            code = cs.get(cls.getRawName()); // CodeStore keyed by raw name (deobf-stable)
-                        }
-                        if (code == null || code.isEmpty()) {
-                            code = ClassCacheManager.getCachedCodeDirect(cls);
-                        }
-                        if (CodeContentIndex.tryIndexFromCache(cls, code)) {
-                            indexed.incrementAndGet();
-                        }
-                    }
-                } finally {
-                    latch.countDown();
-                }
-            });
-        }
-
-        boolean completed;
-        try {
-            completed = latch.await(300, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            completed = false;
-        } finally {
-            indexPool.shutdownNow();
-        }
-        if (!completed) {
-            // P2 fix: the return value used to be discarded — a timeout silently fell through to
-            // Phase-3 with the trigram index partially filled and no signal anyone could act on.
-            // shutdownNow() alone doesn't stop a worker either: it only interrupts, and the loop
-            // above now checks isInterrupted() (previously only cancelRequested) so a timeout
-            // actually drains the workers instead of leaving them running past this method's return.
-            logger.warn("[JAI] Warmup phase-2 TIMED OUT after 300s waiting for index workers — "
-                + "proceeding to Phase-3 with a PARTIAL trigram index ({} of {} classes indexed so far)",
-                indexed.get(), targets.size());
-        }
-
-        long phaseMs = System.currentTimeMillis() - phaseStart;
-        int totalIndexed = CodeContentIndex.indexedClassCount();
-        int totalClasses = total.get() + skipped.get();
-        double coverage = totalClasses > 0 ? 100.0 * totalIndexed / totalClasses : 0.0;
-        logger.info("[JAI] Warmup phase-2 done: {} newly indexed, trigram coverage {}% in {}ms",
-            indexed.get(), String.format("%.1f", coverage), phaseMs);
-    }
-
-    /**
-     * Attempts to restore the trigram index from the persistent store.
-     * Must be called AFTER {@link CodeContentIndex#preAssignIds} so that BitSet bit
-     * positions are stable.  Returns true if the index was restored and Phase 2 can
-     * be skipped; false if a full Phase-2 rebuild is required.
-     */
-    private static boolean tryRestoreIndex(HeadlessJadxWrapper wrapper, List<JavaClass> sortedTargets) {
-        // A1: heap trigram index off → don't restore BitSets into the heap. Returning false is safe;
-        // the COLD caller then hits runPhase2 (also a no-op when off), the FAST_RESTORE caller ignores it.
-        if (!CodeContentIndex.TRIGRAM_HEAP) return false;
-        try {
-            if (persistentStore == null) {
-                persistentStore = new PersistentIndexStore(indexCacheDir());
-            }
-            List<File> inputFiles = wrapper.getInputFiles();
-            String hash = persistentStore.computeInputHash(new ArrayList<>(inputFiles));
-            Map<String, BitSet> loaded = persistentStore.tryLoad(hash);
-            if (loaded == null || loaded.isEmpty()) {
-                return false;
-            }
-            CodeContentIndex.bulkRestore(loaded);
-            logger.info("[JAI] Warmup: trigram index restored from cache ({} trigrams, {} classes) — Phase 2 skipped",
-                loaded.size(), sortedTargets.size());
-            return true;
-        } catch (Exception e) {
-            logger.warn("[JAI] Warmup: failed to restore trigram index from cache: {}", e.getMessage());
-            return false;
-        }
-    }
-
-    /**
-     * Saves the CodeContentIndex to the PersistentIndexStore after a successful warmup.
-     * Failures are logged but do not break the warmup result.
-     */
-    private static void tryPersistIndex(HeadlessJadxWrapper wrapper) {
-        // A1: heap trigram index off → nothing to persist (the in-heap index is empty).
-        if (!CodeContentIndex.TRIGRAM_HEAP) return;
-        try {
-            if (persistentStore == null) {
-                persistentStore = new PersistentIndexStore(indexCacheDir());
-            }
-            java.util.List<java.io.File> inputFiles = wrapper.getInputFiles();
-            String hash = persistentStore.computeInputHash(new java.util.ArrayList<>(inputFiles));
-            CodeContentIndex indexInstance = new CodeContentIndex();
-            persistentStore.save(indexInstance, hash);
-            logger.info("[JAI] Warmup: trigram index persisted (hash={}...)", hash.substring(0, 8));
-        } catch (Exception e) {
-            logger.warn("[JAI] Warmup: failed to persist trigram index: {}", e.getMessage());
-        }
     }
 
     private static boolean isLibraryClass(String fullName) {

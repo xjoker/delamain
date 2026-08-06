@@ -1,7 +1,7 @@
 package com.zin.delamain.server.routes;
 
 import com.zin.delamain.core.HeadlessJadxWrapper;
-import com.zin.delamain.index.CodeContentIndex;
+import com.zin.delamain.index.ClassIdRegistry;
 import com.zin.delamain.index.WarmupManager;
 import com.zin.delamain.index.shard.ContentShardIndex;
 import com.zin.delamain.server.AuthConfig;
@@ -58,7 +58,7 @@ class FileManagementRoutesAutoWarmupTest {
             Thread.sleep(200);
         }
         ContentShardIndex.clear();
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         if (wrapper != null) {
             wrapper.close();
         }

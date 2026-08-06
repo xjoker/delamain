@@ -25,7 +25,7 @@ class ContentShardBuilderTest {
 
     private static final String HASH = "deadbeefcafef00d";
 
-    /** Mirrors CodeContentIndex.index()'s exact trigram extraction (skip all-whitespace windows). */
+    /** Mirrors {@link ContentShardBuilder#addClass}'s exact trigram extraction (skip all-whitespace windows). */
     private static Set<Long> trigramsOf(String code) {
         Set<Long> out = new HashSet<>();
         for (int i = 0; i + 3 <= code.length(); i++) {

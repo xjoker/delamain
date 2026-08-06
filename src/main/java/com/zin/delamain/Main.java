@@ -126,7 +126,7 @@ public class Main {
         // ---- Banner ----
         printBanner(port, bind, apkPaths, outputDir, workers);
 
-        // ---- Configure persistent index location (trigram + usage graph) ----
+        // ---- Configure persistent index location (code store + usage graph + content shards) ----
         // Without this the indices default to ~/.delamain/index-cache (lost on container
         // recreate); pointing them at --index-dir puts them on the mounted volume.
         try {

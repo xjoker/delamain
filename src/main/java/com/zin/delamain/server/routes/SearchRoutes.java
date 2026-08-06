@@ -1,7 +1,7 @@
 package com.zin.delamain.server.routes;
 
 import com.zin.delamain.core.HeadlessJadxWrapper;
-import com.zin.delamain.index.CodeContentIndex;
+import com.zin.delamain.index.ClassIdRegistry;
 import com.zin.delamain.index.CodeStore;
 import com.zin.delamain.index.WarmupManager;
 import com.zin.delamain.index.shard.ContentShardIndex;
@@ -645,42 +645,16 @@ public class SearchRoutes {
         int batchCount = 0;
         final boolean contentRequested = requiresContentSearch(searchLocations);
 
-        final Set<JavaClass> trigramCandidates;
-        final boolean trigramDefinitivelyEmpty;
-        // Additive shard pruning layer (Wave B): the mmap shard index gives an authoritative
+        // Shard pruning layer (Wave B): the mmap shard index gives an authoritative
         // definitive-negative for every class id it covers, letting a broad-term search skip the
-        // bulk of the corpus without a per-class scan. It sits ON TOP of the residual
-        // CodeContentIndex layer below — shard-covered ids use the shard's judgment, everything
-        // else falls back to the byte-for-byte unchanged residual logic. Only populated for a
-        // non-REGEX CODE search (same gate as the trigram prefilter).
+        // bulk of the corpus without a per-class scan. Only populated for a non-REGEX CODE search.
         final TermLookupResult shardResult;
         final AtomicInteger shardCoveredPruned = new AtomicInteger(0);
-        // The trigram index is built from literal code substrings, so it cannot pre-filter a
-        // REGEX search term (e.g. "public\s+class" never appears verbatim in decompiled code).
-        // Skip the trigram shortcut for REGEX and fall through to a full per-class scan instead.
         if (contentRequested && searchLocations.contains(SearchLocation.CODE)
                 && matchMode != MatchMode.REGEX) {
             shardResult = ContentShardIndex.isBuilt() ? ContentShardIndex.candidatesForTerm(term) : null;
-            BitSet candidateBits = CodeContentIndex.candidatesForTerm(term);
-            if (candidateBits != null && !candidateBits.isEmpty()) {
-                Set<JavaClass> tc = new HashSet<>();
-                for (int bit = candidateBits.nextSetBit(0); bit >= 0; bit = candidateBits.nextSetBit(bit + 1)) {
-                    JavaClass resolved = CodeContentIndex.resolveClass(bit);
-                    if (resolved != null) tc.add(resolved);
-                }
-                trigramCandidates = tc.isEmpty() ? null : tc;
-                trigramDefinitivelyEmpty = false;
-            } else if (candidateBits != null) {
-                trigramCandidates = null;
-                trigramDefinitivelyEmpty = true;
-            } else {
-                trigramCandidates = null;
-                trigramDefinitivelyEmpty = false;
-            }
         } else {
             shardResult = null;
-            trigramCandidates = null;
-            trigramDefinitivelyEmpty = false;
         }
 
         // Broad-word guard: shard already told us the candidate cardinality is huge — don't run
@@ -699,8 +673,7 @@ public class SearchRoutes {
         // in the corpus, which on a large APK is exactly the 60s SEARCH_TIMEOUT_SECONDS burn this
         // fixes. Refuse the content phase instead of attempting it; metadata locations are
         // index-free and still run in full, so a mixed search keeps all of its name matches.
-        final boolean contentIndexUsable =
-            shardResult != null || trigramCandidates != null || trigramDefinitivelyEmpty;
+        final boolean contentIndexUsable = shardResult != null;
         final boolean contentScanSkipped = contentRequested && !contentIndexUsable
             && filteredClasses.size() > UNINDEXED_CONTENT_SCAN_MAX;
         if (contentScanSkipped && isContentOnly(searchLocations)) {
@@ -797,8 +770,7 @@ public class SearchRoutes {
                 List<JavaClass> shardCandidateFirst = new ArrayList<>();
                 List<JavaClass> residue = new ArrayList<>();
                 for (JavaClass cls : contentCandidates) {
-                    if (isDefinitivelyAbsent(cls, shardResult, trigramCandidates,
-                            trigramDefinitivelyEmpty, shardCoveredPruned)) continue;
+                    if (isDefinitivelyAbsent(cls, shardResult, shardCoveredPruned)) continue;
                     if (isShardCandidate(cls, shardResult)) shardCandidateFirst.add(cls);
                     else residue.add(cls);
                 }
@@ -850,8 +822,7 @@ public class SearchRoutes {
                     }
                 } else if (requiresContentSearch) {
                     // H6 fix: same soundness guard as the parallel branch above — see comment there.
-                    if (isDefinitivelyAbsent(cls, shardResult, trigramCandidates,
-                            trigramDefinitivelyEmpty, shardCoveredPruned)) continue;
+                    if (isDefinitivelyAbsent(cls, shardResult, shardCoveredPruned)) continue;
                     contentCandidateTotal.incrementAndGet();
                     // Budget exhausted → skip this class's content scan but keep looping: the
                     // metadata phase is interleaved in this branch and must not be cut short.
@@ -876,16 +847,12 @@ public class SearchRoutes {
         searchInfo.put("timed_out", timedOut);
         searchInfo.put("parallel_batches", batchCount);
         searchInfo.put("search_locations", searchLocations.toString());
-        if (requiresContentSearch && trigramCandidates != null) {
-            searchInfo.put("trigram_pre_filter_candidates", trigramCandidates.size());
-        }
         if (requiresContentSearch) {
-            searchInfo.put("trigram_definitively_empty", trigramDefinitivelyEmpty);
-            // H6 honesty signal: the trigram index is a prefilter only, never the source of
+            // H6 honesty signal: the shard index is a prefilter only, never the source of
             // truth. Unindexed classes always fall through to a real content scan (with lazy
             // decompile + self-healing indexing) rather than being trusted/rejected on the
-            // trigram prefilter alone — so unless the search timed out, a miss means the term
-            // genuinely was not found in any scanned class, not that the index failed to cover it.
+            // prefilter alone — so unless the search timed out, a miss means the term genuinely
+            // was not found in any scanned class, not that the index failed to cover it.
             searchInfo.put("index_is_prefilter_only", true);
             // Wave B shard layer signals: whether the mmap shard index was available for this
             // query, and how many classes it authoritatively pruned (definitive negatives skipped
@@ -893,8 +860,6 @@ public class SearchRoutes {
             searchInfo.put("shard_index_built", ContentShardIndex.isBuilt());
             searchInfo.put("shard_covered_pruned", shardCoveredPruned.get());
         }
-        searchInfo.put("trigram_index_size", CodeContentIndex.trigramCount());
-        searchInfo.put("trigram_indexed_classes", CodeContentIndex.indexedClassCount());
         if (classNameMatchSource != null && !classNameMatchSource.isEmpty()) {
             searchInfo.put("matched_on", classNameMatchSource);
         }
@@ -968,7 +933,7 @@ public class SearchRoutes {
     /** True when the shard index positively lists this class as a possible match for the term. */
     private static boolean isShardCandidate(JavaClass cls, TermLookupResult shardResult) {
         if (shardResult == null) return false;
-        int id = CodeContentIndex.idOf(cls);
+        int id = ClassIdRegistry.idOf(cls);
         return id >= 0 && shardResult.candidates.contains(id);
     }
 
@@ -1035,8 +1000,6 @@ public class SearchRoutes {
         searchInfo.put("timed_out", false);
         searchInfo.put("parallel_batches", 0);
         searchInfo.put("search_locations", searchLocations.toString());
-        searchInfo.put("trigram_index_size", CodeContentIndex.trigramCount());
-        searchInfo.put("trigram_indexed_classes", CodeContentIndex.indexedClassCount());
         searchInfo.put("shard_index_built", ContentShardIndex.isBuilt());
         searchInfo.put("shard_covered_pruned", 0);
         searchInfo.put("content_scan_skipped", true);
@@ -1080,7 +1043,7 @@ public class SearchRoutes {
 
         for (int id : shardResult.candidates) {
             if (sampledScanned >= BROAD_SAMPLE_SCAN) break;
-            JavaClass cls = CodeContentIndex.resolveClass(id);
+            JavaClass cls = ClassIdRegistry.resolveClass(id);
             if (cls == null || !filteredSet.contains(cls)) continue;
             sampledScanned++;
             try {
@@ -1101,8 +1064,6 @@ public class SearchRoutes {
         searchInfo.put("timed_out", false);
         searchInfo.put("parallel_batches", 0);
         searchInfo.put("search_locations", searchLocations.toString());
-        searchInfo.put("trigram_index_size", CodeContentIndex.trigramCount());
-        searchInfo.put("trigram_indexed_classes", CodeContentIndex.indexedClassCount());
         searchInfo.put("shard_index_built", ContentShardIndex.isBuilt());
         searchInfo.put("shard_covered_pruned", 0);
         searchInfo.put("broad_term", true);
@@ -1126,9 +1087,9 @@ public class SearchRoutes {
 
     /**
      * H6 soundness guard: decides whether {@code cls} can be safely skipped from the content scan
-     * because some sound index is certain it does not contain the term. Additive two-layer rule:
+     * because the shard index is certain it does not contain the term.
      *
-     * <ol>
+     * <ul>
      *   <li><b>Shard layer (authoritative where it covers).</b> If the shard index covers this
      *       class's id, its judgment is definitive: {@code covered && !candidate} means the class
      *       certainly lacks the term (prune, count it); {@code covered && candidate} means it may
@@ -1139,16 +1100,12 @@ public class SearchRoutes {
      *       contract — the class itself has no content to match, so it is pruned unconditionally.
      *       This never causes a false negative: any term the inner class could "contain" surfaces
      *       via its top-level class instead, which is never itself excluded by this rule.</li>
-     *   <li><b>Residual layer (fallback for everything the shard does not cover).</b> For ids the
-     *       shard makes no claim about — {@code id < 0}, library classes, self-healed classes — the
-     *       existing {@link CodeContentIndex} trigram guard is applied byte-for-byte unchanged: only
-     *       a class the index has actually built ({@link CodeContentIndex#isIndexed}) may be
-     *       rejected on a prefilter miss; anything else falls through to the real scan.</li>
-     * </ol>
+     * </ul>
      *
-     * Soundness invariant: this returns {@code true} only when an index is <em>certain</em> the
-     * term is absent. Any uncertainty (uncovered + unindexed) returns {@code false} → the class is
-     * scanned. Better to over-scan than to wrongly prune a real match.
+     * Soundness invariant: this returns {@code true} only when the shard index is <em>certain</em>
+     * the term is absent. Anything the shard makes no claim about (uncovered id, no shard built)
+     * returns {@code false} → the class is scanned. Better to over-scan than to wrongly prune a
+     * real match.
      *
      * @param shardCoveredPruned incremented once for each class pruned by the shard layer (covered
      *                           or excluded).
@@ -1156,10 +1113,8 @@ public class SearchRoutes {
     static boolean isDefinitivelyAbsent(
             JavaClass cls,
             TermLookupResult shardResult,
-            Set<JavaClass> trigramCandidates,
-            boolean trigramDefinitivelyEmpty,
             AtomicInteger shardCoveredPruned) {
-        int id = CodeContentIndex.idOf(cls);
+        int id = ClassIdRegistry.idOf(cls);
         if (shardResult != null && id >= 0 && shardResult.covered.contains(id)) {
             if (!shardResult.candidates.contains(id)) {
                 shardCoveredPruned.incrementAndGet();
@@ -1173,10 +1128,6 @@ public class SearchRoutes {
             shardCoveredPruned.incrementAndGet();
             return true;
         }
-        // Shard makes no claim about this id → residual CodeContentIndex layer (unchanged).
-        if (trigramCandidates != null && !trigramCandidates.contains(cls)
-                && CodeContentIndex.isIndexed(cls)) return true;
-        if (trigramDefinitivelyEmpty && CodeContentIndex.isIndexed(cls)) return true;
         return false;
     }
 
@@ -1400,7 +1351,6 @@ public class SearchRoutes {
             String normalizedCode;
             if (originalCode != null) {
                 normalizedCode = originalCode.toLowerCase();
-                CodeContentIndex.index(cls, normalizedCode);
             } else if (!allowLiveDecompile) {
                 // Bulk scan: the source is not materialised and decompiling it here would serialise
                 // the whole scan behind the global lock. Skip it and let the caller report it.

@@ -5,8 +5,7 @@ import org.roaringbitmap.RoaringBitmap;
 /**
  * Result of a term lookup against the shard layer.
  *
- * <p>Generalizes {@code CodeContentIndex.candidatesForTerm}'s null/empty/non-empty three-state
- * contract into an explicit pair of id sets:
+ * <p>Expresses a null/empty/non-empty three-state contract as an explicit pair of id sets:
  * <ul>
  *   <li>{@link #covered} — the class ids for which this lookup is <em>authoritative</em>: the
  *       shard layer fully indexed them and can give a trustworthy yes/no. Ids outside this set

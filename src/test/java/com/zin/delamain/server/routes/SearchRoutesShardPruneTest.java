@@ -1,6 +1,6 @@
 package com.zin.delamain.server.routes;
 
-import com.zin.delamain.index.CodeContentIndex;
+import com.zin.delamain.index.ClassIdRegistry;
 import com.zin.delamain.index.shard.ContentShardBuilder;
 import com.zin.delamain.index.shard.ContentShardIndex;
 import com.zin.delamain.index.shard.ShardCatalog;
@@ -22,11 +22,9 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -34,25 +32,24 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Parity / soundness gate for the Wave B additive shard pruning layer wired into
+ * Parity / soundness gate for the Wave B shard pruning layer wired into
  * {@link SearchRoutes#isDefinitivelyAbsent}. The rule under test:
  *
  * <ul>
  *   <li>a class the shard authoritatively covers but does NOT flag as a candidate is the ONLY
  *       case that may be pruned as a definitive negative;</li>
  *   <li>a shard-covered class that DOES contain the term (a candidate) is never pruned;</li>
- *   <li>a class the shard does not cover falls back to the residual {@link CodeContentIndex}
- *       layer with byte-for-byte the legacy behavior;</li>
+ *   <li>a class the shard does not cover (or when no shard is built) is always scanned, never
+ *       pruned;</li>
  *   <li>no class that actually contains the term is ever pruned (zero false negatives).</li>
  * </ul>
  *
  * <p>Uses real {@link JavaClass} instances (the class is {@code final} with package-private
- * constructors, so it cannot be constructed directly) decompiled from a small test APK, mirroring
- * {@code CodeContentIndexTest}. The synthetic code fed to the shard builder does not need to match
- * the class's real decompiled source — only the id→class mapping (via {@code preAssignIds}) and the
- * id→trigram mapping (via the builder) must agree on the id, which they do because
- * {@code preAssignIds} assigns id {@code i} to {@code sorted.get(i)} and the builder is fed those
- * same ids.</p>
+ * constructors, so it cannot be constructed directly) decompiled from a small test APK. The
+ * synthetic code fed to the shard builder does not need to match the class's real decompiled
+ * source — only the id→class mapping (via {@code preAssignIds}) and the id→content mapping (via
+ * the builder) must agree on the id, which they do because {@code preAssignIds} assigns id
+ * {@code i} to {@code sorted.get(i)} and the builder is fed those same ids.</p>
  */
 class SearchRoutesShardPruneTest {
 
@@ -81,14 +78,14 @@ class SearchRoutesShardPruneTest {
 
     @BeforeEach
     void reset() {
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         ContentShardIndex.clear();
     }
 
     @AfterEach
     void tearDown() {
         ContentShardIndex.clear();
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
     }
 
     private static List<JavaClass> sortedClasses() {
@@ -112,12 +109,12 @@ class SearchRoutesShardPruneTest {
     @Test
     void shardCoveredClassPrunedOnlyWhenDefinitivelyAbsent(@TempDir Path dir) throws IOException {
         List<JavaClass> sorted = sortedClasses();
-        CodeContentIndex.preAssignIds(sorted); // idOf(sorted.get(i)) == i
+        ClassIdRegistry.preAssignIds(sorted); // idOf(sorted.get(i)) == i
 
         JavaClass a = sorted.get(0); // shard-covered, CONTAINS "render"
         JavaClass b = sorted.get(1); // shard-covered, does NOT contain "render"
-        JavaClass c = sorted.get(2); // shard-uncovered, flagged by residual layer
-        JavaClass d = sorted.get(3); // shard-uncovered, unindexed
+        JavaClass c = sorted.get(2); // shard-uncovered
+        JavaClass d = sorted.get(3); // shard-uncovered
 
         // Shard covers only ids 0 and 1. Ids must be strictly increasing for the builder.
         Map<Integer, String> corpus = new LinkedHashMap<>();
@@ -126,23 +123,20 @@ class SearchRoutesShardPruneTest {
         buildAndLoadShard(dir, corpus);
 
         TermLookupResult shard = ContentShardIndex.candidatesForTerm("render");
-        // Residual layer flags c as a possible match (so it must NOT be pruned).
-        Set<JavaClass> trigramCandidates = new HashSet<>();
-        trigramCandidates.add(c);
         AtomicInteger pruned = new AtomicInteger(0);
 
         assertFalse(
-                SearchRoutes.isDefinitivelyAbsent(a, shard, trigramCandidates, false, pruned),
+                SearchRoutes.isDefinitivelyAbsent(a, shard, pruned),
                 "shard-covered class that CONTAINS the term must never be pruned (false negative)");
         assertTrue(
-                SearchRoutes.isDefinitivelyAbsent(b, shard, trigramCandidates, false, pruned),
+                SearchRoutes.isDefinitivelyAbsent(b, shard, pruned),
                 "shard-covered class lacking the term is the definitive negative and must be pruned");
         assertFalse(
-                SearchRoutes.isDefinitivelyAbsent(c, shard, trigramCandidates, false, pruned),
-                "shard-uncovered class flagged by the residual layer must be scanned, not pruned");
+                SearchRoutes.isDefinitivelyAbsent(c, shard, pruned),
+                "shard-uncovered class carries no claim and must be scanned");
         assertFalse(
-                SearchRoutes.isDefinitivelyAbsent(d, shard, trigramCandidates, false, pruned),
-                "shard-uncovered unindexed class carries no claim and must be scanned");
+                SearchRoutes.isDefinitivelyAbsent(d, shard, pruned),
+                "shard-uncovered class carries no claim and must be scanned");
 
         assertEquals(1, pruned.get(),
                 "exactly one class (the shard-covered definitive negative) increments the counter");
@@ -154,7 +148,7 @@ class SearchRoutesShardPruneTest {
         // shard candidate yet does not truly contain the term. It must be SCANNED (returns false),
         // never pruned — the real substring check downstream rejects it.
         List<JavaClass> sorted = sortedClasses();
-        CodeContentIndex.preAssignIds(sorted);
+        ClassIdRegistry.preAssignIds(sorted);
 
         JavaClass a = sorted.get(0);
         Map<Integer, String> corpus = new LinkedHashMap<>();
@@ -167,41 +161,24 @@ class SearchRoutesShardPruneTest {
         AtomicInteger pruned = new AtomicInteger(0);
         assertTrue(shard.covered.contains(0), "class must be shard-covered");
         assertTrue(shard.candidates.contains(0), "trigram over-approximation makes it a candidate");
-        assertFalse(SearchRoutes.isDefinitivelyAbsent(a, shard, null, false, pruned),
+        assertFalse(SearchRoutes.isDefinitivelyAbsent(a, shard, pruned),
                 "a shard candidate must be scanned, never pruned");
         assertEquals(0, pruned.get(), "a scanned candidate must not increment the prune counter");
     }
 
     @Test
-    void fallsBackToResidualLayerWhenShardNotConsulted() {
-        // With shardResult == null the guard must reduce EXACTLY to the legacy residual-layer
-        // behavior: only an indexed class absent from trigramCandidates (or with trigram
-        // definitively-empty) is pruned; unindexed classes are always scanned.
+    void noShardResultMeansNeverPruned() {
+        // With shardResult == null (no shard built / class outside the shard's coverage) the guard
+        // must always return false — every class falls through to a real scan.
         List<JavaClass> sorted = sortedClasses();
-        CodeContentIndex.preAssignIds(sorted);
-
-        JavaClass indexed = sorted.get(3);
-        JavaClass unindexed = sorted.get(2);
-        // "ddd" = one trigram, well under the pinned MAX_TRIGRAMS cap, so it fully indexes.
-        CodeContentIndex.index(indexed, "ddd");
-        assertTrue(CodeContentIndex.isIndexed(indexed));
-        assertFalse(CodeContentIndex.isIndexed(unindexed));
+        ClassIdRegistry.preAssignIds(sorted);
 
         AtomicInteger pruned = new AtomicInteger(0);
-
-        // indexed + not a trigram candidate -> pruned by the residual layer.
-        assertTrue(SearchRoutes.isDefinitivelyAbsent(indexed, null, new HashSet<>(), false, pruned));
-        // indexed + IS a trigram candidate -> scanned.
-        Set<JavaClass> withIndexed = new HashSet<>();
-        withIndexed.add(indexed);
-        assertFalse(SearchRoutes.isDefinitivelyAbsent(indexed, null, withIndexed, false, pruned));
-        // trigramDefinitivelyEmpty prunes indexed classes...
-        assertTrue(SearchRoutes.isDefinitivelyAbsent(indexed, null, null, true, pruned));
-        // ...but never an unindexed class (must be scanned / self-healed).
-        assertFalse(SearchRoutes.isDefinitivelyAbsent(unindexed, null, null, true, pruned));
-
-        assertEquals(0, pruned.get(),
-                "residual-layer prunes must not touch the shard-covered counter");
+        for (JavaClass cls : sorted) {
+            assertFalse(SearchRoutes.isDefinitivelyAbsent(cls, null, pruned),
+                    "without a shard result no class may be pruned");
+        }
+        assertEquals(0, pruned.get(), "no shard result means the prune counter never moves");
     }
 
     @Test
@@ -210,7 +187,7 @@ class SearchRoutesShardPruneTest {
         // class. Shard-excluding the (empty) inner id must never cause the term to go missing —
         // it must still surface via the top-level class, which remains a normal scan candidate.
         List<JavaClass> sorted = sortedClasses();
-        CodeContentIndex.preAssignIds(sorted);
+        ClassIdRegistry.preAssignIds(sorted);
 
         JavaClass topLevel = sorted.get(0); // shard-covered, its (synthetic) source contains the term
         JavaClass emptyInner = sorted.get(1); // shard-excluded (stands in for an empty inner class)
@@ -234,13 +211,13 @@ class SearchRoutesShardPruneTest {
         // (a) The top-level class carries the term as a candidate and MUST be scanned (not pruned) —
         //     this is where the real match is found.
         assertFalse(
-                SearchRoutes.isDefinitivelyAbsent(topLevel, shard, null, false, pruned),
+                SearchRoutes.isDefinitivelyAbsent(topLevel, shard, pruned),
                 "shard-covered top-level class containing the term must never be pruned");
 
         // (c) The excluded empty inner class is pruned unconditionally — it has no content, so
         //     pruning it cannot cause a false negative: the term is only ever found via topLevel.
         assertTrue(
-                SearchRoutes.isDefinitivelyAbsent(emptyInner, shard, null, false, pruned),
+                SearchRoutes.isDefinitivelyAbsent(emptyInner, shard, pruned),
                 "shard-excluded empty inner class must be pruned without being scanned");
 
         assertEquals(1, pruned.get(), "only the excluded inner class increments the prune counter");
@@ -249,13 +226,13 @@ class SearchRoutesShardPruneTest {
     @Test
     void idOfReturnsAssignedIdAndMinusOneWhenUnassigned() {
         List<JavaClass> sorted = sortedClasses();
-        assertEquals(-1, CodeContentIndex.idOf(sorted.get(0)),
+        assertEquals(-1, ClassIdRegistry.idOf(sorted.get(0)),
                 "unassigned class must return -1");
-        assertEquals(-1, CodeContentIndex.idOf(null), "null must return -1");
+        assertEquals(-1, ClassIdRegistry.idOf(null), "null must return -1");
 
-        CodeContentIndex.preAssignIds(sorted);
+        ClassIdRegistry.preAssignIds(sorted);
         for (int i = 0; i < sorted.size(); i++) {
-            assertEquals(i, CodeContentIndex.idOf(sorted.get(i)),
+            assertEquals(i, ClassIdRegistry.idOf(sorted.get(i)),
                     "idOf must return the id preAssignIds handed to sorted.get(i)");
         }
     }

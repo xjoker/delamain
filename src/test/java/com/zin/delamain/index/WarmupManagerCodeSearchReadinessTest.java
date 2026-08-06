@@ -16,32 +16,24 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
- * A1 follow-up: with the heap trigram index OFF ({@code TRIGRAM_HEAP == false}), {@code
- * WarmupManager.getStatus()}'s {@code code_search} capability must NOT stay pinned at "warming"
- * forever just because the heap-resident trigram BitSet is (by design) never built. Once the mmap
- * shard layer is built and serving search, code_search must report "ready" — the AI must not be
- * told to avoid code search when the shard layer already covers it.
+ * {@code WarmupManager.getStatus()}'s {@code code_search} capability must report "ready" once the
+ * mmap shard layer is built and serving search — the AI must not be told to avoid code search when
+ * the shard layer already covers it.
  */
 class WarmupManagerCodeSearchReadinessTest {
 
-    private boolean originalTrigramHeap;
-
     @BeforeEach
     void setUp() {
-        originalTrigramHeap = CodeContentIndex.TRIGRAM_HEAP;
         ContentShardIndex.clear();
     }
 
     @AfterEach
     void tearDown() {
         ContentShardIndex.clear();
-        CodeContentIndex.TRIGRAM_HEAP = originalTrigramHeap;
     }
 
     @Test
-    void codeSearchReadyWhenShardLayerBuiltEvenWithTrigramHeapOff(@TempDir Path indexDir) throws Exception {
-        CodeContentIndex.TRIGRAM_HEAP = false;
-
+    void codeSearchReadyWhenShardLayerBuilt(@TempDir Path indexDir) throws Exception {
         String hash = "deadbeefcafebabe";
         ContentShardBuilder builder = new ContentShardBuilder(indexDir, hash, 128L * 1024 * 1024);
         builder.addClass(0, "hello world this is some searchable source code");
@@ -55,6 +47,6 @@ class WarmupManagerCodeSearchReadinessTest {
         @SuppressWarnings("unchecked")
         Map<String, String> caps = (Map<String, String>) status.get("capabilities");
         assertEquals("ready", caps.get("code_search"),
-                "code_search must report ready from the shard layer when TRIGRAM_HEAP is off: " + status);
+                "code_search must report ready once the shard layer is built: " + status);
     }
 }

@@ -1,6 +1,6 @@
 package com.zin.delamain.server.routes;
 
-import com.zin.delamain.index.CodeContentIndex;
+import com.zin.delamain.index.ClassIdRegistry;
 import com.zin.delamain.index.shard.ContentShardIndex;
 
 import org.junit.jupiter.api.AfterEach;
@@ -28,7 +28,7 @@ class MemoryConfigRoutesDiagnosticsTest {
 
     @AfterEach
     void tearDown() {
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         ContentShardIndex.clear();
     }
 
@@ -86,7 +86,7 @@ class MemoryConfigRoutesDiagnosticsTest {
 
     @Test
     void reportsTheKnownHeapConsumersSoAResidualCanBeAttributed() {
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         ContentShardIndex.clear();
 
         Map<String, Object> diag = routes.buildMemoryDiagnostics(false);
@@ -94,8 +94,6 @@ class MemoryConfigRoutesDiagnosticsTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> consumers = (Map<String, Object>) diag.get("consumers");
         assertNotNull(consumers, "consumers breakdown must be present: " + diag);
-        assertEquals(0, ((Number) consumers.get("trigram_count")).intValue(),
-            "trigram_count must reflect the live index (cleared here): " + consumers);
         assertEquals(false, consumers.get("shard_index_built"),
             "shard_index_built must reflect the live shard state (cleared here): " + consumers);
     }

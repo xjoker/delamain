@@ -93,9 +93,9 @@ public final class ContentShardBuilder implements AutoCloseable {
     }
 
     /**
-     * Adds one class's trigrams using the exact same sliding window and whitespace rule as
-     * {@code CodeContentIndex.index()}. {@code lowerCaseCode} must already be lower-cased. A source
-     * shorter than 3 chars cannot be indexed and is routed to {@link #markExcluded}.
+     * Adds one class's trigrams using a sliding window and whitespace rule. {@code lowerCaseCode}
+     * must already be lower-cased. A source shorter than 3 chars cannot be indexed and is routed to
+     * {@link #markExcluded}.
      *
      * @return true if this call pushed the window over budget and triggered a flush.
      */

@@ -5,7 +5,6 @@ import com.google.gson.JsonSyntaxException;
 import com.google.gson.reflect.TypeToken;
 import com.zin.delamain.core.ApkIdentity;
 import com.zin.delamain.core.HeadlessJadxWrapper;
-import com.zin.delamain.index.CodeContentIndex;
 import com.zin.delamain.index.UsageGraphIndex;
 import com.zin.delamain.index.UsePlacesIndex;
 import com.zin.delamain.index.WarmupManager;
@@ -66,11 +65,11 @@ public class GeneralRoutes {
      * GET /index-stats
      *
      * Returns a unified health snapshot of all internal plugin indices:
-     * name indices (class/method/field), trigram content index, snapshot cache,
+     * name indices (class/method/field), mmap shard content index, snapshot cache,
      * and a summary of the upstream code cache delegation.
      *
-     * Useful for AI clients to decide whether trigram-based code search is warm
-     * enough to use efficiently, or whether to fall back to metadata searches.
+     * Useful for AI clients to decide whether code search is warm enough to use
+     * efficiently, or whether to fall back to metadata searches.
      */
     public void handleIndexStats(Context ctx) {
         try {
@@ -83,9 +82,6 @@ public class GeneralRoutes {
 
             // --- Name indices (ClassCacheManager) ---
             response.put("name_indices", ClassCacheManager.getNameIndexStats());
-
-            // --- Trigram content index (CodeContentIndex) ---
-            response.put("trigram_index", CodeContentIndex.getStats());
 
             // --- Mmap shard content index (ContentShardIndex) — dual-build coverage, not yet
             // consulted by queries (Wave B). Exposed for real-machine coverage verification. ---

@@ -20,10 +20,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>Measured on a 255,599-class APK: Phase-1 took 2h19m and throughput decayed 14x
  * (72 → 5 classes/s) purely from memory-pressure throttling. Nothing reported it. The
  * throttle only slept; the counters that would have explained it were local variables in
- * {@code runPhase1}, reported once at phase end. Meanwhile {@code /warmup-status} did
- * publish {@code trigram_build_running} — a field that is pinned false in the default
- * deployment (TRIGRAM_HEAP defaults off) — while the shard build that actually runs there
- * had no field at all. An operator polling status saw a false signal and no true one.
+ * {@code runPhase1}, reported once at phase end. Meanwhile {@code /warmup-status} had no
+ * field at all for the shard build that actually runs in production. An operator polling
+ * status had no true signal to look at.
  *
  * <p>What this test can and cannot cover: it pins that the fields exist, are wired to the
  * real state, and move when the state moves. It does NOT reproduce the 22万-class heap
@@ -47,7 +46,7 @@ class WarmupObservabilityTest {
     // ---- shard build state -------------------------------------------------
 
     @Test
-    void statusReportsShardBuildStateNotOnlyTheTrigramOne() {
+    void statusReportsShardBuildState() {
         Map<String, Object> status = WarmupManager.getStatus();
 
         assertTrue(status.containsKey("shard_build_running"),
@@ -136,14 +135,12 @@ class WarmupObservabilityTest {
 
     @Test
     void codeSearchDistinguishesBuildingFromStalled() {
-        assertEquals("ready", WarmupManager.codeSearchCapability(true, false, null));
-        assertEquals("ready", WarmupManager.codeSearchCapability(true, true, null),
+        assertEquals("ready", WarmupManager.codeSearchCapability(true, false));
+        assertEquals("ready", WarmupManager.codeSearchCapability(true, true),
                 "already serving wins over still building");
-        assertEquals("building", WarmupManager.codeSearchCapability(false, true, null),
+        assertEquals("building", WarmupManager.codeSearchCapability(false, true),
                 "a running shard build must be distinguishable from a stalled one");
-        assertEquals("warming", WarmupManager.codeSearchCapability(false, false, null));
-        assertEquals("skipped:low-heap", WarmupManager.codeSearchCapability(false, false, "heap at 86%"),
-                "a skip reason must still surface — it is why the build will never come");
+        assertEquals("warming", WarmupManager.codeSearchCapability(false, false));
     }
 
     @Test
@@ -153,9 +150,8 @@ class WarmupObservabilityTest {
         Map<String, String> caps = (Map<String, String>) status.get("capabilities");
 
         String expected = WarmupManager.codeSearchCapability(
-                ContentShardIndex.isBuilt() || CodeContentIndex.trigramCount() > 0,
-                WarmupManager.isShardBuildRunning(),
-                null);
+                ContentShardIndex.isBuilt(),
+                WarmupManager.isShardBuildRunning());
         assertEquals(expected, caps.get("code_search"),
                 "getStatus must not reimplement the rule it shares with codeSearchCapability");
     }

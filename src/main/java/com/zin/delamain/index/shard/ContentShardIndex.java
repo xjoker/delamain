@@ -19,7 +19,8 @@ import java.util.zip.CRC32;
 /**
  * Top-level registry of the mmap-backed shard layer for one loaded APK. Holds the open shards plus
  * a small in-heap tombstone set; the trigram payload lives on disk. All methods are static because
- * there is exactly one loaded APK at a time (mirrors {@code CodeContentIndex}'s static model).
+ * there is exactly one loaded APK at a time (mirrors {@link com.zin.delamain.index.ClassIdRegistry}'s
+ * static model).
  *
  * <h2>Query soundness</h2>
  * {@link #candidatesForTerm} returns a {@link TermLookupResult} whose {@code covered} set is the

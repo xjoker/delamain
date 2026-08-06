@@ -1,6 +1,6 @@
 package com.zin.delamain.server.routes;
 
-import com.zin.delamain.index.CodeContentIndex;
+import com.zin.delamain.index.ClassIdRegistry;
 import com.zin.delamain.index.shard.ContentShardBuilder;
 import com.zin.delamain.index.shard.ContentShardIndex;
 import com.zin.delamain.index.shard.ShardCatalog;
@@ -68,14 +68,14 @@ class SearchRoutesBroadTermTest {
 
     @BeforeEach
     void reset() {
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         ContentShardIndex.clear();
     }
 
     @AfterEach
     void tearDown() {
         ContentShardIndex.clear();
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         SearchRoutes.BROAD_CANDIDATE_THRESHOLD = SearchRoutes.DEFAULT_BROAD_CANDIDATE_THRESHOLD;
         SearchRoutes.BROAD_SAMPLE_SCAN = SearchRoutes.DEFAULT_BROAD_SAMPLE_SCAN;
     }
@@ -101,7 +101,7 @@ class SearchRoutesBroadTermTest {
     @Test
     void broadTermReturnsImmediateSampleInsteadOfFullScan(@TempDir Path dir) throws IOException {
         List<JavaClass> sorted = sortedClasses();
-        CodeContentIndex.preAssignIds(sorted); // idOf(sorted.get(i)) == i, ids 0..3 -> real classes
+        ClassIdRegistry.preAssignIds(sorted); // idOf(sorted.get(i)) == i, ids 0..3 -> real classes
 
         // 6 candidate ids for the term "class": ids 0-3 map to real (decompilable) classes, ids
         // 4-5 are shard-only ids with no backing JavaClass (mirrors a corpus far larger than the
@@ -150,7 +150,7 @@ class SearchRoutesBroadTermTest {
     @Test
     void narrowTermIsUnaffectedByGuardAndRunsFullScan(@TempDir Path dir) throws IOException {
         List<JavaClass> sorted = sortedClasses();
-        CodeContentIndex.preAssignIds(sorted);
+        ClassIdRegistry.preAssignIds(sorted);
 
         // Only 1 candidate (id 0) for a rare term — stays under any reasonable threshold, default
         // included, so the existing full-scan path must run unchanged.
@@ -178,7 +178,7 @@ class SearchRoutesBroadTermTest {
     @Test
     void mixedMetadataAndContentSearchDoesNotDropClassNameMatchUnderBroadGuard(@TempDir Path dir) throws IOException {
         List<JavaClass> sorted = sortedClasses();
-        CodeContentIndex.preAssignIds(sorted);
+        ClassIdRegistry.preAssignIds(sorted);
 
         // Find the real class whose name contains "mainactivity" (sg.vantagepoint.uncrackable1.MainActivity
         // in the UnCrackable-Level1 test APK) and note its pre-assigned shard id.

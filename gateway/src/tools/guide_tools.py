@@ -13,7 +13,6 @@ Delamain - Quick Start
 PRE-FLIGHT (call before heavy ops):
 1. get_decompile_status()  → check memory (<85%) and search_lock (false)
 2. get_index_stats()       → check shard_index.built/covered_classes before code search
-                              (trigram_index is now just a residual/self-heal layer)
 
 SEARCH RULES:
 - search_classes_by_keyword_tool(search_in='class,method,field') — always fast
@@ -44,7 +43,6 @@ _JADX_VERBOSE_GUIDE = """\
    - content_scan_skipped=true → the content phase was refused because no index could prefilter it
      (index still warming, or a regex/comment query); metadata matches are still complete. Retry
      only after capabilities.code_search=ready, or use a metadata search now
-   - trigram_index is now a residual/self-heal layer, not the coverage signal
 
 ## Search Decision Tree
 
@@ -170,7 +168,7 @@ _JADX_SKILL_CODEX = """\
 # JADX Reverse Engineering Workflow
 
 Pre-flight: get_decompile_status() + get_index_stats() before heavy ops
-  (check shard_index.built/covered_classes, not trigram_index — that's residual only).
+  (check shard_index.built/covered_classes).
 Search: search_in='class,method,field' is fast; use submit_code_search_tool for code.
 On broad_term=true in results: narrow the term or use search_in='class'/'method', don't retry.
 Never: search_in='code' for hex, UUID, base64, long URLs.

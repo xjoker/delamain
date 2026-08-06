@@ -310,7 +310,7 @@ def register_decompile_tools(mcp):
     async def warm_cache(
         skip_libraries: bool = True,
     ) -> dict:
-        """Manually trigger a full background cache warmup (decompile + trigram + xref graph).
+        """Manually trigger a full background cache warmup (decompile + content shard + xref graph).
 
         The server already auto-triggers this warmup right after a file is loaded (unless disabled
         via DELAMAIN_WARMUP_ON_START=false on the Java side). Call this tool yourself only when: the
@@ -345,11 +345,6 @@ def register_decompile_tools(mcp):
             - percentage: Phase-1 decompile-only completion, 0-100 (processed/total). NOT the overall
               warmup progress — use overall_progress_pct for that.
             - elapsed_seconds: seconds since this warmup run started (or total run time if finished).
-            - trigram_build_running: whether the in-memory trigram index is currently being built.
-              Stays false in the default deployment — the heap trigram layer is off by default and
-              the mmap shard build below is what actually runs; watch shard_build_running instead.
-            - trigram_count: number of trigram entries built so far (0 if using the mmap shard index
-              instead — see capabilities.code_search for the authoritative readiness signal).
             - shard_build_running: whether the mmap content-shard index is being built right now.
               This is the background build that runs by default, and the one whose absence used to
               make a stalled index indistinguishable from a finished one.
@@ -361,8 +356,6 @@ def register_decompile_tools(mcp):
               the total milliseconds slept. Summed across workers, so with N workers stalling in
               parallel pressure_sleep_ms can exceed elapsed_seconds*1000 — compare the trend between
               two polls rather than reading it as wall-clock.
-            - trigram_skip_reason: present only if trigram build was skipped, e.g. "low-heap"; absent
-              (key missing) otherwise.
             - use_places_ready: whether the precise xref-with-snippet index has finished its one-time
               harvest.
             - use_places_harvest_running / use_places_harvest_processed / use_places_harvest_total:
@@ -372,8 +365,8 @@ def register_decompile_tools(mcp):
               (key missing) otherwise.
             - warming_up: single boolean = "is anything still warming" (core pipeline OR the
               use-places harvest). False means everything below has settled into its final state.
-            - overall_progress_pct: 0-100 blended progress across ALL phases (decompile + trigram +
-              graph + use-places harvest), weighted by each phase's typical cost share. This is the
+            - overall_progress_pct: 0-100 blended progress across ALL phases (decompile + graph +
+              use-places harvest), weighted by each phase's typical cost share. This is the
               number to show a human/progress bar — percentage above is only Phase-1.
             - eta_seconds: rough estimate of seconds remaining until warmup fully settles (null while
               there isn't enough data yet, e.g. right at the start of a phase). Extrapolated from
@@ -391,8 +384,6 @@ def register_decompile_tools(mcp):
                 - "warming": not ready and no build is currently running for it. Distinct from
                   "building" — if this persists, waiting may not help (the build was cancelled or
                   never started), so check phase/running rather than polling indefinitely.
-                - "skipped:low-heap": permanently unavailable this run because the host doesn't have
-                  enough heap; do not poll waiting for "ready" — it will never arrive.
               Keys:
                 - metadata_search: class/method name and structure search. Ready as soon as the APK
                   is loaded (does not depend on warmup).
@@ -404,11 +395,9 @@ def register_decompile_tools(mcp):
                   after that, individual live-decompile calls are fast.
                 - code_search: full-text/regex search over decompiled code bodies
                   (search_in='code' on the search tool). Do NOT issue search_in='code' calls while
-                  this is not "ready" — results will be empty or incomplete, not just slow. If this
-                  is "skipped:low-heap", code-body search is unavailable for the whole session; use
-                  metadata_search (name/structure) instead. "building" means the shard index is
-                  being built and will become ready; "warming" without a running build means it
-                  will not on its own.
+                  this is not "ready" — results will be empty or incomplete, not just slow.
+                  "building" means the shard index is being built and will become ready; "warming"
+                  without a running build means it will not on its own.
                 - xref_class_level: class-level cross-reference graph (who calls/uses this class).
                   "warming" until the usage graph index finishes building.
                 - precise_xref_snippets: cross-references with exact call-site source snippets (as

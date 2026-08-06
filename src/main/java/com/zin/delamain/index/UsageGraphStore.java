@@ -12,9 +12,9 @@ import java.util.zip.CheckedOutputStream;
 /**
  * Persists the {@link UsageGraphIndex} class-level reverse graph to disk so a cold restart
  * skips re-harvesting (and, more importantly, lets xref answer instantly without re-decompiling
- * callers). Mirrors {@link PersistentIndexStore}'s format conventions (magic + version + atomic
- * move) and reuses its {@code {input_hash}.graph} naming so the file is invalidated when the
- * loaded APK changes.
+ * callers). Uses the same format conventions as this package's other persisted indices (magic +
+ * version + atomic move) and a {@code {input_hash}.graph} naming so the file is invalidated when
+ * the loaded APK changes.
  *
  * <h2>File format</h2>
  * <pre>

@@ -1,6 +1,6 @@
 package com.zin.delamain.server.routes;
 
-import com.zin.delamain.index.CodeContentIndex;
+import com.zin.delamain.index.ClassIdRegistry;
 import com.zin.delamain.index.shard.ContentShardIndex;
 
 import jadx.api.JadxArgs;
@@ -59,16 +59,16 @@ class SearchRoutesNoBulkLiveDecompileTest {
         sorted = new ArrayList<>(jadx.getClasses());
         sorted.sort(Comparator.comparing(JavaClass::getRawName));
         assertTrue(sorted.size() >= 4, "test APK must yield at least 4 classes");
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         ContentShardIndex.clear();
-        CodeContentIndex.preAssignIds(sorted);
+        ClassIdRegistry.preAssignIds(sorted);
         SearchRoutes.PARALLEL_SCAN_MIN_CLASSES = 1; // drive the branch production takes
     }
 
     @AfterEach
     void tearDown() {
         SearchRoutes.PARALLEL_SCAN_MIN_CLASSES = SearchRoutes.DEFAULT_PARALLEL_SCAN_MIN_CLASSES;
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         ContentShardIndex.clear();
         if (jadx != null) jadx.close();
     }

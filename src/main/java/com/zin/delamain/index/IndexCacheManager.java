@@ -20,8 +20,8 @@ import java.util.regex.Pattern;
  * Disk-cache LRU retention for per-{@code inputHash} index artifacts.
  *
  * <p><b>Why.</b> Every distinct APK analyzed leaves a full set of on-disk artifacts (decompiled
- * source in {@link CodeStore}, trigram index, usage graph, precise use-places, mmap content
- * shards, manifest) under {@code --index-dir}. Nothing previously bounded the total size across
+ * source in {@link CodeStore}, usage graph, precise use-places, mmap content shards, manifest)
+ * under {@code --index-dir}. Nothing previously bounded the total size across
  * multiple analyzed APKs, so the volume grows unbounded. This class enforces a size quota by
  * deleting the least-recently-used complete artifact group (all files for one {@code inputHash})
  * until usage drops back under a low-water mark, while never touching the group of the APK
@@ -31,7 +31,8 @@ import java.util.regex.Pattern;
  * <h2>Artifact group (one {@code inputHash}, deleted atomically as a unit)</h2>
  * <ul>
  *   <li>{@code code/{inputHash8}/} — {@link CodeStore} directory (usually the largest piece)</li>
- *   <li>{@code {inputHash}.idx} — {@link PersistentIndexStore} trigram index</li>
+ *   <li>{@code {inputHash}.idx} — legacy trigram index (no longer written; still cleaned up here
+ *       if present from an older index volume)</li>
  *   <li>{@code {inputHash}.graph} — {@link UsageGraphStore} usage graph</li>
  *   <li>{@code {inputHash}.useplaces} — {@link UsePlacesStore} precise use-places</li>
  *   <li>{@code {inputHash}.shard.N} + {@code {inputHash}.shardcat} — mmap content shards

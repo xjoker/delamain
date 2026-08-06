@@ -56,8 +56,9 @@ Two path sets get special auth treatment:
 Built to let a large APK (hundreds of thousands of classes) be searched and
 decompiled without the memory blow-up of holding everything in JVM heap:
 
-- **`CodeContentIndex`** — an in-memory trigram inverted index over
-  decompiled source, used for fast `code`/`comment` search hits.
+- **`ClassIdRegistry`** — the class↔integer id space. Ids are assigned in a
+  deterministic sorted order so the same APK yields the same ids across
+  restarts, which is what lets the on-disk shard layer address classes by id.
 - **`CodeStore`** — persisted decompiled source, keyed by class, so a
   restart doesn't require re-decompiling everything on disk.
 - **`UsageGraphIndex` / `UsageGraphStore`** — the class/method usage graph
@@ -69,22 +70,26 @@ decompiled without the memory blow-up of holding everything in JVM heap:
   `ContentShardIndex`, `ShardCatalog`, `TermLookupResult`) — the mmap'd
   on-disk shard layer (`.shard.N` files plus a `.shardcat` catalog). Shards
   are memory-mapped, read-only, and **do not consume JVM heap**, which is
-  what keeps code search available on low-heap hosts where a purely
-  in-memory trigram index would otherwise have to be skipped under memory
-  pressure.
-- **`PersistentIndexStore`**, **`IndexCacheManager`** — coordinate loading
+  what keeps code search available on low-heap hosts. This is the only
+  content-search index; a heap-resident trigram index existed alongside it
+  until it was removed, having been off by default and superseded here.
+- **`IndexCacheManager`** — coordinates loading
   an existing `--index-dir` on startup (`FAST_RESTORE`: if the directory
   already has a complete, hash-matched index for the loaded APK, startup
   skips the full Phase-1 decompile + index build) and writing a new one
   after warmup. See `docs/prebaked-index.md` for the operational workflow
   (building an index volume on a large-heap host, shipping it to a
   low-spec one, and verifying it's complete via `/index-stats`).
-- **`WarmupManager`** — drives the background warmup: Phase 1 (parallel
-  decompile across `--workers` threads) then Phase 2 (trigram index build).
-  The server serves requests during warmup; capability coverage opens up
-  progressively as `WarmupManager` reports phase and percentage.
-- **`MemoryConfig`** — heap-aware tuning knobs (e.g. trigram cap) so the
-  index stack degrades predictably instead of OOMing on constrained hosts.
+- **`WarmupManager`** — drives the background warmup: parallel decompile
+  across `--workers` threads, then the usage graph, then a background mmap
+  shard build and use-places harvest. The server serves requests during
+  warmup; capability coverage opens up progressively as `WarmupManager`
+  reports phase and percentage. `/warmup-status` also reports whether the
+  shard build is running and whether workers are currently throttled by
+  memory pressure — on an under-provisioned host that throttling, not the
+  class count, is what turns a short warmup into a multi-hour one.
+- **`MemoryConfig`** — heap-aware tuning knobs so the index stack degrades
+  predictably instead of OOMing on constrained hosts.
 
 `CodeSearchCoordinator` and `TicketRegistry` (in `utils`) implement the
 submit/poll ticket pattern for anything that can take longer than a single

@@ -2,7 +2,7 @@
 
 > Background: the index directory under `--index-dir` (`.graph` usage graph /
 > `code/` CodeStore / `.shard.N` mmap shards / `.shardcat` shard catalog /
-> `.idx` trigram index) is already a portable set of files keyed by the APK's
+> mmap content shards) is already a portable set of files keyed by the APK's
 > `inputHash` — copy the whole directory to another machine, start it against
 > **the same APK**, and it goes straight into `FAST_RESTORE` (second-scale
 > load), skipping the Phase-1 full decompile and index build. This document
@@ -20,7 +20,7 @@ On a machine with enough memory, run one full warmup against the target APK
 # target APK already loaded
 curl -X POST http://localhost:18650/cache/warmup
 
-# poll until running=false and every background task (trigram / shard /
+# poll until running=false and every background task (shard /
 # use-places harvest) has finished
 curl -s http://localhost:18650/cache/warmup-status | jq '.running, .phase, .warming_up'
 ```
@@ -31,7 +31,6 @@ APK size). Once it's done, `--index-dir` holds a full set of files named by
 
 ```
 <inputHash>.graph          # usage graph
-<inputHash>.idx            # trigram index
 <inputHash>.shardcat       # mmap shard catalog
 <inputHash>.shard.0 ...    # mmap shard files
 <inputHash>.useplaces      # precise reference locations
@@ -70,7 +69,8 @@ Once started, the service automatically detects the existing
 under `--index-dir` and takes the `FAST_RESTORE` branch — completing in
 seconds instead of the multi-minute Phase-1 full decompile and index build.
 
-**Verified on low-spec hardware**: a purely in-memory trigram index gets
+**Verified on low-spec hardware**: a purely in-memory trigram index (removed in a
+later version, but the measurement is why the shard layer exists) gets
 skipped under memory pressure on a constrained heap (0% availability, code
 search permanently degraded to `skipped:low-heap`); with delamain's mmap
 shard index (the `.shardcat`/`.shard.N` files carried in this volume), code

@@ -1,8 +1,7 @@
 package com.zin.delamain.server.routes;
 
 import com.zin.delamain.core.HeadlessJadxWrapper;
-import com.zin.delamain.index.CodeContentIndex;
-import com.zin.delamain.index.PersistentIndexStore;
+import com.zin.delamain.index.ClassIdRegistry;
 import com.zin.delamain.index.WarmupManager;
 import com.zin.delamain.index.shard.ContentShardIndex;
 import com.zin.delamain.server.AuthConfig;
@@ -57,7 +56,7 @@ class FileManagementRoutesReloadIdentityTest {
             Thread.sleep(200);
         }
         ContentShardIndex.clear();
-        CodeContentIndex.clear();
+        ClassIdRegistry.clear();
         if (wrapper != null) {
             wrapper.close();
         }
@@ -79,9 +78,8 @@ class FileManagementRoutesReloadIdentityTest {
 
         // Precondition: A and B are genuinely different inputs (distinct input hashes), so a stale
         // A-hash after loading B would be an observably wrong identity — the bug this guards.
-        PersistentIndexStore store = new PersistentIndexStore(indexDir);
-        String hashAExpected = store.computeInputHash(List.of(root.resolve("a.apk").toFile()));
-        String hashBExpected = store.computeInputHash(List.of(root.resolve("b.apk").toFile()));
+        String hashAExpected = WarmupManager.computeInputHash(List.of(root.resolve("a.apk").toFile()));
+        String hashBExpected = WarmupManager.computeInputHash(List.of(root.resolve("b.apk").toFile()));
         assertNotEquals(hashAExpected, hashBExpected, "A and B must have distinct input hashes");
 
         FilePathSandbox sandbox = new FilePathSandbox(root);
