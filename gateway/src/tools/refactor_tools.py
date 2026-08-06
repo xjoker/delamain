@@ -178,17 +178,26 @@ def register_refactor_tools(mcp):
         """Unified rename for classes, methods, fields, and packages. Triggers 30s cache cooldown.
 
         This only changes the JADX display alias, never the class/method/field's actual
-        (bytecode) name — the response echoes raw_name/raw_class_name+raw_method_name/
-        raw_class_name+raw_field_name (per target_type) so you keep the one identifier
-        Frida/Xposed can still target after the rename.
+        (bytecode) name — for class/method/field the response echoes the raw name so you keep
+        the one identifier Frida/Xposed can still target after the rename.
 
         Args:
             target_type: class|method|field|package. old_name: Current name. new_name: New name.
             class_name: Required for method/field. method_signature: JVM descriptor for overloads.
             dry_run: Preview without renaming.
         Returns:
-            dict: {result: str, raw_name|raw_class_name+raw_method_name|raw_class_name+
-            raw_field_name} on success, or dry_run: {target_exists: bool, target_info: {...}}
+            The shape depends on target_type — package is a bulk operation and does NOT follow
+            the single-target shape:
+            - class:   {result: str, raw_name: str}
+            - method:  {result: str, raw_class_name: str, raw_method_name: str}
+            - field:   {result: str, raw_class_name: str, raw_field_name: str}
+            - package: {renamed: int, total: int, errors: [str], interrupted: bool} — renames
+                       every class under the package; names no individual class, so it carries
+                       no raw name. interrupted=true means an orderly partial batch (everything
+                       counted in 'renamed' is committed), not a failure.
+            dry_run (any target_type): {dry_run: true, target_exists: bool, target_type: str,
+                       target_info: {...} | None}
+            Rejected input (missing class_name, unknown target_type): {success: false, error: str}.
         """
         target_type_lower = target_type.lower()
 
