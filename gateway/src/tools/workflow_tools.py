@@ -11,6 +11,7 @@ ever one backend, so there is no "route to a different instance" option —
 callers who want a fresh load use replace, and dependency JARs use append.
 """
 
+from ..busy_tracker import InstanceBusyTracker
 from ..registry.instance_registry import InstanceRegistry
 from ..routing.request_router import get_from_jadx
 from ..logging_config import get_logger
@@ -190,14 +191,23 @@ async def list_loaded_files() -> dict:
     file_info = await _fetch_file_info(target)
     warmup_status = await _fetch_warmup_status(target)
 
-    available = _instance_has_no_file(file_info)
+    has_no_file = _instance_has_no_file(file_info)
     identity = file_info.get("apk_identity") or {}
-    loaded_file = None if available else (
+    loaded_file = None if has_no_file else (
         file_info.get("file_name") or identity.get("file_name") or file_info.get("apk_package") or None
     )
 
     progress = warmup_status.get("percentage") or 0.0
     decompile_progress = round(float(progress) / 100.0, 2) if isinstance(progress, (int, float)) else 0.0
+
+    # "Has a file" and "is free" are different questions; this tool used to answer the first
+    # while calling it the second. Whether the backend can take work now comes from the lane
+    # scheduler, which is the only component that actually knows.
+    snapshot = InstanceBusyTracker.get_snapshot()
+    busy = any(
+        snapshot.get(lane, 0) > 0
+        for lane in ("metadata_inflight", "code_read_inflight", "analysis_inflight", "exclusive_inflight")
+    )
 
     return {
         "name": target.name,
@@ -205,7 +215,8 @@ async def list_loaded_files() -> dict:
         "port": target.port,
         "loaded_file": loaded_file,
         "decompile_progress": decompile_progress,
-        "available": available,
+        "file_loaded": not has_no_file,
+        "busy": busy,
         "version_name": file_info.get("version_name") or identity.get("version_name"),
         "version_code": (
             file_info.get("version_code")
@@ -243,8 +254,15 @@ def register_workflow_tools(mcp):
     async def list_loaded_files_tool() -> dict:
         """Show what APK/JAR the JADX backend is currently analyzing and whether it is free.
 
+        file_loaded and busy answer different questions and are both needed to decide
+        whether to send work now: a backend can hold a fully warmed APK (file_loaded=true)
+        and still be free (busy=false), which is the normal steady state.
+
         Returns:
-            dict: {name, host, port, loaded_file, decompile_progress, available,
+            dict: {name, host, port, loaded_file, decompile_progress,
+                   file_loaded: bool — a file is open on the backend,
+                   busy: bool — an operation is in flight right now (any lane); when true,
+                     a heavy call may come back INSTANCE_BUSY,
                    version_name, version_code, input_hash} — or
                   {error: "NO_INSTANCE", message} when no backend is configured.
         """

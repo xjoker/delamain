@@ -87,7 +87,7 @@ async def test_list_loaded_files_returns_flat_shape(monkeypatch):
     assert "count" not in result
     assert "free_count" not in result
     assert result["loaded_file"] == "target.apk"
-    assert result["available"] is False
+    assert result["file_loaded"] is True
     assert result["input_hash"] == "abc123"
     assert result["name"] == "jadx"
     assert result["decompile_progress"] == 0.5
@@ -133,13 +133,13 @@ async def test_list_loaded_files_reflects_file_info_identity(monkeypatch):
     result = await workflow_tools.list_loaded_files()
 
     assert result["loaded_file"] == "9290803.apk"
-    assert result["available"] is False
+    assert result["file_loaded"] is True
     assert result["version_name"] == "3.2.1"
     assert result["version_code"] == 321
 
 
 @pytest.mark.asyncio
-async def test_list_loaded_files_reports_available_when_nothing_loaded(monkeypatch):
+async def test_list_loaded_files_reports_no_file_loaded_when_nothing_loaded(monkeypatch):
     InstanceRegistry.configure(host="127.0.0.1", port=8650, name="jadx")
 
     async def fake_get_from_jadx(endpoint, *args, **kwargs):
@@ -154,4 +154,4 @@ async def test_list_loaded_files_reports_available_when_nothing_loaded(monkeypat
     result = await workflow_tools.list_loaded_files()
 
     assert result["loaded_file"] is None
-    assert result["available"] is True
+    assert result["file_loaded"] is False
