@@ -4,9 +4,17 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.zin.delamain.utils.ClassCacheManager;
 import com.zin.delamain.utils.JadxSearchLock;
+import jadx.api.JadxArgs;
 import jadx.api.JavaClass;
 import jadx.api.JavaField;
 import jadx.api.JavaMethod;
+import jadx.api.JavaVariable;
+import jadx.api.data.ICodeData;
+import jadx.api.data.ICodeRename;
+import jadx.api.data.impl.JadxCodeData;
+import jadx.api.data.impl.JadxCodeRef;
+import jadx.api.data.impl.JadxCodeRename;
+import jadx.api.data.impl.JadxNodeRef;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -17,8 +25,9 @@ import java.util.*;
 /**
  * Persistent rename / alias store for headless JADX rename operations.
  *
- * <h2>Strategy: Method A — direct ClassNode/MethodNode/FieldNode rename</h2>
- * <p>JADX 1.5.5 exposes the following public API chain that works without any GUI:</p>
+ * <h2>Two strategies, because nodes and locals do not behave the same</h2>
+ * <p><b>Classes, methods, fields — alias on the node.</b> JADX exposes a public API chain that
+ * works without any GUI:</p>
  * <ul>
  *   <li>{@code JavaClass.getClassNode().rename(newName)}</li>
  *   <li>{@code JavaMethod.getMethodNode().rename(newName)}</li>
@@ -29,14 +38,22 @@ import java.util.*;
  * reflect the new name.  The previous decompiled code cache should be invalidated by
  * calling {@code classNode.unloadFromCache()} after renaming.</p>
  *
+ * <p><b>Local variables — a rule, not an alias.</b> The equivalent {@code VarNode.setName()}
+ * does <em>not</em> survive, because a local's name is rebuilt from bytecode on every decompile;
+ * the {@code unloadFromCache()} that publishes the other three renames is what erases this one.
+ * Locals therefore go through {@code JadxCodeRename} rules in {@link jadx.api.JadxArgs}'s code
+ * data, re-applied on each decompile by {@code CodeRenameVisitor}. See
+ * {@link #renameVariable}.</p>
+ *
  * <h2>Persistence format</h2>
  * Renames are serialised as a JSON file ({@code renames.json}) in the supplied data
  * directory:
  * <pre>
  * {
- *   "classes":  { "com.example.a": "com.example.LoginActivity" },
- *   "methods":  { "com.example.a#a()V": "doLogin" },
- *   "fields":   { "com.example.a#b:Ljava/lang/String;": "userId" }
+ *   "classes":   { "com.example.a": "com.example.LoginActivity" },
+ *   "methods":   { "com.example.a#a()V": "doLogin" },
+ *   "fields":    { "com.example.a#b:Ljava/lang/String;": "userId" },
+ *   "variables": { "com.example.a#a()V#2:2": "aesCipher" }
  * }
  * </pre>
  * Keys follow the convention below:
@@ -45,7 +62,11 @@ import java.util.*;
  *   <li>methods — {@code declaringClass#methodShortId}  (shortId = name + descriptor,
  *       e.g. {@code a()V})</li>
  *   <li>fields  — {@code declaringClass#fieldName:fieldType}</li>
+ *   <li>variables — {@code declaringClass#methodShortId#reg:ssa} (see {@link #variableKey})</li>
  * </ul>
+ *
+ * <p>This file records what was renamed; it is not a restore mechanism. Nothing re-applies it to
+ * a fresh session — true for all four kinds alike, not a gap specific to variables.</p>
  *
  * <h2>Thread safety</h2>
  * All public mutating methods are {@code synchronized}.  Read methods ({@code getXxxAlias})
@@ -75,8 +96,9 @@ public class RenameStorage {
         Files.createDirectories(dataDir);
         this.storagePath = dataDir.resolve("renames.json");
         this.data = loadFromDisk();
-        logger.info("[RenameStorage] Loaded {} class / {} method / {} field rename(s) from {}",
-                data.classes.size(), data.methods.size(), data.fields.size(), storagePath);
+        logger.info("[RenameStorage] Loaded {} class / {} method / {} field / {} variable rename(s) from {}",
+                data.classes.size(), data.methods.size(), data.fields.size(),
+                data.variables.size(), storagePath);
     }
 
     // -------------------------------------------------------------------------
@@ -185,6 +207,86 @@ public class RenameStorage {
         logger.info("[RenameStorage] Renamed field '{}' → '{}'", key, newName);
     }
 
+    /**
+     * Renames a local variable and persists the mapping.
+     *
+     * <h3>Why this one is not like the other three</h3>
+     * Class/method/field renames set an alias on a node that outlives decompilation, so
+     * {@code node.rename()} + {@code unloadFromCache()} is enough. A local variable's name lives
+     * in SSA state that is rebuilt from bytecode on every decompile, so mutating
+     * {@code VarNode.setName()} is discarded by the very {@code unloadFromCache()} that is
+     * supposed to publish it — measured, not assumed.
+     *
+     * <p>The durable form is therefore a <em>rule</em>: a {@link JadxCodeRename} keyed by
+     * method + (reg, ssa), registered in {@link JadxArgs#setCodeData}, which
+     * {@code jadx.core.dex.visitors.rename.CodeRenameVisitor} re-applies on every decompile.
+     * {@code reloadCodeData()} only notifies that visitor to rebuild its map, so this costs
+     * O(renames) and does not invalidate anything globally — the one class whose code is now
+     * stale is unloaded explicitly below.</p>
+     *
+     * @param wrapper owner of the decompiler whose code data holds the rename rules
+     * @param var     target variable; must not be null
+     * @param newName new variable name
+     */
+    public synchronized void renameVariable(HeadlessJadxWrapper wrapper, JavaVariable var, String newName)
+            throws IOException {
+        Objects.requireNonNull(wrapper, "wrapper");
+        Objects.requireNonNull(var, "var");
+        Objects.requireNonNull(newName, "newName");
+
+        String key = variableKey(var);
+        JavaClass declaringClass = var.getDeclaringClass();
+
+        if (!JadxSearchLock.tryAcquire(JadxSearchLock.LOCK_TIMEOUT_SECONDS)) {
+            throw new IOException("Timed out waiting for search lock before renaming variable '" + key + "'");
+        }
+        try {
+            applyVariableRenameRule(wrapper, var, newName);
+            if (declaringClass != null) {
+                // Only this class's code is now stale; reloadCodeData() itself invalidates nothing.
+                declaringClass.getClassNode().unloadFromCache();
+                ClassCacheManager.invalidateCode(declaringClass.getFullName());
+            }
+        } finally {
+            JadxSearchLock.release();
+        }
+
+        putAndSave(data.variables, key, newName);
+        logger.info("[RenameStorage] Renamed variable '{}' → '{}'", key, newName);
+    }
+
+    /**
+     * Adds (or replaces) the code-rename rule for one variable, preserving every rule already
+     * registered. {@link JadxArgs#getCodeData} holds a single immutable-by-convention list, so it
+     * is rebuilt rather than mutated in place.
+     */
+    private static void applyVariableRenameRule(HeadlessJadxWrapper wrapper, JavaVariable var, String newName) {
+        JadxArgs args = wrapper.getArgs();
+        ICodeData existing = args.getCodeData();
+
+        JadxNodeRef methodRef = JadxNodeRef.forMth(var.getMth());
+        JadxCodeRef varRef = JadxCodeRef.forVar(var);
+
+        List<ICodeRename> renames = new ArrayList<>();
+        if (existing != null && existing.getRenames() != null) {
+            for (ICodeRename r : existing.getRenames()) {
+                // Renaming the same variable twice replaces the rule instead of stacking a second
+                // one whose relative order would decide the winner.
+                if (methodRef.equals(r.getNodeRef()) && varRef.equals(r.getCodeRef())) continue;
+                renames.add(r);
+            }
+        }
+        renames.add(new JadxCodeRename(methodRef, varRef, newName));
+
+        JadxCodeData codeData = new JadxCodeData();
+        codeData.setRenames(renames);
+        if (existing != null && existing.getComments() != null) {
+            codeData.setComments(new ArrayList<>(existing.getComments()));
+        }
+        args.setCodeData(codeData);
+        wrapper.getJadx().reloadCodeData();
+    }
+
     // -------------------------------------------------------------------------
     // String-key convenience methods (for serialisation / restore on reload)
     // -------------------------------------------------------------------------
@@ -232,10 +334,14 @@ public class RenameStorage {
         return Collections.unmodifiableMap(data.fields);
     }
 
+    public Map<String, String> getAllVariableRenames() {
+        return Collections.unmodifiableMap(data.variables);
+    }
+
     /** Returns total number of persisted renames (all node types combined). */
     public int size() {
         RenameData d = data;
-        return d.classes.size() + d.methods.size() + d.fields.size();
+        return d.classes.size() + d.methods.size() + d.fields.size() + d.variables.size();
     }
 
     /** True once loading hit a corrupt/unparseable {@code renames.json} this session -- this
@@ -266,6 +372,21 @@ public class RenameStorage {
         String declaringClass = field.getDeclaringClass() != null
                 ? field.getDeclaringClass().getFullName() : "<unknown>";
         return declaringClass + "#" + field.getFieldNode().getFieldInfo().getShortId();
+    }
+
+    /**
+     * {@code declaringClass#methodShortId#reg:ssa}  e.g. {@code com.example.a#a()V#2:2}
+     *
+     * <p>Register + SSA version rather than the variable's current name, because the name is what
+     * is being changed and because one name can map to several distinct variables in a method
+     * (two loops each declaring {@code i}). Reg/SSA is what {@link JadxCodeRef#forVar} keys on.</p>
+     */
+    public static String variableKey(JavaVariable var) {
+        JavaMethod mth = var.getMth();
+        String declaringClass = mth != null && mth.getDeclaringClass() != null
+                ? mth.getDeclaringClass().getFullName() : "<unknown>";
+        String shortId = mth != null ? mth.getMethodNode().getMethodInfo().getShortId() : "<unknown>";
+        return declaringClass + "#" + shortId + "#" + var.getReg() + ":" + var.getSsa();
     }
 
     // -------------------------------------------------------------------------
@@ -509,5 +630,8 @@ public class RenameStorage {
         Map<String, String> classes = new LinkedHashMap<>();
         Map<String, String> methods = new LinkedHashMap<>();
         Map<String, String> fields  = new LinkedHashMap<>();
+        // Absent from files written before variable rename existed; Gson leaves the initialiser
+        // in place for a missing key, so an older renames.json still loads.
+        Map<String, String> variables = new LinkedHashMap<>();
     }
 }

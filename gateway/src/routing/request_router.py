@@ -23,6 +23,8 @@ _METADATA_ENDPOINTS = frozenset({
     "class-info", "methods-of-class", "fields-of-class", "all-classes",
     "search-classes-by-keyword", "search-native-methods", "file-info",
     "package-classes", "decompile-status", "apk-info", "memory-diagnostics",
+    # rename-variable is deliberately absent: unlike its three siblings it has to decompile the
+    # class to locate the variable, so it belongs in the 120s code-read tier it falls back to.
     "rename-class", "rename-method", "rename-field", "method-signature",
 })
 _HEALTH_ENDPOINTS = frozenset({"health", "start-warmup", "warmup-status"})

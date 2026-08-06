@@ -178,37 +178,17 @@ async def test_generate_apk_digest_total_classes_from_pagination(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# (5) rename_variable: headless JADX has no SSA rename — the endpoint answers 501
-#     with a redirect, and get_from_jadx passes that body through verbatim.
+# (5) rename_variable: RefactoringRoutes#handleRenameVariable 的两种真实响应。
+#     这两条走真实的 httpx 路径（本文件其它用例都 monkeypatch 掉了 get_from_jadx），
+#     因为要证的正是 get_from_jadx 自己那一段：非 2xx 的响应体原样透出、HTTP 状态码被丢弃。
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_rename_variable_returns_the_501_redirect_body_verbatim(monkeypatch):
-    """RefactoringRoutes#handleRenameVariable 恒定返回 501。
-
-    这个 shape 一直是对的，错的是 gateway 文档（曾写成 ``{result: str}`` / 404）。这条测试把
-    真实形状钉住：真跑 get_from_jadx 的 httpx 路径（而不是像本文件其它用例那样 monkeypatch 掉
-    它），因为要证明的正是「非 2xx 的响应体会原样透出、HTTP 状态码本身则被丢弃」这一段。
-
-    哪天 headless 真的实现了变量重命名，这条会变红——那时文档也必须跟着改。
-    """
+async def _rename_variable_against(monkeypatch, status: int, java_body: dict, **kwargs) -> dict:
     InstanceRegistry.configure(host="127.0.0.1", port=8650, name="jadx")
-
-    java_body = {
-        "status": "not_implemented_headless",
-        "message": (
-            "Variable rename is not available in headless mode. "
-            "SSA variable tracking requires JADX GUI's EDT processing pipeline."
-        ),
-        "alternatives": [
-            {"tool": "rename_method", "description": "Rename the method containing the variable"},
-            {"tool": "get_class_source", "description": "View the class source to understand variable usage"},
-        ],
-    }
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/rename-variable"
-        return httpx.Response(501, json=java_body)
+        return httpx.Response(status, json=java_body)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
@@ -217,14 +197,53 @@ async def test_rename_variable_returns_the_501_redirect_body_verbatim(monkeypatc
 
     monkeypatch.setattr(request_router, "get_http_client", fake_get_http_client)
     try:
-        result = await refactor_tools.rename_variable(
+        return await refactor_tools.rename_variable(
             class_name="com.example.Foo", method_name="bar",
-            variable_name="v0", new_name="counter",
+            variable_name="v0", new_name="counter", **kwargs,
         )
     finally:
         await client.aclose()
 
+
+@pytest.mark.asyncio
+async def test_rename_variable_success_carries_result_and_raw_names(monkeypatch):
+    """成功形状：{result, raw_class_name, raw_method_name, variable}。
+
+    局部变量本身不可 hook（在字节码里就是寄存器），但这个响应点名了类和方法，所以按红线必须
+    带上它们的原始混淆名。
+    """
+    java_body = {
+        "result": "Renamed variable cipher to aesCipher",
+        "raw_class_name": "sg.vantagepoint.a.a",
+        "raw_method_name": "a",
+        "variable": {"name": "aesCipher", "previous_name": "cipher", "reg": 2, "ssa": 2},
+    }
+
+    result = await _rename_variable_against(monkeypatch, 200, java_body)
+
     assert result == java_body
-    # The 501 itself is not surfaced — 'status' in the body is the only signal a caller gets.
-    assert "result" not in result
-    assert result["status"] == "not_implemented_headless"
+    assert result["raw_class_name"] == "sg.vantagepoint.a.a"
+
+
+@pytest.mark.asyncio
+async def test_rename_variable_ambiguous_name_returns_candidates_verbatim(monkeypatch):
+    """一个名字在同一方法里可能对应多个变量（两个循环各自的 i）。
+
+    这时 Java 返回 409 + candidates 而不是随便挑一个。409 本身不会透到调用方——
+    body 里的 candidates 是唯一的信号，这正是要钉住的那段透传行为。
+    """
+    java_body = {
+        "error": "'i' matches 2 distinct variables in com.example.Foo#bar",
+        "hint": "Repeat the call with reg and ssa from one of the candidates below.",
+        "candidates": [
+            {"name": "i", "reg": 1, "ssa": 1},
+            {"name": "i", "reg": 1, "ssa": 3},
+        ],
+    }
+
+    result = await _rename_variable_against(monkeypatch, 409, java_body)
+
+    assert result == java_body
+    assert len(result["candidates"]) == 2
+    # The 409 itself is not surfaced — the body is all a caller ever sees.
+    assert "status_code" not in result

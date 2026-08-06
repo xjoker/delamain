@@ -8,9 +8,13 @@ import com.google.gson.JsonParseException;
 import io.javalin.Javalin;
 import io.javalin.http.Context;
 
+import jadx.api.ICodeInfo;
 import jadx.api.JavaClass;
 import jadx.api.JavaField;
 import jadx.api.JavaMethod;
+import jadx.api.JavaNode;
+import jadx.api.JavaVariable;
+import jadx.api.metadata.ICodeAnnotation;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,8 +36,10 @@ import com.zin.delamain.utils.JadxApiAdapter;
  * Rename operations use {@link RenameStorage} (direct ClassNode/MethodNode/FieldNode rename + JSON persistence)
  * instead of the GUI {@code NodeRenamedByUser} event bus that is unavailable in headless mode.
  *
- * Variable rename ({@code /rename-variable}) is not implemented in headless mode because
- * SSA variable tracking requires Swing EDT processing; it returns a 501 NOT_IMPLEMENTED response.
+ * Variable rename ({@code /rename-variable}) needs a different mechanism from the other three:
+ * a local's name is rebuilt from bytecode on every decompile, so it is expressed as a
+ * {@code JadxCodeRename} rule rather than an alias on a node. See
+ * {@link RenameStorage#renameVariable}.
  */
 public class RefactoringRoutes {
     private static final Logger logger = LoggerFactory.getLogger(RefactoringRoutes.class);
@@ -612,20 +618,143 @@ public class RefactoringRoutes {
     }
 
     /**
-     * Variable rename is not implemented in headless mode.
-     * SSA variable tracking requires JADX GUI's Swing EDT processing pipeline
-     * which is unavailable in headless operation.
+     * Renames a local variable in a decompiled method.
+     *
+     * <p>The GUI identifies the variable by where you clicked. Headless has no click, so the
+     * variable is located by name within the named method, reading the same code metadata the
+     * GUI reads ({@code DECLARATION} annotations wrapping a {@code VarNode}). One name can belong
+     * to several distinct variables in a method — two loops each declaring {@code i} — so when the
+     * name alone is ambiguous the request is refused with the candidates and their reg/ssa rather
+     * than a coin flip; {@code reg}/{@code ssa} then pick one.</p>
      */
     public void handleRenameVariable(Context ctx) {
-        ctx.status(501).json(Map.of(
-            "status", "not_implemented_headless",
-            "message", "Variable rename is not available in headless mode. " +
-                "SSA variable tracking requires JADX GUI's EDT processing pipeline.",
-            "alternatives", List.of(
-                Map.of("tool", "rename_method", "description", "Rename the method containing the variable"),
-                Map.of("tool", "get_class_source", "description", "View the class source to understand variable usage")
-            )
-        ));
+        JsonObject requestBody = parseJsonBody(ctx);
+        if (requestBody == null) return;
+
+        String className = getBodyString(requestBody, "class_name");
+        String methodName = getBodyString(requestBody, "method_name");
+        String variableName = getBodyString(requestBody, "variable_name");
+        String newName = getBodyString(requestBody, "new_name");
+        // The existing validateParams overloads hardcode class/field parameter names, so this one
+        // names its own missing field rather than reporting a generic "Missing required parameters".
+        String missing = firstMissing(
+                "class_name", className, "method_name", methodName,
+                "variable_name", variableName, "new_name", newName);
+        if (missing != null) {
+            ctx.status(400).json(Map.of("error", "Missing required parameter '" + missing + "'"));
+            return;
+        }
+
+        Integer reg = parseOptionalInt(requestBody, "reg");
+        Integer ssa = parseOptionalInt(requestBody, "ssa");
+
+        try {
+            if (ClassCacheManager.getStatus() == ClassCacheManager.CacheStatus.NOT_INITIALIZED) {
+                ClassCacheManager.initCache(wrapper);
+            }
+            JavaClass cls = ClassCacheManager.findClass(ClassCacheManager.getCache(), className);
+            if (cls == null) {
+                ctx.status(404).json(Map.of("error", "Class " + className + " not found."));
+                return;
+            }
+
+            List<JavaVariable> inMethod = collectVariables(cls, methodName);
+            if (inMethod.isEmpty()) {
+                ctx.status(404).json(Map.of(
+                    "error", "No local variables found in " + className + "#" + methodName,
+                    "hint", "The method may have no named locals, or the method name may be wrong. "
+                        + "get_method_source shows what the decompiled body actually declares."));
+                return;
+            }
+
+            List<JavaVariable> matches = new ArrayList<>();
+            for (JavaVariable v : inMethod) {
+                if (!variableName.equals(v.getName())) continue;
+                if (reg != null && reg != v.getReg()) continue;
+                if (ssa != null && ssa != v.getSsa()) continue;
+                matches.add(v);
+            }
+
+            if (matches.isEmpty()) {
+                List<String> available = new ArrayList<>();
+                for (JavaVariable v : inMethod) available.add(v.getName());
+                ctx.status(404).json(Map.of(
+                    "error", "Variable '" + variableName + "' not found in " + className + "#" + methodName,
+                    "available_variables", available));
+                return;
+            }
+            if (matches.size() > 1) {
+                List<Map<String, Object>> candidates = new ArrayList<>();
+                for (JavaVariable v : matches) {
+                    candidates.add(Map.of("name", v.getName(), "reg", v.getReg(), "ssa", v.getSsa()));
+                }
+                ctx.status(409).json(Map.of(
+                    "error", "'" + variableName + "' matches " + matches.size()
+                        + " distinct variables in " + className + "#" + methodName,
+                    "hint", "Repeat the call with reg and ssa from one of the candidates below.",
+                    "candidates", candidates));
+                return;
+            }
+
+            JavaVariable target = matches.get(0);
+            String oldName = target.getName();
+            renameStorage.renameVariable(wrapper, target, newName);
+            logger.info("Renamed variable '{}' to '{}' in {}#{}", oldName, newName, className, methodName);
+
+            // Renaming a local changes nothing in the bytecode -- locals are registers there and
+            // are not hookable at all. The class and method raw names are echoed because this
+            // response names them, and those are the identifiers a hook needs.
+            Map<String, Object> result = new HashMap<>();
+            result.put("result", "Renamed variable " + oldName + " to " + newName);
+            result.put("raw_class_name", cls.getRawName());
+            result.put("raw_method_name", JadxApiAdapter.getMethodRawName(target.getMth()));
+            result.put("variable", Map.of("name", newName, "previous_name", oldName,
+                    "reg", target.getReg(), "ssa", target.getSsa()));
+            ctx.json(withStorageStatus(result));
+        } catch (Exception e) {
+            logger.error("Failed to rename variable: {}", e.getMessage(), e);
+            ctx.status(500).json(Map.of("error", "Failed to rename variable: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * Every named local in {@code methodName}, read from the class's code metadata.
+     * Decompiles the class first — metadata does not exist until then.
+     */
+    private List<JavaVariable> collectVariables(JavaClass cls, String methodName) {
+        List<JavaVariable> found = new ArrayList<>();
+        cls.getCode();
+        ICodeInfo info = cls.getCodeInfo();
+        if (info == null || !info.hasMetadata()) return found;
+        for (ICodeAnnotation ann : info.getCodeMetadata().getAsMap().values()) {
+            if (ann.getAnnType() != ICodeAnnotation.AnnType.DECLARATION) continue;
+            JavaNode node = wrapper.getJadx().getJavaNodeByCodeAnnotation(info, ann);
+            if (node instanceof JavaVariable var
+                    && var.getMth() != null
+                    && methodName.equals(var.getMth().getName())) {
+                found.add(var);
+            }
+        }
+        return found;
+    }
+
+    /** Name of the first blank value in a (name, value, name, value, ...) run, or null if all set. */
+    private static String firstMissing(String... namesAndValues) {
+        for (int i = 0; i + 1 < namesAndValues.length; i += 2) {
+            String value = namesAndValues[i + 1];
+            if (value == null || value.isEmpty()) return namesAndValues[i];
+        }
+        return null;
+    }
+
+    /** Reads an optional int that the gateway may send as either a JSON number or a string. */
+    private static Integer parseOptionalInt(JsonObject body, String field) {
+        if (body == null || !body.has(field) || body.get(field).isJsonNull()) return null;
+        try {
+            return Integer.valueOf(body.get(field).getAsString().trim());
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     // -------------------------------------------------------------------------

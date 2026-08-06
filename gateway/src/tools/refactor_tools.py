@@ -123,23 +123,29 @@ def register_refactor_tools(mcp):
         reg: Optional[str] = None,
         ssa: Optional[str] = None,
     ) -> dict:
-        """NOT AVAILABLE in headless mode — this call always fails. Use an alternative below.
+        """Rename a local variable in a decompiled method, to make the body readable.
 
-        JADX renames local variables through its GUI's Swing EDT processing pipeline, which a
-        headless backend does not have, so there is no working path behind this tool. It stays
-        registered only so the failure comes back as a redirect instead of a bare error.
+        Obfuscated APKs have no local variable names — in bytecode a local is just a register —
+        so JADX emits bArr2/i/obj. Renaming them is the difference between a method you can read
+        and one you can only stare at. This changes decompiled output only: locals do not exist
+        in the bytecode and are never a Frida/Xposed target, so unlike class/method/field renames
+        there is no identifier here that a hook could lose.
 
-        Equivalent moves: rename the enclosing method with rename(target_type='method', ...),
-        or read the class with get_class_source and work out the variable from context.
+        A name can belong to several distinct variables in one method (two loops each declaring
+        'i'). When variable_name alone is ambiguous the call is refused with the candidates and
+        their reg/ssa rather than picking one; pass reg and ssa to choose.
 
         Args:
             class_name: Fully qualified class name. method_name: Method name.
             variable_name: Current variable name. new_name: New name.
             reg: Register number (disambiguation). ssa: SSA version (disambiguation).
+                 Both come from the 'candidates' list of a previous ambiguous call.
         Returns:
-            Always dict: {status: "not_implemented_headless", message: str,
-            alternatives: [{tool: str, description: str}]}. There is no success shape. The
-            underlying HTTP 501 is not surfaced, so 'status' is the only signal.
+            dict: {result: str, raw_class_name: str, raw_method_name: str,
+            variable: {name, previous_name, reg, ssa}} on success.
+            Ambiguous variable_name: {error: str, hint: str, candidates: [{name, reg, ssa}]}.
+            Unknown variable: {error: str, available_variables: [str]} — the method's actual
+            locals, so a wrong guess tells you what to ask for instead.
         """
         return await rename_variable(
             class_name=class_name,
