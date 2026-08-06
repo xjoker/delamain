@@ -18,10 +18,12 @@
 4. generate_apk_digest 的 total_classes 取自 pagination.total，而非顶层不存在的 "total"
 """
 
+import httpx
 import pytest
 
 from src.registry.instance_registry import InstanceRegistry
-from src.tools import security_tools, decompile_tools, digest_tools, workflow_tools
+from src.routing import request_router
+from src.tools import security_tools, decompile_tools, digest_tools, refactor_tools, workflow_tools
 
 
 @pytest.fixture(autouse=True)
@@ -173,3 +175,56 @@ async def test_generate_apk_digest_total_classes_from_pagination(monkeypatch):
     result = await digest_tools._generate_apk_digest()
 
     assert result["class_stats"]["total_classes"] == 500
+
+
+# ---------------------------------------------------------------------------
+# (5) rename_variable: headless JADX has no SSA rename — the endpoint answers 501
+#     with a redirect, and get_from_jadx passes that body through verbatim.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rename_variable_returns_the_501_redirect_body_verbatim(monkeypatch):
+    """RefactoringRoutes#handleRenameVariable 恒定返回 501。
+
+    这个 shape 一直是对的，错的是 gateway 文档（曾写成 ``{result: str}`` / 404）。这条测试把
+    真实形状钉住：真跑 get_from_jadx 的 httpx 路径（而不是像本文件其它用例那样 monkeypatch 掉
+    它），因为要证明的正是「非 2xx 的响应体会原样透出、HTTP 状态码本身则被丢弃」这一段。
+
+    哪天 headless 真的实现了变量重命名，这条会变红——那时文档也必须跟着改。
+    """
+    InstanceRegistry.configure(host="127.0.0.1", port=8650, name="jadx")
+
+    java_body = {
+        "status": "not_implemented_headless",
+        "message": (
+            "Variable rename is not available in headless mode. "
+            "SSA variable tracking requires JADX GUI's EDT processing pipeline."
+        ),
+        "alternatives": [
+            {"tool": "rename_method", "description": "Rename the method containing the variable"},
+            {"tool": "get_class_source", "description": "View the class source to understand variable usage"},
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/rename-variable"
+        return httpx.Response(501, json=java_body)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def fake_get_http_client():
+        return client
+
+    monkeypatch.setattr(request_router, "get_http_client", fake_get_http_client)
+    try:
+        result = await refactor_tools.rename_variable(
+            class_name="com.example.Foo", method_name="bar",
+            variable_name="v0", new_name="counter",
+        )
+    finally:
+        await client.aclose()
+
+    assert result == java_body
+    # The 501 itself is not surfaced — 'status' in the body is the only signal a caller gets.
+    assert "result" not in result
+    assert result["status"] == "not_implemented_headless"

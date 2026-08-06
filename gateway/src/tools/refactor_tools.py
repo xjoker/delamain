@@ -123,14 +123,23 @@ def register_refactor_tools(mcp):
         reg: Optional[str] = None,
         ssa: Optional[str] = None,
     ) -> dict:
-        """Rename a local variable inside a method using JADX SSA tracking.
+        """NOT AVAILABLE in headless mode — this call always fails. Use an alternative below.
+
+        JADX renames local variables through its GUI's Swing EDT processing pipeline, which a
+        headless backend does not have, so there is no working path behind this tool. It stays
+        registered only so the failure comes back as a redirect instead of a bare error.
+
+        Equivalent moves: rename the enclosing method with rename(target_type='method', ...),
+        or read the class with get_class_source and work out the variable from context.
 
         Args:
             class_name: Fully qualified class name. method_name: Method name.
             variable_name: Current variable name. new_name: New name.
             reg: Register number (disambiguation). ssa: SSA version (disambiguation).
         Returns:
-            dict: {result: str} on success or {error: str, status: 404} if not found.
+            Always dict: {status: "not_implemented_headless", message: str,
+            alternatives: [{tool: str, description: str}]}. There is no success shape. The
+            underlying HTTP 501 is not surfaced, so 'status' is the only signal.
         """
         return await rename_variable(
             class_name=class_name,
