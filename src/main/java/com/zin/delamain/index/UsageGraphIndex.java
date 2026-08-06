@@ -1,5 +1,7 @@
 package com.zin.delamain.index;
 
+import com.zin.delamain.utils.JadxApiAdapter;
+
 import jadx.api.JavaClass;
 import jadx.api.JavaField;
 import jadx.api.JavaMethod;
@@ -159,7 +161,10 @@ public final class UsageGraphIndex {
      * @param target    the class to trace callers of
      * @param maxDepth  hop limit (1 = direct callers)
      * @param maxNodes  safety cap on total discovered classes
-     * @return layered result with per-depth class lists, or null if index not ready / unknown class
+     * @return layered result with per-depth class lists, or null if index not ready / unknown class.
+     *         Every class is named twice — {@code name} (deobfuscated alias, readable) and
+     *         {@code raw_name} (the APK's own name, the only one a hook can use); the target
+     *         itself likewise as {@code target} / {@code raw_target}.
      */
     public static Map<String, Object> callersChain(JavaClass target, int maxDepth, int maxNodes) {
         return chain(target, classToReferrers, maxDepth, maxNodes, "callers");
@@ -192,7 +197,7 @@ public final class UsageGraphIndex {
             }
             if (nextBits.isEmpty()) break;
 
-            List<String> names = new ArrayList<>();
+            List<Map<String, Object>> names = new ArrayList<>();
             int[] nextFrontier = new int[nextBits.cardinality()];
             int fi = 0;
             for (int s = nextBits.nextSetBit(0); s >= 0; s = nextBits.nextSetBit(s + 1)) {
@@ -200,7 +205,7 @@ public final class UsageGraphIndex {
                 nextFrontier[fi++] = s;
                 discovered++;
                 if (discovered <= maxNodes && id2c[s] != null) {
-                    names.add(id2c[s].getFullName());
+                    names.add(nameEntry(id2c[s]));
                 }
                 if (discovered >= maxNodes) { truncated = true; break; }
             }
@@ -215,6 +220,7 @@ public final class UsageGraphIndex {
 
         Map<String, Object> out = new java.util.HashMap<>();
         out.put("target", target.getFullName());
+        out.put("raw_target", JadxApiAdapter.getClassRawName(target));
         out.put("direction", direction);
         out.put("max_depth", maxDepth);
         out.put("callers".equals(direction) ? "total_callers" : "total_callees", discovered);
@@ -223,6 +229,20 @@ public final class UsageGraphIndex {
         out.put("via", "usage-graph");
         out.put("resolution", "class-level");
         return out;
+    }
+
+    /**
+     * A class named for both audiences: {@code name} is the deobfuscated alias that makes the
+     * chain readable, {@code raw_name} is what is actually in the APK and therefore the only
+     * name Frida/Xposed can resolve. callers-chain is a navigation entry point — whoever walks
+     * it to "what reaches this crypto class" hooks the answer next, so the alias alone is a
+     * dead end.
+     */
+    private static Map<String, Object> nameEntry(JavaClass cls) {
+        Map<String, Object> entry = new java.util.LinkedHashMap<>();
+        entry.put("name", cls.getFullName());
+        entry.put("raw_name", JadxApiAdapter.getClassRawName(cls));
+        return entry;
     }
 
     /** Returns the classes that {@code target} references ("what X calls"), or null if not ready. */

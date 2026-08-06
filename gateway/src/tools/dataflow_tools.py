@@ -370,7 +370,10 @@ def register_dataflow_tools(mcp):
             granularity: 'class' | 'method'.
             max_nodes: class-mode safety cap on discovered classes (default 2000).
         Returns:
-            class: {target, layers:[{depth,count,classes}], total_callers, truncated, via}
+            class: {target, raw_target, layers:[{depth, count, classes:[{name, raw_name}]}],
+                   total_callers, truncated, via}. Every class is named twice: 'name' is the
+                   readable deobfuscated alias, 'raw_name' is the name actually in the APK and
+                   the only one Frida/Xposed can resolve. Read with name, hook with raw_name.
             method: {caller_tree, sources_found, stats}
         """
         if granularity == "method":
