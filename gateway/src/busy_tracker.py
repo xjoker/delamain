@@ -154,6 +154,11 @@ EXCLUSIVE_OPERATIONS = {
     "add_tag",
     "delete_tag",
     "load_file",
+    # Same write as load_file, reached through the higher-level workflow entry point.
+    # It went unscheduled until 2026-08-06: the lane-coverage check only sees operations
+    # with_busy_check registered, so a tool missing the decorator entirely was invisible
+    # to it — and this is the load path an AI is more likely to pick.
+    "analyze_apk",
     "rename_variable",
     "import_rename_mappings",
     "apply_proguard_mapping",

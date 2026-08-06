@@ -11,7 +11,7 @@ ever one backend, so there is no "route to a different instance" option —
 callers who want a fresh load use replace, and dependency JARs use append.
 """
 
-from ..busy_tracker import InstanceBusyTracker
+from ..busy_tracker import InstanceBusyTracker, with_busy_check
 from ..registry.instance_registry import InstanceRegistry
 from ..routing.request_router import get_from_jadx
 from ..logging_config import get_logger
@@ -231,6 +231,7 @@ def register_workflow_tools(mcp):
     """Register workflow tools with the MCP server."""
 
     @mcp.tool()
+    @with_busy_check
     async def analyze_apk_tool(
         path: str,
         strategy: str = "auto",
