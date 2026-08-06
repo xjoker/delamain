@@ -346,8 +346,21 @@ def register_decompile_tools(mcp):
               warmup progress — use overall_progress_pct for that.
             - elapsed_seconds: seconds since this warmup run started (or total run time if finished).
             - trigram_build_running: whether the in-memory trigram index is currently being built.
+              Stays false in the default deployment — the heap trigram layer is off by default and
+              the mmap shard build below is what actually runs; watch shard_build_running instead.
             - trigram_count: number of trigram entries built so far (0 if using the mmap shard index
               instead — see capabilities.code_search for the authoritative readiness signal).
+            - shard_build_running: whether the mmap content-shard index is being built right now.
+              This is the background build that runs by default, and the one whose absence used to
+              make a stalled index indistinguishable from a finished one.
+            - throttling: whether at least one warmup worker is stalled by memory pressure AT THIS
+              MOMENT. Sustained true means the run is memory-starved, not merely slow — on an
+              under-provisioned host this is what turns a 10-minute warmup into a multi-hour one.
+              Check capacity_warning for the size of the shortfall.
+            - pressure_hits / pressure_sleep_ms: how many times workers were throttled this run and
+              the total milliseconds slept. Summed across workers, so with N workers stalling in
+              parallel pressure_sleep_ms can exceed elapsed_seconds*1000 — compare the trend between
+              two polls rather than reading it as wall-clock.
             - trigram_skip_reason: present only if trigram build was skipped, e.g. "low-heap"; absent
               (key missing) otherwise.
             - use_places_ready: whether the precise xref-with-snippet index has finished its one-time
@@ -373,8 +386,11 @@ def register_decompile_tools(mcp):
             - capabilities: dict mapping capability name -> readiness string. Check this BEFORE
               calling the corresponding tool:
                 - "ready": safe to use now.
-                - "warming": still being built; the corresponding tool call may be slow, return
-                  partial results, or should be retried later.
+                - "building": a background build for this capability is running right now. Waiting
+                  will help; poll again.
+                - "warming": not ready and no build is currently running for it. Distinct from
+                  "building" — if this persists, waiting may not help (the build was cancelled or
+                  never started), so check phase/running rather than polling indefinitely.
                 - "skipped:low-heap": permanently unavailable this run because the host doesn't have
                   enough heap; do not poll waiting for "ready" — it will never arrive.
               Keys:
@@ -390,7 +406,9 @@ def register_decompile_tools(mcp):
                   (search_in='code' on the search tool). Do NOT issue search_in='code' calls while
                   this is not "ready" — results will be empty or incomplete, not just slow. If this
                   is "skipped:low-heap", code-body search is unavailable for the whole session; use
-                  metadata_search (name/structure) instead.
+                  metadata_search (name/structure) instead. "building" means the shard index is
+                  being built and will become ready; "warming" without a running build means it
+                  will not on its own.
                 - xref_class_level: class-level cross-reference graph (who calls/uses this class).
                   "warming" until the usage graph index finishes building.
                 - precise_xref_snippets: cross-references with exact call-site source snippets (as

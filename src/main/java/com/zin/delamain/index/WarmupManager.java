@@ -258,6 +258,62 @@ public class WarmupManager {
     // MemoryConfig at each check (volatile read) so runtime updates take effect immediately.
     private static final AtomicLong lastGcCallMs = new AtomicLong(0);
 
+    // Memory-pressure throttling, surfaced to /warmup-status. On a 255,599-class APK the throttle
+    // decayed Phase-1 throughput 14x (72 → 5 classes/s) over 2h19m with no signal anywhere: it only
+    // slept, and the counters explaining it were locals reported once at phase end. A slow warmup
+    // and a stuck one looked identical from outside. throttleActive counts threads currently inside
+    // a stall, so "is it being throttled right now" is answerable, not just "did it ever stall".
+    private static final AtomicInteger throttleActive = new AtomicInteger(0);
+    private static final AtomicInteger pressureHitsTotal = new AtomicInteger(0);
+    private static final AtomicLong pressureSleepMsTotal = new AtomicLong(0);
+
+    /** True while at least one worker is stalled by memory pressure right now. */
+    public static boolean isThrottling() {
+        return throttleActive.get() > 0;
+    }
+
+    /**
+     * Sleeps for a memory-pressure stall while keeping the live throttling signal accurate.
+     * Returns the milliseconds actually spent asleep.
+     *
+     * <p>The counters are updated in a {@code finally} so an interrupt (cancel / shutdown) still
+     * records the stall that happened and, more importantly, still clears {@code throttleActive} —
+     * a stuck live signal would be worse than no signal at all.
+     */
+    static long throttleSleep(long ms) throws InterruptedException {
+        pressureHitsTotal.incrementAndGet();
+        throttleActive.incrementAndGet();
+        long t0 = System.currentTimeMillis();
+        try {
+            Thread.sleep(ms);
+            return System.currentTimeMillis() - t0;
+        } finally {
+            throttleActive.decrementAndGet();
+            pressureSleepMsTotal.addAndGet(System.currentTimeMillis() - t0);
+        }
+    }
+
+    /** Test hook: clears the cross-warmup pressure totals so cases do not observe each other. */
+    static void resetPressureCountersForTests() {
+        throttleActive.set(0);
+        pressureHitsTotal.set(0);
+        pressureSleepMsTotal.set(0);
+    }
+
+    /**
+     * Whether code search is usable, and if not, why — as a function so {@link #getStatus} and its
+     * test share one rule.
+     *
+     * <p>"building" exists because the two-state version could not distinguish a shard build in
+     * progress from one that will never finish (cancelled, or silently stalled). Both reported
+     * "warming", so an AI waiting on code search had no way to know whether waiting would help.
+     */
+    static String codeSearchCapability(boolean ready, boolean shardBuildRunning, String trigramSkipReason) {
+        if (ready) return "ready";
+        if (shardBuildRunning) return "building";
+        return trigramSkipReason != null ? "skipped:low-heap" : "warming";
+    }
+
     // Persistent index store — lazily initialised
     private static volatile PersistentIndexStore persistentStore = null;
     private static volatile UsageGraphStore usageGraphStore = null;
@@ -406,6 +462,12 @@ public class WarmupManager {
             startTime.set(System.currentTimeMillis());
             endTime.set(0);
             cancelRequested.set(false);
+            // Pressure totals describe this warmup, not every warmup since process start.
+            // throttleActive is deliberately NOT reset: a background build from the previous
+            // APK may still be mid-stall, and zeroing a live gauge would report "not throttling"
+            // while a thread is in fact asleep.
+            pressureHitsTotal.set(0);
+            pressureSleepMsTotal.set(0);
             running.set(true);
             phase.set("PHASE1_DECOMPILE");
             lastWrapper = wrapper;
@@ -471,6 +533,15 @@ public class WarmupManager {
         status.put("decompile_workers_source", DECOMPILE_WORKERS_OVERRIDE > 0 ? "override" : "auto");
         status.put("trigram_build_running", trigramBuildRunning.get());
         status.put("trigram_count", CodeContentIndex.trigramCount());
+        // The shard build is what actually runs in the default deployment (TRIGRAM_HEAP is off),
+        // so reporting only the trigram flag above published a permanently-false signal while
+        // leaving the real background work invisible.
+        status.put("shard_build_running", shardBuildRunning.get());
+        // Live throttling state + totals. Without these a memory-pressure collapse is
+        // indistinguishable from ordinary slowness on any HTTP-visible surface.
+        status.put("throttling", isThrottling());
+        status.put("pressure_hits", pressureHitsTotal.get());
+        status.put("pressure_sleep_ms", pressureSleepMsTotal.get());
         // Precise use-places (E2): readiness + one-time harvest progress (surfaced to MCP
         // get_warmup_status so the AI knows whether precise xref is instant or still warming).
         status.put("use_places_ready", UsePlacesIndex.isReady());
@@ -538,8 +609,8 @@ public class WarmupManager {
         // though the shard layer is already serving searches).
         String trigramSkip = trigramSkipReason.get();
         boolean codeSearchReady = CodeContentIndex.trigramCount() > 0 || ContentShardIndex.isBuilt();
-        caps.put("code_search", codeSearchReady ? "ready"
-            : (trigramSkip != null ? "skipped:low-heap" : "warming"));
+        caps.put("code_search",
+            codeSearchCapability(codeSearchReady, shardBuildRunning.get(), trigramSkip));
         caps.put("xref_class_level", UsageGraphIndex.isReady() ? "ready" : "warming");
         String usePlacesSkip = usePlacesSkipReason.get();
         caps.put("precise_xref_snippets", UsePlacesIndex.isReady() ? "ready"
@@ -1078,7 +1149,7 @@ public class WarmupManager {
                     break;
                 }
                 if (isHighMemoryPressure()) {
-                    try { Thread.sleep(1500); } catch (InterruptedException ie) { completed = false; break; }
+                    try { throttleSleep(1500); } catch (InterruptedException ie) { completed = false; break; }
                 }
                 String code = cs.get(cls.getRawName()); // CodeStore keyed by raw name (deobf-stable)
                 if (code != null && !code.isEmpty() && CodeContentIndex.tryIndexFromCache(cls, code)) {
@@ -1187,7 +1258,7 @@ public class WarmupManager {
                         break;
                     }
                     if (isHighMemoryPressure()) {
-                        try { Thread.sleep(1500); } catch (InterruptedException ie) { completed = false; break; }
+                        try { throttleSleep(1500); } catch (InterruptedException ie) { completed = false; break; }
                     }
                     JavaClass cls = sorted.get(i);
                     // id == i by the preAssignIds contract documented above.
@@ -1455,9 +1526,12 @@ public class WarmupManager {
                             pressureGcMs.addAndGet(gcMs);
                             // Jittered sleep: base + 0–400ms per-thread offset prevents thundering-herd wakeup.
                             long jitter = (Thread.currentThread().getId() % 5) * 100L;
-                            long ps = System.currentTimeMillis();
-                            try { Thread.sleep(mc.getPressureSleepBaseMs() + jitter); } catch (InterruptedException ie) { break; }
-                            pressureSleepMs.addAndGet(System.currentTimeMillis() - ps);
+                            // throttleSleep also feeds the live /warmup-status signal; the local
+                            // counters below stay for the phase-end per-worker stall report, whose
+                            // percentage is only meaningful over Phase-1 alone.
+                            try {
+                                pressureSleepMs.addAndGet(throttleSleep(mc.getPressureSleepBaseMs() + jitter));
+                            } catch (InterruptedException ie) { break; }
                         }
 
                         JavaClass cls = targets.get(pos);
