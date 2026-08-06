@@ -16,9 +16,9 @@ PRE-FLIGHT (call before heavy ops):
                               (trigram_index is now just a residual/self-heal layer)
 
 SEARCH RULES:
-- search_classes_by_keyword(search_in='class,method,field') — always fast
+- search_classes_by_keyword_tool(search_in='class,method,field') — always fast
 - NEVER use search_in='code' for hex, UUID, base64, or long URLs
-- For code search on large APKs: submit_code_search + get_code_search_result
+- For code search on large APKs: submit_code_search_tool + get_code_search_result_tool
 
 ORIENTATION:
 - list_packages()  → find main package (ignore lib packages)
@@ -50,10 +50,10 @@ _JADX_VERBOSE_GUIDE = """\
 
 | What you're looking for | Tool | search_in |
 |------------------------|------|-----------|
-| Class by name | search_classes_by_keyword | class |
-| Method by name | search_classes_by_keyword | method |
-| String literal in code | submit_code_search | code |
-| JNI/native methods | search_native_methods | — |
+| Class by name | search_classes_by_keyword_tool | class |
+| Method by name | search_classes_by_keyword_tool | method |
+| String literal in code | submit_code_search_tool | code |
+| JNI/native methods | search_native_methods_tool | — |
 
 ### CODE SEARCH HARD LIMITS — NEVER use search_in='code' for:
 - Hex strings ≥ 8 chars (AES keys, hashes, device IDs)
@@ -61,7 +61,7 @@ _JADX_VERBOSE_GUIDE = """\
 - Base64 blobs
 - Long URL paths (/api/v1/some/deep/path)
 → These live in native libs or are excluded from the shard index due to class size.
-→ Instead: search_classes_by_keyword(search_in='class') to find the owning class, then get_class_source()
+→ Instead: search_classes_by_keyword_tool(search_in='class') to find the owning class, then get_class_source()
 
 ## Standard Reconnaissance Workflow
 
@@ -71,7 +71,7 @@ _JADX_VERBOSE_GUIDE = """\
 3. list_packages()                    → identify main vs library packages
 4. get_android_manifest()             → entry points, permissions, services
 5. get_attack_surface()               → exported components (attack surface)
-6. search_classes_by_keyword(         → find key classes by name
+6. search_classes_by_keyword_tool(         → find key classes by name
        search_term="Network",
        package="com.example",
        search_in="class,method,field")
@@ -83,12 +83,12 @@ _JADX_VERBOSE_GUIDE = """\
 
 ```python
 # 1. Submit
-result = submit_code_search("OkHttp", package="com.example")
+result = submit_code_search_tool("OkHttp", package="com.example")
 ticket = result["ticket"]
 
 # 2. Poll until done
 while True:
-    r = get_code_search_result(ticket)
+    r = get_code_search_result_tool(ticket)
     if r["status"] == "done":
         break
     sleep(r.get("retry_after_seconds", 5))
@@ -99,8 +99,10 @@ classes = r["classes"]  # up to count= items, use offset= for more
 
 ## Xrefs (Cross-References)
 
-- get_xrefs(class_name) → all classes that reference this class
-- get_xrefs(class_name, method_name) → all callers of a specific method
+- get_xrefs(target_type='class', class_name=...) → all classes that reference this class
+- get_xrefs(target_type='method', class_name=..., member_name=...) → all callers of a specific method
+- target_type is required and comes first: 'class' | 'method' | 'field'. The member goes in
+  member_name, not a second positional argument.
 - **NOTE**: Xrefs on heavily-referenced classes (main Activity) can take 60s+ on large APKs (O(N) scan)
 
 ## File Upload (create_transfer_token)
@@ -112,7 +114,9 @@ classes = r["classes"]  # up to count= items, use offset= for more
 
 ## Rename / Refactor
 
-- rename(class_name, new_name) → rename a class (persisted to disk)
+- rename(target_type='class', old_name=..., new_name=...) → rename a class (persisted to disk)
+- target_type is required and comes first: 'class' | 'method' | 'field' | 'package'.
+  method/field additionally need class_name=...
 - Revert: always use the ORIGINAL DEX name, not the alias
 - All renames trigger a 30s global cache cooldown
 
@@ -144,15 +148,15 @@ When working with the `jadx` MCP server for Android APK analysis:
 
 ## Search Rules
 
-- `search_classes_by_keyword(search_in='class,method,field')` — always fast (<100ms)
-- For code search: use `submit_code_search` + `get_code_search_result` (async, no timeout)
+- `search_classes_by_keyword_tool(search_in='class,method,field')` — always fast (<100ms)
+- For code search: use `submit_code_search_tool` + `get_code_search_result_tool` (async, no timeout)
 - **NEVER** use `search_in='code'` for: hex strings, UUIDs, base64, long URL paths
 
 ## Standard Recon Workflow
 
 ```
 get_file_info() → list_packages() → get_android_manifest()
-→ search_classes_by_keyword(search_in='class') → get_class_source()
+→ search_classes_by_keyword_tool(search_in='class') → get_class_source()
 ```
 
 ## Key Rules
@@ -167,7 +171,7 @@ _JADX_SKILL_CODEX = """\
 
 Pre-flight: get_decompile_status() + get_index_stats() before heavy ops
   (check shard_index.built/covered_classes, not trigram_index — that's residual only).
-Search: search_in='class,method,field' is fast; use submit_code_search for code.
+Search: search_in='class,method,field' is fast; use submit_code_search_tool for code.
 On broad_term=true in results: narrow the term or use search_in='class'/'method', don't retry.
 Never: search_in='code' for hex, UUID, base64, long URLs.
 Full guide: get_jadx_guide(verbose=True)
