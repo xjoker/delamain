@@ -10,14 +10,17 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Security boundary from the upload-transfer contract: the {@code .transfer} staging directory
@@ -58,6 +61,55 @@ class FileManagementRoutesHiddenEntryTest {
         assertFalse(resp.body().contains(".part"), "staging .part file must not be listed: " + resp.body());
         assertFalse(resp.body().contains(".transfer"), ".transfer dir must not be listed: " + resp.body());
         assertEquals(1, countOccurrences(resp.body(), "\"path\""), "only the visible.apk entry must be listed");
+    }
+
+    /**
+     * Issue #7: listing <em>from inside</em> {@code .transfer} (subdir=.transfer) used to return
+     * the {@code <token>.part} staging files, because only the entry's own file name was checked.
+     * Every spelling that lands in a dot-prefixed directory must now be refused without leaking
+     * the token, while a normal subdir keeps working.
+     */
+    @Test
+    void subdirPointingIntoHiddenDir_isRefusedAndNeverLeaksTokens(@TempDir Path tempDir) throws Exception {
+        Path root = tempDir.toRealPath();
+        String token = "a".repeat(64);
+        Files.createDirectory(root.resolve(".transfer"));
+        Files.writeString(root.resolve(".transfer").resolve(token + ".part"), "partial");
+        Files.createDirectory(root.resolve("apps"));
+        Files.writeString(root.resolve("apps").resolve("visible.apk"), "real apk");
+        Files.createSymbolicLink(root.resolve("alias"), root.resolve(".transfer"));
+
+        FilePathSandbox sandbox = new FilePathSandbox(root);
+        app = Javalin.create();
+        new FileManagementRoutes(null, sandbox).register(app, new AuthConfig(null, false));
+        app.start(0);
+        HttpClient client = HttpClient.newHttpClient();
+
+        for (String subdir : new String[] {
+                ".transfer", "./.transfer", ".transfer/", "apps/../.transfer",
+                root.resolve(".transfer").toString(), "alias"}) {
+            for (String extra : new String[] {"", "&recursive=true"}) {
+                HttpResponse<String> resp = list(client, "subdir=" + enc(subdir) + extra);
+                assertEquals(400, resp.statusCode(), "subdir=" + subdir + extra + " -> " + resp.body());
+                assertFalse(resp.body().contains(token), "token leaked for subdir=" + subdir + ": " + resp.body());
+                assertFalse(resp.body().contains(".part"), ".part leaked for subdir=" + subdir + ": " + resp.body());
+            }
+        }
+
+        HttpResponse<String> ok = list(client, "subdir=apps");
+        assertEquals(200, ok.statusCode(), ok.body());
+        assertTrue(ok.body().contains("visible.apk"), ok.body());
+    }
+
+    private HttpResponse<String> list(HttpClient client, String query) throws Exception {
+        HttpRequest req = HttpRequest.newBuilder(
+                        URI.create("http://127.0.0.1:" + app.port() + "/list-available-files?" + query))
+                .GET().build();
+        return client.send(req, HttpResponse.BodyHandlers.ofString());
+    }
+
+    private static String enc(String s) {
+        return URLEncoder.encode(s, StandardCharsets.UTF_8);
     }
 
     private static int countOccurrences(String haystack, String needle) {

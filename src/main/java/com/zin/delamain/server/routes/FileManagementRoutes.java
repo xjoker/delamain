@@ -18,6 +18,7 @@ import java.io.IOException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -70,9 +71,23 @@ public class FileManagementRoutes {
             boolean recursive = Boolean.parseBoolean(ctx.queryParamAsClass("recursive", String.class)
                     .getOrDefault("false"));
 
+            // A subdir that names a dot-prefixed directory (e.g. ".transfer", the in-flight
+            // upload staging dir whose *.part file names are the transfer tokens) is refused
+            // before it is resolved, so the reply does not reveal whether it exists. The
+            // canonical path is checked again after resolution to cover symlinks and "..".
+            if (subdir != null && !subdir.isEmpty() && hasHiddenSegment(Paths.get(subdir))) {
+                logger.warn("list-available-files: refused hidden subdir");
+                ctx.status(400).json(Map.of("error", HIDDEN_SUBDIR_ERROR));
+                return;
+            }
             Path base = (subdir == null || subdir.isEmpty())
                     ? sandbox.getRoot()
                     : sandbox.resolveWithinRoot(subdir);
+            if (hasHiddenSegment(sandbox.getRoot().relativize(base))) {
+                logger.warn("list-available-files: refused hidden subdir");
+                ctx.status(400).json(Map.of("error", HIDDEN_SUBDIR_ERROR));
+                return;
+            }
             if (!Files.isDirectory(base)) {
                 logger.warn("subdir is not a directory: {}", subdir);
                 ctx.status(400).json(Map.of("error", "subdir is not a directory: " + subdir));
@@ -281,6 +296,24 @@ public class FileManagementRoutes {
      *  never surfaced by list-available-files, regardless of glob/recursive. */
     private static boolean isHidden(Path entry) {
         return entry.getFileName().toString().startsWith(".");
+    }
+
+    static final String HIDDEN_SUBDIR_ERROR =
+            "subdir must not name a hidden (dot-prefixed) directory such as .transfer";
+
+    /** True if any name segment of {@code path} is dot-prefixed (e.g. {@code .transfer}).
+     *  The {@code .} and {@code ..} navigation segments are not counted here; where they lead
+     *  is checked on the canonical path. Used on the caller's raw {@code subdir} and on its
+     *  canonical path relative to the sandbox root, so {@code subdir=.transfer} (issue #7)
+     *  can't list token files. */
+    static boolean hasHiddenSegment(Path path) {
+        for (Path segment : path) {
+            String name = segment.toString();
+            if (name.startsWith(".") && !".".equals(name) && !"..".equals(name)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void collect(Path base, String glob, boolean recursive,

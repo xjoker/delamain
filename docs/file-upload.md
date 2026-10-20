@@ -29,8 +29,11 @@ JSON status responses, never the file content.
      "upload_url": "http://<gateway-host>:8651/transfer/upload"
    }
    ```
-   If the gateway has no externally-reachable address configured (see
-   `transfer_public_url` below), `upload_url` is replaced with an
+   The host part of `upload_url` comes from, in order: `JADX_TRANSFER_PUBLIC_URL`
+   (env) > `transfer_public_url` (TOML) > the gateway's bind host:port, unless it
+   is a wildcard such as `0.0.0.0` / `::` > the `Host` the MCP client used to
+   reach the gateway on this request. A wildcard bind address is never returned.
+   If none of these is available, `upload_url` is replaced with an
    `upload_url_hint` string explaining what to configure.
 
 2. **The AI relays `token` and `upload_url` to the human**, who uploads the
@@ -90,9 +93,12 @@ server-confirmed `path`, `bytes`, and `sha256`.
 ## Checking status manually
 
 ```sh
-curl "<gateway-host>:8651/transfer/status?token=<token>"
+curl -H "X-Transfer-Token: <token>" "<gateway-host>:8651/transfer/status"
 ```
-or with the header instead of a query param: `-H "X-Transfer-Token: <token>"`.
+The token is accepted **only** in the `X-Transfer-Token` header. A `?token=`
+query parameter is rejected with `400 {"error": "token_in_query_not_allowed"}`
+on both `/transfer/status` and `/transfer/upload`, because URLs are written
+to access logs, proxy logs and `Referer` headers.
 Response:
 ```json
 {"filename": "app.apk", "bytes_received": 8388608, "expires_at_epoch_ms": ..., "consumed": false}
@@ -135,7 +141,11 @@ Response:
   8651; it proxies both the MCP protocol and the two transfer endpoints
   through to the Java backend on `127.0.0.1:8650`, which is not reachable
   from outside the container. Set `transfer_public_url` (TOML) or
-  `JADX_TRANSFER_PUBLIC_URL` (env, higher priority) to the gateway's own
-  externally-reachable address if its bind host (e.g. `0.0.0.0`) isn't
-  itself usable as a client-facing hostname — see
+  `JADX_TRANSFER_PUBLIC_URL` (env, higher priority; also wired through
+  `docker-compose.yml` / `.env.example`) to the gateway's own
+  externally-reachable address when clients reach it under a different
+  address than the one they use for MCP — e.g. behind a reverse proxy that
+  rewrites `Host` or terminates TLS. When it is unset and the gateway binds
+  `0.0.0.0` (the Docker default), `upload_url` uses the `Host` header of the
+  MCP request (`X-Forwarded-*` headers are not trusted) — see
   `gateway/src/tools/transfer_tools.py:resolve_upload_base()`.

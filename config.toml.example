@@ -17,8 +17,10 @@ port = 8651
 
 # This gateway's own externally-reachable base URL (e.g.
 # "http://192.168.1.100:8651"). Used to build create_transfer_token's
-# upload_url when the bind address above (e.g. "0.0.0.0") is not itself a
-# reachable hostname/IP for the client that will PUT the uploaded file.
+# upload_url. If unset and the bind address above is a wildcard ("0.0.0.0"),
+# upload_url uses the Host the MCP client connected to; set this when the
+# uploading machine reaches the gateway under a different address (reverse
+# proxy, TLS termination, NAT).
 # Equivalent env var (higher priority): JADX_TRANSFER_PUBLIC_URL.
 # See gateway/src/tools/transfer_tools.py:resolve_upload_base().
 # transfer_public_url = "http://your-host:8651"

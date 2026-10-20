@@ -25,6 +25,11 @@ services:
       # entrypoint.sh generates a random one and shares it between the two
       # in-container processes; it is never used for MCP client auth.
       - JADX_INTERNAL_TOKEN=${JADX_INTERNAL_TOKEN:-}
+      # Public base URL clients use to reach this gateway, e.g.
+      # https://delamain.example.com or http://192.168.1.100:8651. Used for
+      # create_transfer_token's upload_url. Optional: if empty, upload_url uses
+      # the Host the MCP client connected to (never the 0.0.0.0 bind address).
+      - JADX_TRANSFER_PUBLIC_URL=${JADX_TRANSFER_PUBLIC_URL:-}
     restart: unless-stopped
     # Cap container log growth (both processes log to stdout/stderr only, no log
     # files) — without this, Docker's default json-file driver grows unbounded
