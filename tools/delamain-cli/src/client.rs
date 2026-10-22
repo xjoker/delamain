@@ -41,7 +41,6 @@ pub struct UploadResponse {
 pub fn fetch_status(client: &Client, status_url: &str, token: &str) -> Result<StatusResponse> {
     let resp = client
         .get(status_url)
-        .query(&[("token", token)])
         .header(HEADER_TOKEN, token)
         .send()
         .with_context(|| format!("GET {status_url} (status check) failed to send"))?;
@@ -110,4 +109,48 @@ pub fn put_chunk(
     Err(anyhow!(
         "PUT {upload_url} (offset={offset}, final={is_final}) failed: {reason} -- body: {body_text}"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn fetch_status_sends_token_in_header_not_query() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut head = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                head.push(line);
+            }
+            let body = r#"{"filename":"app.apk","bytes_received":7,"consumed":false}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            head
+        });
+
+        let token = "a".repeat(64);
+        let status_url = format!("http://{addr}/transfer/status");
+        let resp = fetch_status(&Client::new(), &status_url, &token).unwrap();
+        assert_eq!(resp.bytes_received, 7);
+
+        let head = server.join().unwrap();
+        let request_line = &head[0];
+        assert_eq!(request_line.trim_end(), "GET /transfer/status HTTP/1.1");
+        assert!(!request_line.contains(&token), "token leaked into URL: {request_line}");
+        let header = head.iter()
+            .find(|l| l.to_ascii_lowercase().starts_with("x-transfer-token:"))
+            .expect("X-Transfer-Token header missing");
+        assert_eq!(header.split_once(':').unwrap().1.trim(), token);
+    }
 }
