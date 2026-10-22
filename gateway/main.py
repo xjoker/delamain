@@ -66,6 +66,13 @@ def main():
     )
     args = parser.parse_args()
 
+    # SAF-90: mask ?token= (and similar) URL parameter values in uvicorn's access log
+    # and httpx's outgoing-request log (src/log_redaction.py; see its docstring for
+    # what is not covered). Only effective on this launch path: serving the app with
+    # a plain `uvicorn` command would bypass the log_config passed below.
+    from src.log_redaction import install_log_redaction, uvicorn_log_config
+    install_log_redaction()
+
     from src.mcp_server import build_mcp_app
     from src.config.config_loader import AppConfig, ConfigLoader, set_config_loader
     from src.registry.instance_registry import InstanceRegistry
@@ -128,8 +135,16 @@ def main():
 
     # STRICT HTTP-only — no stdio fallback. Single uvicorn worker — see module
     # docstring; do not pass workers>1.
+    # uvicorn_config: uvicorn's default log config plus the SAF-90 query redaction
+    # filter. FastMCP only applies its own log_level when no log_config is given, so
+    # pass the same level it would have used (FASTMCP_LOG_LEVEL, default INFO).
+    import fastmcp
     mcp.run(transport="http", host=args.host, port=args.port, stateless_http=True,
-            show_banner=False)
+            show_banner=False,
+            uvicorn_config={
+                "log_config": uvicorn_log_config(),
+                "log_level": fastmcp.settings.log_level.lower(),
+            })
 
 
 if __name__ == "__main__":
