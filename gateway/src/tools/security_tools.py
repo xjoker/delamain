@@ -187,12 +187,16 @@ async def _run_security_scan(
             "message": f"Invalid scan_type '{scan_type}'. Valid values: {list(SCAN_TYPES.keys())}",
         }
 
-    decompile_status = await get_from_jadx("decompile-status", instance_id=instance_id)
-    cached_percentage = 0.0
-    if isinstance(decompile_status, dict):
-        cached_percentage = decompile_status.get("cached_percentage", 0.0)
+    # /decompile-status does not expose cached progress. Java reports whether body
+    # search can run safely through /warmup-status's capabilities.code_search.
+    warmup_status = await get_from_jadx("warmup-status", instance_id=instance_id)
+    code_search_state = "unknown"
+    if isinstance(warmup_status, dict):
+        capabilities = warmup_status.get("capabilities", {})
+        if isinstance(capabilities, dict):
+            code_search_state = capabilities.get("code_search", "unknown")
 
-    code_search_available = cached_percentage >= 20.0
+    code_search_available = code_search_state == "ready"
     rules = filter_rules(scan_type)
 
     findings: list[dict] = []
@@ -201,6 +205,8 @@ async def _run_security_scan(
     for rule_id, rule in rules.items():
         rule_matches: list[dict[str, str]] = []
         rule_skipped_patterns: list[str] = []
+        rule_failed_patterns: list[str] = []
+        rule_failure_kinds: set[str] = set()
 
         for pattern in rule["patterns"]:
             search_in = pattern["search_in"]
@@ -227,9 +233,16 @@ async def _run_security_scan(
                     f"run_security_scan: search failed for term={pattern['term']!r}",
                     exc_info=True,
                 )
+                rule_failed_patterns.append(pattern["term"])
+                rule_failure_kinds.add("exception")
                 continue
 
-            if isinstance(result, dict) and "error" not in result:
+            if isinstance(result, dict) and "error" in result:
+                rule_failed_patterns.append(pattern["term"])
+                rule_failure_kinds.add("error")
+                continue
+
+            if isinstance(result, dict):
                 matches = _extract_matches(result)
                 if matches:
                     annotated: list[dict[str, str]] = []
@@ -249,8 +262,17 @@ async def _run_security_scan(
             skipped_rules.append({
                 "rule_id": rule_id,
                 "reason": (
-                    f"Code search skipped (cached_percentage={cached_percentage:.1f}% < 20%). "
+                    f"Code search skipped (capabilities.code_search={code_search_state!r}, "
+                    f"not 'ready'). "
                     f"Skipped patterns: {', '.join(rule_skipped_patterns)}"
+                ),
+            })
+        if rule_failed_patterns:
+            skipped_rules.append({
+                "rule_id": rule_id,
+                "reason": (
+                    f"Code search failed ({', '.join(sorted(rule_failure_kinds))}). "
+                    f"Skipped patterns: {', '.join(rule_failed_patterns)}"
                 ),
             })
 
@@ -277,6 +299,7 @@ async def _run_security_scan(
     elapsed = round(time.monotonic() - start_time, 2)
 
     result = {
+        "status": "incomplete" if skipped_rules else "complete",
         "scan_type": scan_type,
         "scan_time_seconds": elapsed,
         "summary": {
@@ -291,7 +314,7 @@ async def _run_security_scan(
         "skipped_rules": skipped_rules,
         "scan_coverage": {
             "code_search_available": code_search_available,
-            "cached_percentage": cached_percentage,
+            "code_search_state": code_search_state,
         },
     }
 
