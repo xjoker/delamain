@@ -91,11 +91,15 @@ class TransferRoutesTest {
     }
 
     private HttpResponse<String> get(String path) throws Exception {
-        HttpRequest req = HttpRequest.newBuilder(URI.create(base + path))
+        return get(path, Map.of());
+    }
+
+    private HttpResponse<String> get(String path, Map<String, String> headers) throws Exception {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(base + path))
                 .timeout(Duration.ofSeconds(10))
-                .GET()
-                .build();
-        return HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+                .GET();
+        headers.forEach(builder::header);
+        return HTTP.send(builder.build(), HttpResponse.BodyHandlers.ofString());
     }
 
     private static String field(String json, String key) {
@@ -297,13 +301,39 @@ class TransferRoutesTest {
         put("/transfer/upload", chunk, Map.of(
                 "X-Transfer-Token", token, "X-Chunk-Offset", "0", "X-Chunk-Final", "false"));
 
-        HttpResponse<String> status = get("/transfer/status?token=" + token);
+        HttpResponse<String> status = get("/transfer/status", Map.of("X-Transfer-Token", token));
         assertEquals(200, status.statusCode(), status.body());
         assertEquals(String.valueOf(chunk.length), field(status.body(), "bytes_received"));
         assertEquals("false", field(status.body(), "consumed"));
 
-        HttpResponse<String> unknown = get("/transfer/status?token=deadbeef");
+        HttpResponse<String> unknown = get("/transfer/status", Map.of("X-Transfer-Token", "deadbeef"));
         assertEquals(404, unknown.statusCode(), unknown.body());
+    }
+
+    @Test
+    void tokenInQueryString_isRejectedOnStatusAndUpload() throws Exception {
+        startApp(1024L * 1024, 30);
+        HttpResponse<String> created = post("/create-transfer-token", "{\"filename\":\"app.apk\"}");
+        String token = field(created.body(), "token");
+
+        HttpResponse<String> queryOnly = get("/transfer/status?token=" + token);
+        assertEquals(400, queryOnly.statusCode(), queryOnly.body());
+        assertTrue(queryOnly.body().contains("token_in_query_not_allowed"), queryOnly.body());
+        assertFalse(queryOnly.body().contains(token), queryOnly.body());
+
+        HttpResponse<String> queryAndHeader = get("/transfer/status?token=" + token,
+                Map.of("X-Transfer-Token", token));
+        assertEquals(400, queryAndHeader.statusCode(), queryAndHeader.body());
+
+        byte[] content = "payload".getBytes(StandardCharsets.UTF_8);
+        HttpResponse<String> upload = put("/transfer/upload?token=" + token, content,
+                Map.of("X-Transfer-Token", token));
+        assertEquals(400, upload.statusCode(), upload.body());
+        assertFalse(Files.exists(root.resolve("app.apk")), "rejected upload must not write the file");
+
+        HttpResponse<String> headerOnly = get("/transfer/status", Map.of("X-Transfer-Token", token));
+        assertEquals(200, headerOnly.statusCode(), headerOnly.body());
+        assertEquals("0", field(headerOnly.body(), "bytes_received"));
     }
 
     // -------------------------------------------------------------------------
@@ -327,7 +357,7 @@ class TransferRoutesTest {
         // bytes past N since the whole file was already (wrongly) sent.
         assertFalse(Files.exists(root.resolve(".transfer").resolve(token + ".part")),
                 ".part must be deleted after a sha256 mismatch, not left as a full-size orphan");
-        HttpResponse<String> status = get("/transfer/status?token=" + token);
+        HttpResponse<String> status = get("/transfer/status", Map.of("X-Transfer-Token", token));
         assertEquals("0", field(status.body(), "bytes_received"), "bytesReceived must reset to 0");
         assertEquals("false", field(status.body(), "consumed"), "token must remain usable, not consumed");
 

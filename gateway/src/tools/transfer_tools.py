@@ -13,7 +13,9 @@ load_file() once the upload completes.
 """
 
 import os
+import re
 from typing import Optional
+from urllib.parse import urlsplit
 
 import httpx
 from starlette.requests import Request
@@ -37,19 +39,48 @@ _UPLOAD_HEADERS = ("X-Transfer-Token", "X-Chunk-Offset", "X-Chunk-Final", "X-Con
 # JADX_TRANSFER_PUBLIC_URL nor the TOML equivalent is configured.
 _gateway_public_base: Optional[str] = None
 
+_WILDCARD_HOSTS = frozenset({"", "0.0.0.0", "::", "[::]", "*"})
+_HOST_HEADER_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252})|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$")
+
+
+def _is_wildcard_host(host: Optional[str]) -> bool:
+    return (host or "").strip().lower() in _WILDCARD_HOSTS
+
 
 def configure_gateway_public_base(host: str, port: int) -> None:
     """Record this gateway process's own bind host:port as the default externally-
     reachable address for create_transfer_token's upload_url. Called once at startup
     (see gateway/main.py) — not meant to be called again afterwards."""
     global _gateway_public_base
+    if _is_wildcard_host(host):
+        _gateway_public_base = None
+        return
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
     _gateway_public_base = f"http://{host}:{port}"
+
+
+def _request_base_url() -> Optional[str]:
+    try:
+        from fastmcp.server.dependencies import get_http_request
+        request = get_http_request()
+    except Exception:
+        return None
+    host = (request.headers.get("host") or "").strip()
+    if not host or not _HOST_HEADER_RE.fullmatch(host):
+        return None
+    hostname = host.rsplit(":", 1)[0] if not host.endswith("]") else host
+    if _is_wildcard_host(hostname):
+        return None
+    scheme = request.url.scheme if request.url.scheme in ("http", "https") else "http"
+    return f"{scheme}://{host}"
 
 
 def resolve_upload_base(
     env_value: Optional[str],
     toml_value: Optional[str],
     gateway_address: Optional[str],
+    request_address: Optional[str] = None,
 ) -> Optional[str]:
     """Pick the externally-reachable base URL for the gateway's own Transfer API
     proxy (PUT/GET /transfer/*, forwarded internally to the Java backend).
@@ -60,8 +91,11 @@ def resolve_upload_base(
     8651) — never the Java backend's address (8650), which is not reachable from
     outside the fused container.
     """
-    for value in (env_value, toml_value, gateway_address):
+    for value in (env_value, toml_value):
         if value:
+            return value.rstrip("/")
+    for value in (gateway_address, request_address):
+        if value and not _is_wildcard_host(urlsplit(value).hostname):
             return value.rstrip("/")
     return None
 
@@ -73,7 +107,7 @@ def _resolve_upload_base(instance_id: Optional[str]) -> Optional[str]:
     loader = get_config_loader()
     toml_value = loader.config.server.transfer_public_url if loader and loader.config else None
 
-    return resolve_upload_base(env_value, toml_value, _gateway_public_base)
+    return resolve_upload_base(env_value, toml_value, _gateway_public_base, _request_base_url())
 
 
 async def _create_transfer_token_impl(
@@ -172,6 +206,17 @@ def register_transfer_tools(mcp):
 # here is the one-time X-Transfer-Token itself, exactly as it is on the Java
 # side (see TransferRoutes.java).
 
+def _reject_token_in_query(request: Request) -> Optional[Response]:
+    if "token" not in request.query_params:
+        return None
+    return JSONResponse(
+        {
+            "error": "token_in_query_not_allowed",
+            "message": "send the transfer token in the X-Transfer-Token header, not in the URL",
+        },
+        status_code=400,
+    )
+
 def _backend_url_or_error():
     """Returns (base_url, None) or (None, JSONResponse) if no backend is configured."""
     inst = InstanceRegistry.get_default()
@@ -191,6 +236,10 @@ async def _proxy_transfer_upload(request: Request) -> Response:
     base, error = _backend_url_or_error()
     if error is not None:
         return error
+
+    rejected = _reject_token_in_query(request)
+    if rejected is not None:
+        return rejected
 
     headers = {
         name: value
@@ -231,21 +280,19 @@ async def _proxy_transfer_status(request: Request) -> Response:
     if error is not None:
         return error
 
+    rejected = _reject_token_in_query(request)
+    if rejected is not None:
+        return rejected
+
     headers = {}
     token_header = request.headers.get("X-Transfer-Token")
     if token_header is not None:
         headers["X-Transfer-Token"] = token_header
-    params = {}
-    token_query = request.query_params.get("token")
-    if token_query:
-        params["token"] = token_query
-
     client = await get_http_client()
     try:
         backend_resp = await client.get(
             f"{base}/transfer/status",
             headers=headers,
-            params=params,
             timeout=httpx.Timeout(TIMEOUT_METADATA),
         )
         return Response(

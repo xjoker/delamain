@@ -102,7 +102,7 @@ pub fn put_chunk(
         StatusCode::CONFLICT => "409 Conflict: offset mismatch, server has a different byte count than expected",
         StatusCode::PAYLOAD_TOO_LARGE => "413 Payload Too Large: upload exceeds server's configured size cap",
         StatusCode::UNPROCESSABLE_ENTITY => "422 Unprocessable Entity: whole-file SHA-256 did not match server's",
-        StatusCode::BAD_REQUEST => "400 Bad Request: filename/path/extension rejected by server",
+        StatusCode::BAD_REQUEST => "400 Bad Request: filename/path/extension rejected, or token sent in the URL",
         StatusCode::SERVICE_UNAVAILABLE => "503 Service Unavailable: server sandbox is not enabled",
         _ => "unexpected HTTP status",
     };

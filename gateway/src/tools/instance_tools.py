@@ -109,7 +109,8 @@ classes = r["classes"]  # up to count= items, use offset= for more
 
 - Alternative to `delamain-cli` CLI: `curl -T <local-file> -H "X-Transfer-Token: <token>" <upload_url>`
 - If the upload stalls or the connection drops, the token can be reused to resume:
-  GET <upload_url's host>/transfer/status?token=<token> reports bytes_received,
+  GET <upload_url's host>/transfer/status with header X-Transfer-Token: <token> reports bytes_received
+  (a ?token= query parameter is rejected with 400),
   then re-PUT from that offset with header X-Chunk-Offset.
 
 ## Rename / Refactor

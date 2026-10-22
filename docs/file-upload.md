@@ -90,9 +90,10 @@ server-confirmed `path`, `bytes`, and `sha256`.
 ## Checking status manually
 
 ```sh
-curl "<gateway-host>:8651/transfer/status?token=<token>"
+curl -H "X-Transfer-Token: <token>" "<gateway-host>:8651/transfer/status"
 ```
-or with the header instead of a query param: `-H "X-Transfer-Token: <token>"`.
+The token is accepted only in the `X-Transfer-Token` header. A `?token=` query
+parameter is rejected with `400 {"error": "token_in_query_not_allowed"}`.
 Response:
 ```json
 {"filename": "app.apk", "bytes_received": 8388608, "expires_at_epoch_ms": ..., "consumed": false}

@@ -36,7 +36,7 @@ import java.util.concurrent.TimeUnit;
  * Endpoints (see the upload-transfer contract, v1):
  *   POST /create-transfer-token              body: {filename, size_bytes?}
  *   PUT  /transfer/upload                    header X-Transfer-Token; optional chunk headers
- *   GET  /transfer/status?token=...          or header X-Transfer-Token
+ *   GET  /transfer/status                    header X-Transfer-Token
  *
  * Bytes land in {@code <root>/.transfer/<token>.part} while in flight and are atomically moved
  * to {@code <root>/<filename>} on the final chunk. All three endpoints reject requests when the
@@ -224,6 +224,9 @@ public class TransferRoutes {
             ctx.status(503).json(Map.of("error", "Sandbox not configured. Set JADX_FILE_ROOT or mount a directory at /apks."));
             return;
         }
+        if (rejectTokenInQuery(ctx)) {
+            return;
+        }
         try {
             Map<?, ?> body = ctx.bodyAsClass(Map.class);
             String filename = body == null ? null : String.valueOf(body.get("filename"));
@@ -284,6 +287,9 @@ public class TransferRoutes {
     public void handleUpload(Context ctx) {
         if (!sandbox.isEnabled()) {
             ctx.status(503).json(Map.of("error", "Sandbox not configured. Set JADX_FILE_ROOT or mount a directory at /apks."));
+            return;
+        }
+        if (rejectTokenInQuery(ctx)) {
             return;
         }
         try {
@@ -441,11 +447,11 @@ public class TransferRoutes {
             ctx.status(503).json(Map.of("error", "Sandbox not configured. Set JADX_FILE_ROOT or mount a directory at /apks."));
             return;
         }
+        if (rejectTokenInQuery(ctx)) {
+            return;
+        }
         try {
             String token = ctx.header("X-Transfer-Token");
-            if (token == null || token.isEmpty()) {
-                token = ctx.queryParam("token");
-            }
             TokenEntry entry = tokenStore.get(token);
             if (entry == null || entry.isExpired()) {
                 ctx.status(404).json(Map.of("error", "token_not_found"));
@@ -465,6 +471,18 @@ public class TransferRoutes {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    static final String TOKEN_IN_QUERY_ERROR = "token_in_query_not_allowed";
+
+    private static boolean rejectTokenInQuery(Context ctx) {
+        if (!ctx.queryParamMap().containsKey("token")) {
+            return false;
+        }
+        ctx.status(400).json(Map.of(
+                "error", TOKEN_IN_QUERY_ERROR,
+                "message", "send the transfer token in the X-Transfer-Token header, not in the URL"));
+        return true;
+    }
 
     /** Rejects anything but a plain basename: no path separators, no "." / "..". */
     private static String validateBasename(String filename) {

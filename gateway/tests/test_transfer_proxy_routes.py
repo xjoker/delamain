@@ -190,15 +190,37 @@ async def test_status_forwards_token_header(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_status_forwards_token_query_param(monkeypatch):
+async def test_status_rejects_token_in_query_string(monkeypatch):
     received: dict = {}
     _patch_backend(monkeypatch, _fake_backend(received))
 
     async with await _gateway_client() as client:
-        resp = await client.get("/transfer/status", params={"token": "tok-xyz"})
+        query_only = await client.get("/transfer/status", params={"token": "tok-xyz"})
+        both = await client.get(
+            "/transfer/status", params={"token": "tok-xyz"}, headers={"X-Transfer-Token": "tok-xyz"},
+        )
 
-    assert resp.status_code == 200
-    assert received["status_query"]["token"] == "tok-xyz"
+    for resp in (query_only, both):
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "token_in_query_not_allowed"
+        assert "tok-xyz" not in resp.text
+    assert "status_headers" not in received
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_token_in_query_string(monkeypatch):
+    received: dict = {}
+    _patch_backend(monkeypatch, _fake_backend(received))
+
+    async with await _gateway_client() as client:
+        resp = await client.put(
+            "/transfer/upload?token=tok-xyz", content=b"abc",
+            headers={"X-Transfer-Token": "tok-xyz", "X-Chunk-Final": "true"},
+        )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "token_in_query_not_allowed"
+    assert "upload_headers" not in received
 
 
 @pytest.mark.asyncio
@@ -208,7 +230,7 @@ async def test_status_returns_503_when_no_backend_configured(monkeypatch):
     _patch_backend(monkeypatch, _fake_backend(received))
 
     async with await _gateway_client() as client:
-        resp = await client.get("/transfer/status", params={"token": "tok-xyz"})
+        resp = await client.get("/transfer/status", headers={"X-Transfer-Token": "tok-xyz"})
 
     assert resp.status_code == 503
     assert resp.json()["error"] == "NO_INSTANCE"
