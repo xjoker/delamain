@@ -163,12 +163,62 @@ async def get_decompile_priority_list(
 ) -> dict:
     logger.info(f"get_decompile_priority_list: goal='{analysis_goal}', package='{package}'")
 
-    try:
-        all_classes_resp = await get_from_jadx("all-classes", instance_id=instance_id)
-    except Exception as exc:
-        return {"error": "JADX_ERROR", "message": f"Failed to fetch classes: {exc}"}
+    all_classes: list[str] = []
+    offset = 0
+    while True:
+        try:
+            all_classes_resp = await get_from_jadx(
+                "all-classes", {"offset": offset, "count": 0}, instance_id=instance_id,
+            )
+        except Exception as exc:
+            return {"error": "JADX_ERROR", "message": f"Failed to fetch classes: {exc}"}
 
-    all_classes: list[str] = all_classes_resp.get("classes", [])
+        if not isinstance(all_classes_resp, dict):
+            return {
+                "error": "INVALID_RESPONSE",
+                "message": "Invalid all-classes response: expected an object with a classes list",
+            }
+        class_entries = all_classes_resp.get("classes", [])
+        if not isinstance(class_entries, list):
+            return {
+                "error": "INVALID_RESPONSE",
+                "message": "Invalid all-classes response: classes must be a list",
+            }
+        for index, entry in enumerate(class_entries):
+            if not isinstance(entry, dict):
+                return {
+                    "error": "INVALID_RESPONSE",
+                    "message": f"Invalid all-classes response: classes[{index}] must be an object",
+                }
+            name = entry.get("name")
+            raw_name = entry.get("raw_name")
+            if not isinstance(name, str) or not name:
+                return {
+                    "error": "INVALID_RESPONSE",
+                    "message": f"Invalid all-classes response: classes[{index}].name must be a non-empty string",
+                }
+            if not isinstance(raw_name, str) or not raw_name:
+                return {
+                    "error": "INVALID_RESPONSE",
+                    "message": f"Invalid all-classes response: classes[{index}].raw_name must be a non-empty string",
+                }
+            all_classes.append(name)
+
+        pagination = all_classes_resp.get("pagination")
+        if not isinstance(pagination, dict) or not isinstance(pagination.get("has_more"), bool):
+            return {
+                "error": "INVALID_RESPONSE",
+                "message": "Invalid all-classes response: pagination.has_more must be a boolean",
+            }
+        if not pagination["has_more"]:
+            break
+        next_offset = pagination.get("next_offset")
+        if not isinstance(next_offset, int) or next_offset <= offset:
+            return {
+                "error": "INVALID_RESPONSE",
+                "message": "Invalid all-classes response: pagination.next_offset must advance",
+            }
+        offset = next_offset
     if not all_classes:
         return {
             "error": "NO_CLASSES",
