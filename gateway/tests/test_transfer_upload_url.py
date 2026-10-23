@@ -7,6 +7,7 @@ Covers src.tools.transfer_tools.resolve_upload_base priority:
 
 import pytest
 from starlette.requests import Request
+from types import SimpleNamespace
 
 from src.tools import transfer_tools
 from src.tools.transfer_tools import resolve_upload_base
@@ -57,6 +58,24 @@ def _fake_backend_token(monkeypatch):
     monkeypatch.setattr(transfer_tools, "get_config_loader", lambda: None)
 
 
+def _configure_explicit_public_url(monkeypatch, env_value, toml_value):
+    monkeypatch.delenv("JADX_TRANSFER_PUBLIC_URL", raising=False)
+    if env_value is not None:
+        monkeypatch.setenv("JADX_TRANSFER_PUBLIC_URL", env_value)
+    if toml_value is None:
+        monkeypatch.setattr(transfer_tools, "get_config_loader", lambda: None)
+    else:
+        monkeypatch.setattr(
+            transfer_tools,
+            "get_config_loader",
+            lambda: SimpleNamespace(
+                config=SimpleNamespace(
+                    server=SimpleNamespace(transfer_public_url=toml_value)
+                )
+            ),
+        )
+
+
 def _http_request(host: str, scheme: str = "http") -> Request:
     return Request({
         "type": "http", "method": "POST", "scheme": scheme, "path": "/mcp",
@@ -87,6 +106,46 @@ async def test_wildcard_bind_falls_back_to_request_host(monkeypatch, restore_gat
 
     result = await transfer_tools._create_transfer_token_impl("app.apk", None, None)
     assert result["upload_url"] == "http://127.0.0.1:18651/transfer/upload"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("env_value", "toml_value"),
+    [
+        ("http://0.0.0.0:8651", None),
+        ("http://[::]:8651", None),
+        (None, "http://0.0.0.0:8651"),
+        (None, "http://[::]:8651"),
+    ],
+    ids=["env-ipv4", "env-ipv6", "toml-ipv4", "toml-ipv6"],
+)
+async def test_explicit_wildcard_public_url_returns_hint_without_request_host_fallback(
+    monkeypatch, restore_gateway_base, env_value, toml_value,
+):
+    _fake_backend_token(monkeypatch)
+    _configure_explicit_public_url(monkeypatch, env_value, toml_value)
+    transfer_tools.configure_gateway_public_base("0.0.0.0", 8651)
+    import fastmcp.server.dependencies as deps
+    monkeypatch.setattr(deps, "get_http_request", lambda: _http_request("gateway.example:8651"))
+
+    result = await transfer_tools._create_transfer_token_impl("app.apk", None, None)
+
+    assert "upload_url" not in result
+    assert "upload_url_hint" in result
+    assert "gateway.example:8651" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_valid_explicit_public_url_keeps_priority_over_request_host(monkeypatch, restore_gateway_base):
+    _fake_backend_token(monkeypatch)
+    _configure_explicit_public_url(monkeypatch, "https://public.example:9443", "http://toml.example:8651")
+    transfer_tools.configure_gateway_public_base("0.0.0.0", 8651)
+    import fastmcp.server.dependencies as deps
+    monkeypatch.setattr(deps, "get_http_request", lambda: _http_request("gateway.example:8651"))
+
+    result = await transfer_tools._create_transfer_token_impl("app.apk", None, None)
+
+    assert result["upload_url"] == "https://public.example:9443/transfer/upload"
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0:8651", "[::]:8651", "evil.com/path", "a b", "u@h", "", "h\r\nX: y"])

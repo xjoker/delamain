@@ -93,6 +93,12 @@ def resolve_upload_base(
     """
     for value in (env_value, toml_value):
         if value:
+            try:
+                if _is_wildcard_host(urlsplit(value).hostname):
+                    return None
+            except ValueError:
+                # Keep the existing handling of malformed explicit values unchanged.
+                pass
             return value.rstrip("/")
     for value in (gateway_address, request_address):
         if value and not _is_wildcard_host(urlsplit(value).hostname):
