@@ -224,6 +224,12 @@ ProGuard/rename mappings), **sessions & annotations**, and **file transfer**.
 
 Call `get_jadx_guide(verbose=True)` from a client for the full workflow guide.
 
+Annotations, bookmarks, and tags are written under the current APK `input_hash`.
+Writes return HTTP 409 while that identity is pending or when a supplied
+`apk_hash` conflicts with it. Existing records remain unchanged and can be read
+with an explicit `apk_hash` query parameter; implicit reads also wait for the
+current identity.
+
 ## Bundled jadx
 
 delamain bundles **jadx-all** (the [jadx](https://github.com/skylot/jadx)

@@ -5,12 +5,11 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
 
 import com.zin.delamain.core.HeadlessJadxWrapper;
+import com.zin.delamain.index.WarmupManager;
 import com.zin.delamain.server.AuthConfig;
 
 import io.javalin.Javalin;
 import io.javalin.http.Context;
-
-import jadx.api.ResourceFile;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -53,8 +52,13 @@ public class AnnotationRoutes {
     private final String dbPath;
 
     public AnnotationRoutes(HeadlessJadxWrapper wrapper) {
+        this(wrapper, System.getProperty("user.home") + "/.delamain/annotations.db");
+    }
+
+    /** Test-only seam for an isolated SQLite database; production keeps the default location. */
+    AnnotationRoutes(HeadlessJadxWrapper wrapper, String dbPath) {
         this.wrapper = wrapper;
-        this.dbPath = System.getProperty("user.home") + "/.delamain/annotations.db";
+        this.dbPath = dbPath;
         initDatabase();
     }
 
@@ -146,23 +150,29 @@ public class AnnotationRoutes {
 
     // ==================== APK hash retrieval ====================
 
-    /**
-     * Derives apk_hash from the currently opened file's resource path.
-     */
-    private String getCurrentApkHash() {
-        try {
-            if (wrapper == null) return "unknown";
-            java.util.List<ResourceFile> resources = wrapper.getJadx().getResources();
-            if (!resources.isEmpty()) {
-                String path = resources.get(0).getOriginalName();
-                if (path != null && !path.isEmpty()) {
-                    return Integer.toHexString(path.hashCode());
-                }
-            }
-        } catch (Exception e) {
-            logger.debug("[JAI] Could not get APK hash: {}", e.getMessage());
+    /** Returns the canonical cache identity, or reports that a reload/cold start is still pending. */
+    private String requireCurrentApkHash(Context ctx) {
+        String apkHash = WarmupManager.getCurrentInputHash();
+        if (apkHash == null || apkHash.isBlank()) {
+            ctx.status(409).json(Map.of(
+                "error", "apk_identity_not_ready",
+                "message", "APK identity is not ready; wait for warmup to publish the current input hash"
+            ));
+            return null;
         }
-        return "unknown";
+        return apkHash;
+    }
+
+    private boolean bodyHashMatchesCurrent(JsonObject body, String currentApkHash, Context ctx) {
+        String requestedApkHash = getBodyString(body, "apk_hash");
+        if (requestedApkHash != null && !requestedApkHash.isBlank() && !requestedApkHash.equals(currentApkHash)) {
+            ctx.status(409).json(Map.of(
+                "error", "apk_hash_conflict",
+                "message", "apk_hash must match the current APK identity"
+            ));
+            return false;
+        }
+        return true;
     }
 
     // ==================== JSON parsing utilities ====================
@@ -220,8 +230,9 @@ public class AnnotationRoutes {
             return;
         }
 
+        String apkHash = requireCurrentApkHash(ctx);
+        if (apkHash == null || !bodyHashMatchesCurrent(body, apkHash, ctx)) return;
         String author = getBodyStringOrDefault(body, "author", "anonymous");
-        String apkHash = getBodyStringOrDefault(body, "apk_hash", getCurrentApkHash());
 
         try (Connection conn = getConnection();
              PreparedStatement ps = conn.prepareStatement(
@@ -264,7 +275,8 @@ public class AnnotationRoutes {
         String apkHash = ctx.queryParam("apk_hash");
 
         if (apkHash == null || apkHash.isBlank()) {
-            apkHash = getCurrentApkHash();
+            apkHash = requireCurrentApkHash(ctx);
+            if (apkHash == null) return;
         }
 
         StringBuilder sql = new StringBuilder(
@@ -373,9 +385,10 @@ public class AnnotationRoutes {
             return;
         }
 
+        String apkHash = requireCurrentApkHash(ctx);
+        if (apkHash == null || !bodyHashMatchesCurrent(body, apkHash, ctx)) return;
         String note = getBodyStringOrDefault(body, "note", "");
         String author = getBodyStringOrDefault(body, "author", "anonymous");
-        String apkHash = getBodyStringOrDefault(body, "apk_hash", getCurrentApkHash());
 
         try (Connection conn = getConnection();
              PreparedStatement ps = conn.prepareStatement(
@@ -420,7 +433,8 @@ public class AnnotationRoutes {
         String apkHash = ctx.queryParam("apk_hash");
 
         if (apkHash == null || apkHash.isBlank()) {
-            apkHash = getCurrentApkHash();
+            apkHash = requireCurrentApkHash(ctx);
+            if (apkHash == null) return;
         }
 
         StringBuilder sql = new StringBuilder(
@@ -529,8 +543,9 @@ public class AnnotationRoutes {
             return;
         }
 
+        String apkHash = requireCurrentApkHash(ctx);
+        if (apkHash == null || !bodyHashMatchesCurrent(body, apkHash, ctx)) return;
         String author = getBodyStringOrDefault(body, "author", "anonymous");
-        String apkHash = getBodyStringOrDefault(body, "apk_hash", getCurrentApkHash());
 
         try (Connection conn = getConnection();
              PreparedStatement ps = conn.prepareStatement(
@@ -574,7 +589,8 @@ public class AnnotationRoutes {
         String apkHash = ctx.queryParam("apk_hash");
 
         if (apkHash == null || apkHash.isBlank()) {
-            apkHash = getCurrentApkHash();
+            apkHash = requireCurrentApkHash(ctx);
+            if (apkHash == null) return;
         }
 
         StringBuilder sql = new StringBuilder(
@@ -665,7 +681,8 @@ public class AnnotationRoutes {
     public void handleGetAnalysisNotes(Context ctx) {
         String apkHash = ctx.queryParam("apk_hash");
         if (apkHash == null || apkHash.isBlank()) {
-            apkHash = getCurrentApkHash();
+            apkHash = requireCurrentApkHash(ctx);
+            if (apkHash == null) return;
         }
 
         Map<String, Object> response = new HashMap<>();
