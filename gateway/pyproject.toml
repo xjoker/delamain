@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 dependencies = [
     "fastmcp==3.4.4",
     "httpx==0.28.1",
+    "mcp>=1.30.0,<2",
     "tomli==2.4.0; python_version < '3.11'",
 ]
 
